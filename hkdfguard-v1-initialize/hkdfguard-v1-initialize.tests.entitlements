@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	 Used by the Debug and DebugHosted builds of the bundled CLI (the
+	 hkdfguard-v1-initialize-app target) -- the builds the hosted test suite
+	 and setup-hosted-test-kek.sh run. Release, the only configuration
+	 build-dist.sh ships, uses hkdfguard-v1-initialize.entitlements and the
+	 production com.hkdfguard.keys group instead.
+
+	 A separate, test-only group, so the test fixtures can never read
+	 production KEKs: the test host (HkdfGuardNativeMacOSTestHost) runs
+	 without the hardened runtime -- Xcode's test injection needs DYLD
+	 environment variables -- so any code can be injected into it. Sharing
+	 the production group would hand every production KEK on a developer's
+	 Mac to anything that can launch that app. Must match, and be listed
+	 first in, HkdfGuardNativeMacOSTestHost.entitlements.
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.hkdfguard.tests.keys</string>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	 The TEST-ONLY HkdfGuard keychain access group -- deliberately not the
+	 production com.hkdfguard.keys group. This app runs without the hardened
+	 runtime (Xcode's test injection needs DYLD environment variables), so
+	 code can be injected into it; entitled for the production group, it
+	 would expose every production KEK on the Mac it was built on.
+
+	 Listed FIRST (here, only): the library stores KEK items under the first
+	 group in this array. The Debug/DebugHosted builds of the bundled CLI
+	 (hkdfguard-v1-initialize.tests.entitlements) declare the same group, so
+	 KEKs they provision are readable by tests hosted in this app with no
+	 interactive prompt. $(AppIdentifierPrefix) is the Team ID, substituted
+	 at signing time.
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.hkdfguard.tests.keys</string>
+	</array>
+</dict>
+</plist>

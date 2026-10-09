@@ -2,6 +2,26 @@
 #
 # gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
 
+.DS_Store
+
+## Build products (xcodebuild's default -derivedDataPath / raw `build/` output
+## directory used throughout this project's docs and by hkdfguard-v1-initialize's
+## Package.swift, which links against it)
+build/
+dist/
+build-arm64/
+build-x64/
+build-x86_64/
+## Per-architecture SwiftPM scratch directories used by build-dist.sh
+hkdfguard-v1-initialize/.build-*/
+
+## Signing secrets: App Store Connect API keys (.p8) and exported
+## certificates with private keys (.p12/.pfx). build-dist.sh only takes
+## paths and names; these files belong outside the repository.
+*.p8
+*.p12
+*.pfx
+
 ## User settings
 xcuserdata/
 

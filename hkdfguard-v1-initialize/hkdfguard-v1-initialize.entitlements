@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	 Used only by the *bundled* build of the CLI (the hkdfguard-v1-initialize
+	 app target in HkdfGuardNativeMacOS.xcodeproj), which is what
+	 lets it run in data-protection keychain mode: a bare Mach-O cannot carry
+	 this entitlement at all (AMFI kills it at launch without an embedded
+	 provisioning profile, which only a bundle can hold). The SwiftPM build
+	 of the same main.swift has no entitlements and runs in legacy mode.
+
+	 The group must be the same, and listed first, in every bundle that is
+	 meant to share KEKs. This file is the Release configuration's only:
+	 Debug and DebugHosted use hkdfguard-v1-initialize.tests.entitlements and
+	 the test-only com.hkdfguard.tests.keys group, so the test host -- which
+	 runs without the hardened runtime -- never shares production KEKs.
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.hkdfguard.keys</string>
+	</array>
+</dict>
+</plist>
