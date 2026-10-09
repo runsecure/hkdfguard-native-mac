@@ -4,15 +4,15 @@
 #   ~/.hkdfguard/v1/
 #
 # holding libhkdfguard_v1.dylib, hkdfguard.h, hkdfguard-v1-initialize and
-# SHA256SUMS for this Mac's architecture only: the osx-arm64 build on Apple
-# silicon, the osx-x64 build on Intel.
+# SHA256SUMS from the osx-arm64 build. Apple silicon only: the library is
+# not built for Intel.
 #
 # Usage: ./install-user.sh [--from DIR] [--team-id TEAMID] [--uninstall]
 #
 #   --from DIR        either a build-dist.sh output folder holding
-#                     osx-arm64/ and osx-x64/ (default: ./dist next to this
-#                     script), or a single extracted per-architecture
-#                     release folder with SHA256SUMS at its top level
+#                     osx-arm64/ (default: ./dist next to this script), or
+#                     an extracted osx-arm64 release folder with SHA256SUMS
+#                     at its top level
 #   --team-id TEAMID  require both binaries to be signed by this Team ID
 #                     (default: they only have to agree with each other)
 #   --uninstall       remove ~/.hkdfguard/v1
@@ -51,14 +51,13 @@ done
 # that the user can then no longer update.
 [ "$(id -u)" -ne 0 ] || fail "run this as the user it installs for, not as root"
 
-# The hardware's architecture, not this shell's: hw.optional.arm64 is 1 on
-# Apple silicon even when the shell runs under Rosetta, where `uname -m`
-# would report x86_64. On Intel the sysctl does not exist.
-if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then
-    RID=osx-arm64; ARCH=arm64
-else
-    RID=osx-x64; ARCH=x86_64
-fi
+# The hardware, not this shell: hw.optional.arm64 is 1 on Apple silicon
+# even when the shell runs under Rosetta, where `uname -m` would report
+# x86_64. On Intel the sysctl does not exist.
+RID=osx-arm64
+ARCH=arm64
+[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ] \
+    || fail "this Mac is not Apple silicon; the library is built for arm64 only"
 
 USER_NAME="$(id -un)"
 USER_UID="$(id -u)"
@@ -96,10 +95,10 @@ fi
 
 [ -d "$SOURCE" ] || fail "source folder not found: $SOURCE (run ./build-dist.sh or pass --from)"
 SOURCE="$(cd "$SOURCE" && pwd -P)"
-# A single extracted release folder, or build-dist.sh output with one
-# subfolder per architecture.
+# An extracted release folder, or build-dist.sh output with an osx-arm64/
+# subfolder.
 if [ ! -f "$SOURCE/SHA256SUMS" ]; then
-    [ -d "$SOURCE/$RID" ] || fail "no $RID/ folder in $SOURCE (this Mac is $ARCH)"
+    [ -d "$SOURCE/$RID" ] || fail "no $RID/ folder in $SOURCE"
     SOURCE="$SOURCE/$RID"
 fi
 
@@ -135,7 +134,7 @@ expected="$(printf '%s\n' "$CLI_NAME" "$HEADER_NAME" "$DYLIB_NAME" | sort | tr '
 
 for f in "$DYLIB_NAME" "$CLI_NAME"; do
     [ "$(lipo -archs "$STAGE/$f")" = "$ARCH" ] \
-        || fail "$f is built for '$(lipo -archs "$STAGE/$f")', but this Mac is $ARCH"
+        || fail "$f is built for '$(lipo -archs "$STAGE/$f")', expected $ARCH"
     codesign --verify --strict "$STAGE/$f" || fail "$f: signature does not verify"
     info="$(codesign -dvv "$STAGE/$f" 2>&1)"
     team="$(sed -n 's/^TeamIdentifier=//p' <<<"$info")"

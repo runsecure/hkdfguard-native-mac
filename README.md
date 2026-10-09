@@ -315,8 +315,8 @@ keychain mode:
 
 | Build | Keychain mode | Use it to |
 |---|---|---|
-| `hkdfguard-v1-initialize` (plain executable, per architecture) | legacy | provision and wrap for consumers that run in legacy mode — any `dlopen`/FFI host |
-| `hkdfguard-v1-initialize.app` (universal app bundle) | data-protection | provision, wrap, and retire for consumers that are Team-signed app bundles in the same `com.hkdfguard.keys` access group |
+| `hkdfguard-v1-initialize` (plain executable) | legacy | provision and wrap for consumers that run in legacy mode — any `dlopen`/FFI host |
+| `hkdfguard-v1-initialize.app` (app bundle) | data-protection | provision, wrap, and retire for consumers that are Team-signed app bundles in the same `com.hkdfguard.keys` access group |
 
 Run the bundled build by its executable inside the bundle; a symlink onto
 your `PATH` works:
@@ -391,14 +391,15 @@ xcodebuild test -scheme HkdfGuardNativeMacOSTests
 
 ### Distribution: `build-dist.sh`
 
-Builds everything a downstream consumer needs into `dist/osx-x64/` and
-`dist/osx-arm64/` (dylib, header, CLI, `SHA256SUMS`), one folder per .NET
-runtime identifier. For each architecture it builds the dylib and the CLI
-natively, rewrites the CLI's rpath to `@executable_path` so it finds the
+Builds everything a downstream consumer needs into `dist/osx-arm64/`
+(dylib, header, CLI, `SHA256SUMS`), named for the .NET runtime identifier.
+**arm64 (Apple silicon) is the only supported architecture**: there is no
+Intel build, and the script refuses to run on an Intel Mac. It builds the
+dylib and the CLI, rewrites the CLI's rpath to `@executable_path` so it finds the
 dylib next to itself, signs both with the **hardened runtime and a secure
 timestamp**, then verifies: strict signature check, runtime flag, timestamp,
 `lipo` architecture, rpath, `@rpath` reference, and a `--help` launch smoke
-test on the host architecture. Everything is assembled in a staging
+test. Everything is assembled in a staging
 directory and only moved into `dist/` once every check passes.
 
 ```sh
@@ -418,11 +419,15 @@ refuses to start unless the signing identity is Developer ID, the app is
 exported as Developer ID, and a notary profile is set. Without it, the
 script prints that the build is not a release.
 
-For each architecture folder, the script then checks that the dylib and
+The script then checks that the dylib and
 the CLI are signed by the build's Team (library validation requires it) and,
 for a Developer ID build, by a Developer ID certificate. With a notary
-profile it notarizes both files and requires Gatekeeper to report
-`source=Notarized Developer ID` for each. A bare dylib or executable cannot
+profile it notarizes both files, confirms that each file's cdhash is in
+the ticket Apple issued (from `notarytool log`), and then requires
+Gatekeeper to report `source=Notarized Developer ID` for each, assessing
+both by their own signature (`spctl --assess --type open --context
+context:primary-signature`; `--type execute` never reports a source for a
+bare executable). A bare dylib or executable cannot
 carry a stapled ticket, so Gatekeeper looks the ticket up online the first
 time a downloaded copy runs. Nothing is modified on disk, so the
 signatures and `SHA256SUMS` stay valid.
@@ -440,8 +445,8 @@ disables `DYLD_*` environment overrides (which can otherwise redirect which
 dylib a process loads) and enforces library validation, so the CLI only
 loads dylibs signed by the same Team or by Apple.
 
-It also builds the bundled CLI into `dist/osx-universal/hkdfguard-v1-initialize.app`
-— one universal (arm64 + x86_64) bundle with the dylib embedded. Xcode
+It also builds the bundled CLI into `dist/osx-arm64-app/hkdfguard-v1-initialize.app`
+— an arm64 bundle with the dylib embedded. Xcode
 archives and exports it, because only an export embeds the provisioning
 profile that the `keychain-access-groups` entitlement requires. Before
 anything reaches `dist/`, the script verifies:
@@ -450,7 +455,7 @@ anything reaches `dist/`, the script verifies:
   hardened runtime;
 - the Team ID on both the bundle and the embedded dylib (library validation
   only loads a same-Team dylib);
-- both architectures in the executable and the embedded dylib;
+- that the executable and the embedded dylib are arm64;
 - that the first `keychain-access-groups` entry is `<TeamID>.com.hkdfguard.keys`
   (the library stores KEKs under the first), and that the test-only
   `com.hkdfguard.tests.keys` group is absent;
@@ -474,7 +479,7 @@ input only names something kept in your keychain or Xcode:
 | `HKDFGUARD_SIGN_IDENTITY` | a signing certificate in your login keychain |
 | `HKDFGUARD_TEAM_ID` | the Team to sign the bundle for (not secret; defaults to the project's `DEVELOPMENT_TEAM`) |
 | `HKDFGUARD_ASC_KEY_PATH`, `HKDFGUARD_ASC_KEY_ID`, `HKDFGUARD_ASC_ISSUER_ID` | optional App Store Connect API key (path to the `.p8`, kept outside the repo) so `xcodebuild` can manage provisioning profiles without an Apple ID signed in to Xcode; otherwise it uses the account in Xcode → Settings → Accounts |
-| `HKDFGUARD_NOTARY_PROFILE` | optional `notarytool` keychain profile; when set, the per-architecture dylib and CLI are notarized and checked with Gatekeeper, and the bundle is notarized, stapled, and checked (Developer ID only) |
+| `HKDFGUARD_NOTARY_PROFILE` | optional `notarytool` keychain profile; when set, the dylib and CLI are notarized and checked with Gatekeeper, and the bundle is notarized, stapled, and checked (Developer ID only) |
 | `HKDFGUARD_RELEASE` | `1` for a release: refuses to run without a Developer ID identity, a Developer ID app export, and a notary profile |
 
 One-time setup for a distributable build:
@@ -518,19 +523,17 @@ HKDFGUARD_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary \
 ./build-dist.sh
 
-(cd dist/osx-x64   && zip -r "../hkdfguard-native-macos-v1-$VERSION-osx-x64.zip"   .)
 (cd dist/osx-arm64 && zip -r "../hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip" .)
 # ditto, not zip, for the app bundle: it preserves the bundle's signature.
-ditto -c -k --keepParent dist/osx-universal/hkdfguard-v1-initialize.app \
-  "dist/hkdfguard-v1-initialize-$VERSION-osx-universal.app.zip"
+ditto -c -k --keepParent dist/osx-arm64-app/hkdfguard-v1-initialize.app \
+  "dist/hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip"
 
 # Checksums of the release assets themselves, published in the release
 # notes -- outside the assets, so replacing an asset cannot also replace
 # the value it is checked against.
 (cd dist && shasum -a 256 \
-  "hkdfguard-native-macos-v1-$VERSION-osx-x64.zip" \
   "hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip" \
-  "hkdfguard-v1-initialize-$VERSION-osx-universal.app.zip" > RELEASE-SHA256SUMS)
+  "hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip" > RELEASE-SHA256SUMS)
 {
   echo "See README for the C ABI and per-language consumption notes."
   echo
@@ -544,9 +547,8 @@ git tag -s "$VERSION" -m "$VERSION"   # signed tag; -a if you have no signing ke
 git push origin "$VERSION"
 
 gh release create "$VERSION" \
-  dist/hkdfguard-native-macos-v1-$VERSION-osx-x64.zip \
   dist/hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip \
-  "dist/hkdfguard-v1-initialize-$VERSION-osx-universal.app.zip" \
+  "dist/hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip" \
   --title "$VERSION" \
   --notes-file dist/release-notes.md
 ```
@@ -577,8 +579,7 @@ two such paths:
 | `install-user.sh` | `~/.hkdfguard/v1/` | the current user | a developer's own Mac |
 | `sudo ./install-system.sh` | `/Library/Application Support/HkdfGuard/v1/` | root | shared, build, and team machines; MDM rollout |
 
-Either one installs the four files for **this Mac's architecture only**
-(the `osx-arm64` build on Apple silicon, `osx-x64` on Intel) directly into
+Either one installs the four files of the `osx-arm64` build directly into
 `v1/`:
 
 ```
@@ -588,17 +589,17 @@ v1/hkdfguard-v1-initialize
 v1/SHA256SUMS
 ```
 
-The architecture comes from the hardware (`sysctl hw.optional.arm64`), not
-from the shell, so running the script under Rosetta still installs the
-arm64 build. An x64 .NET, Python, or Java runtime under Rosetta on Apple
-silicon cannot load it; run consumers on a native arm64 runtime.
+Both refuse to run on an Intel Mac. They check the hardware (`sysctl
+hw.optional.arm64`), not the shell, so a script run under Rosetta still
+installs. Consumers must run on a native arm64 runtime: an x64 .NET,
+Python, or Java runtime under Rosetta cannot load the arm64 dylib.
 
 ### Pushing a build
 
 From a local build, after `./build-dist.sh`:
 
 ```sh
-./install-user.sh                 # picks dist/osx-arm64 or dist/osx-x64
+./install-user.sh                 # installs dist/osx-arm64
 sudo ./install-system.sh
 ```
 
@@ -617,13 +618,12 @@ sudo ./install-system.sh --from hkdfguard-$VERSION --team-id <TEAMID>
 ```
 
 `--from` accepts either a `build-dist.sh`-style folder holding `osx-arm64/`
-and `osx-x64/` (the script picks the matching one) or a single extracted
-per-architecture folder, which must match this Mac.
+or the extracted `osx-arm64` release folder itself.
 
 For a fleet, have your MDM (Jamf, Intune, Kandji, ...) run
-`install-system.sh --from <folder> --team-id <TEAMID>` as root, with each
-release zip extracted into `<folder>/osx-arm64/` and `<folder>/osx-x64/`,
-so one policy covers Intel and Apple silicon. Always pass `--team-id` there: it pins the signing Team, so a
+`install-system.sh --from <folder> --team-id <TEAMID>` as root, with the
+release zip extracted into `<folder>`, and scope the policy to Apple
+silicon Macs. Always pass `--team-id` there: it pins the signing Team, so a
 build signed by anyone else is refused.
 
 To remove an install: `./install-user.sh --uninstall` or
@@ -637,7 +637,7 @@ file in the `--from` folder cannot be swapped between the check and the
 install:
 
 - `SHA256SUMS` lists exactly the three payload files, and they match it.
-- The dylib and CLI are thin binaries for this Mac's architecture.
+- The dylib and CLI are thin arm64 binaries.
 - Both signatures verify (`codesign --verify --strict`), carry a Team ID
   (not ad-hoc), share the same Team ID, and match `--team-id` when given.
 
@@ -789,8 +789,8 @@ int status = hkdfguard_create_kek("com.example.ingest");
 extension, so the same `DllImport` works wherever the library follows the
 standard naming.
 
-The `dist/osx-x64` / `dist/osx-arm64` folder names are already .NET runtime
-identifiers, so a C# consumer can drop them straight into a NuGet package's
+The `dist/osx-arm64` folder name is already a .NET runtime identifier, so a
+C# consumer can drop it straight into a NuGet package's
 `runtimes/{rid}/native/` layout instead of loading the zip by hand.
 
 ## Signing and entitlements

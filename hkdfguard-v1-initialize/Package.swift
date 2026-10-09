@@ -31,12 +31,9 @@ import PackageDescription
 // normal installed command-line tool should.
 //
 // HKDFGUARD_DYLIB_DIR overrides that default directory. build-dist.sh uses
-// it to link each architecture's CLI against the matching per-architecture
-// dylib build (build-x86_64/Release, build-arm64/Release) -- the linker
-// refuses to link an x86_64 executable against an arm64-only dylib, so a
-// single hardcoded directory can only ever produce a host-architecture
-// CLI. Pair an override with a distinct --scratch-path per architecture so
-// one build's cached manifest/linker flags can't bleed into the other's.
+// it to link the CLI against its own Release dylib build
+// (build-arm64/Release). Pair an override with a dedicated --scratch-path so
+// a cached manifest/linker flags from another build can't bleed into it.
 let hkdfguardDylibDir: String = {
     if let override = ProcessInfo.processInfo.environment["HKDFGUARD_DYLIB_DIR"], !override.isEmpty {
         return override
