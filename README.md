@@ -363,7 +363,10 @@ dylib and both CLI builds target **macOS 13.0+**; the test bundle and test
 host target 14.0; the framework target uses the SDK's recommended
 deployment target.
 
-Supporting scripts: `build-dist.sh` (release artifacts, below) and
+Supporting scripts: `build-dist.sh` (release artifacts, below),
+`install-user.sh` / `install-system.sh` (put a build at a fixed path on a
+Mac for other applications to load; see
+[Installing on a machine](#installing-on-a-machine)), and
 `setup-hosted-test-kek.sh` (a one-time, per-developer provisioning of a
 data-protection KEK in the test-only access group, under
 `com.hkdfguard.fixture.hostedtests`; see Tests).
@@ -561,6 +564,140 @@ downloaded zip against those first, then its contents against the inner
 signature and notarization (`spctl --assess`). Confirm the tag before pushing it or
 running `gh release create` — a release, unlike a local build, is visible
 and hard to fully retract once someone has pulled it.
+
+## Installing on a machine
+
+Applications should load the dylib from a fixed, absolute path rather than
+from their working directory or a search path, so nothing earlier on that
+path can substitute a different library. Two scripts put a build at one of
+two such paths:
+
+| Script | Installs to | Owned by | Use it for |
+|---|---|---|---|
+| `install-user.sh` | `~/.hkdfguard/v1/` | the current user | a developer's own Mac |
+| `sudo ./install-system.sh` | `/Library/Application Support/HkdfGuard/v1/` | root | shared, build, and team machines; MDM rollout |
+
+Either one installs the four files for **this Mac's architecture only**
+(the `osx-arm64` build on Apple silicon, `osx-x64` on Intel) directly into
+`v1/`:
+
+```
+v1/libhkdfguard_v1.dylib
+v1/hkdfguard.h
+v1/hkdfguard-v1-initialize
+v1/SHA256SUMS
+```
+
+The architecture comes from the hardware (`sysctl hw.optional.arm64`), not
+from the shell, so running the script under Rosetta still installs the
+arm64 build. An x64 .NET, Python, or Java runtime under Rosetta on Apple
+silicon cannot load it; run consumers on a native arm64 runtime.
+
+### Pushing a build
+
+From a local build, after `./build-dist.sh`:
+
+```sh
+./install-user.sh                 # picks dist/osx-arm64 or dist/osx-x64
+sudo ./install-system.sh
+```
+
+From a published release, verify the zip against the release notes first
+(see [Publishing a release](#publishing-a-release)), then point `--from` at
+the extracted folder:
+
+```sh
+VERSION=v1.2.0
+ZIP="hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip"
+gh release download "$VERSION" --pattern "$ZIP"
+shasum -a 256 "$ZIP"              # must match the value in the release notes
+mkdir hkdfguard-$VERSION && ditto -x -k "$ZIP" hkdfguard-$VERSION
+
+sudo ./install-system.sh --from hkdfguard-$VERSION --team-id <TEAMID>
+```
+
+`--from` accepts either a `build-dist.sh`-style folder holding `osx-arm64/`
+and `osx-x64/` (the script picks the matching one) or a single extracted
+per-architecture folder, which must match this Mac.
+
+For a fleet, have your MDM (Jamf, Intune, Kandji, ...) run
+`install-system.sh --from <folder> --team-id <TEAMID>` as root, with each
+release zip extracted into `<folder>/osx-arm64/` and `<folder>/osx-x64/`,
+so one policy covers Intel and Apple silicon. Always pass `--team-id` there: it pins the signing Team, so a
+build signed by anyone else is refused.
+
+To remove an install: `./install-user.sh --uninstall` or
+`sudo ./install-system.sh --uninstall`.
+
+### What the scripts check
+
+Before anything at the destination changes, each script copies the files
+into a staging folder next to `v1/` and verifies **the staged copy** — so a
+file in the `--from` folder cannot be swapped between the check and the
+install:
+
+- `SHA256SUMS` lists exactly the three payload files, and they match it.
+- The dylib and CLI are thin binaries for this Mac's architecture.
+- Both signatures verify (`codesign --verify --strict`), carry a Team ID
+  (not ad-hoc), share the same Team ID, and match `--team-id` when given.
+
+Only then is the old `v1/` swapped out for the new one; a failed run leaves
+an existing install untouched. Extended attributes, including quarantine,
+are not copied, as with a `.pkg` installer: the checks above stand in for
+Gatekeeper's.
+
+Each script also refuses to install through a symlink, or under a folder
+that the wrong owner or another user could write:
+
+- `install-user.sh` refuses to run as root, takes the home folder from the
+  directory service (`dscl`) rather than `$HOME`, and requires the home
+  folder, `~/.hkdfguard`, and `v1/` to be owned by the user and not group-
+  or world-writable. Files are mode 644, the CLI and folders 755.
+- `install-system.sh` requires root, runs with a fixed `PATH`, and requires
+  `/`, `/Library`, `/Library/Application Support`, `HkdfGuard/`, and
+  everything it installs to be root-owned and writable only by root (files
+  `root:wheel` 644, the CLI and folders 755). It warns when the binaries are
+  not Developer ID signed.
+
+`/Library/Application Support` is used rather than `/usr/local/lib`
+because Homebrew on Intel Macs makes `/usr/local`'s subfolders writable by
+a user; `/usr/lib` is protected by SIP; and `/Users/Shared` or `/tmp` are
+writable by everyone.
+
+A per-user install is only as trusted as that user's account: anything
+running as the user can replace it. It is meant for development. Use the
+system install anywhere the library protects production data.
+
+### Loading the installed library
+
+Consumers should look in the system location first and fall back to the
+per-user one, so an administrator's install cannot be overridden by a
+per-user copy:
+
+1. `/Library/Application Support/HkdfGuard/v1/libhkdfguard_v1.dylib`
+2. `<home>/.hkdfguard/v1/libhkdfguard_v1.dylib`, with `<home>` looked up
+   from the user database (`getpwuid(getuid())`), not `$HOME`
+
+Load the chosen file by its absolute path. Do not take extra search folders
+from an environment variable or config file. A hardened consumer also
+re-checks what the scripts enforce before loading: resolve the path with
+`realpath` and confirm it is still one of the two above, then check that
+every folder from the install root down and the dylib itself are owned by
+root (system) or the current user (per-user) and not group- or
+world-writable.
+
+For C#, route the `DllImport` name to that path with a resolver, so the
+existing `[DllImport("hkdfguard_v1")]` declarations stay unchanged:
+
+```csharp
+NativeLibrary.SetDllImportResolver(typeof(HkdfGuardInterop).Assembly, (name, assembly, searchPath) =>
+    name == "hkdfguard_v1"
+        ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath()) // system, then per-user; checks above
+        : IntPtr.Zero);
+```
+
+Other languages load the same absolute path in place of the
+`./libhkdfguard_v1.dylib` used in the examples below.
 
 ## Consuming this library
 
