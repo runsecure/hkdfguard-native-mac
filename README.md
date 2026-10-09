@@ -614,17 +614,22 @@ gh release download "$VERSION" --pattern "$ZIP"
 shasum -a 256 "$ZIP"              # must match the value in the release notes
 mkdir hkdfguard-$VERSION && ditto -x -k "$ZIP" hkdfguard-$VERSION
 
-sudo ./install-system.sh --from hkdfguard-$VERSION --team-id <TEAMID>
+sudo ./install-system.sh --from hkdfguard-$VERSION
 ```
 
 `--from` accepts either a `build-dist.sh`-style folder holding `osx-arm64/`
 or the extracted `osx-arm64` release folder itself.
 
 For a fleet, have your MDM (Jamf, Intune, Kandji, ...) run
-`install-system.sh --from <folder> --team-id <TEAMID>` as root, with the
-release zip extracted into `<folder>`, and scope the policy to Apple
-silicon Macs. Always pass `--team-id` there: it pins the signing Team, so a
-build signed by anyone else is refused.
+`install-system.sh --from <folder>` as root, with the release zip
+extracted into `<folder>`, and scope the policy to Apple silicon Macs.
+
+`install-system.sh` only installs binaries signed by the Team pinned in
+the script (`PINNED_TEAM_ID`, which must match `DEVELOPMENT_TEAM` in the
+Xcode project); a build signed by anyone else is refused. The pin lives in
+the script rather than in the payload, so tampering with the files being
+installed cannot change it. `--team-id <TEAMID>` overrides it, for a build
+signed by a different team such as a fork.
 
 To remove an install: `./install-user.sh --uninstall` or
 `sudo ./install-system.sh --uninstall`.
@@ -638,8 +643,10 @@ install:
 
 - `SHA256SUMS` lists exactly the three payload files, and they match it.
 - The dylib and CLI are thin arm64 binaries.
-- Both signatures verify (`codesign --verify --strict`), carry a Team ID
-  (not ad-hoc), share the same Team ID, and match `--team-id` when given.
+- Both signatures verify (`codesign --verify --strict`) and carry a Team
+  ID (not ad-hoc). `install-system.sh` requires that Team ID to be the
+  pinned one (or `--team-id`); `install-user.sh` requires both to share
+  one Team ID, and match `--team-id` when given.
 
 Only then is the old `v1/` swapped out for the new one; a failed run leaves
 an existing install untouched. Extended attributes, including quarantine,

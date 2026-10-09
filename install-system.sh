@@ -13,9 +13,8 @@
 #                     osx-arm64/ (default: ./dist next to this script), or
 #                     an extracted osx-arm64 release folder with SHA256SUMS
 #                     at its top level
-#   --team-id TEAMID  require both binaries to be signed by this Team ID
-#                     (recommended for fleet installs; default: they only
-#                     have to agree with each other)
+#   --team-id TEAMID  override the pinned Team ID below (only for a build
+#                     signed by a different team, e.g. a fork)
 #   --uninstall       remove /Library/Application Support/HkdfGuard/v1
 #
 # Why this location: every folder from / down is owned by root and writable
@@ -42,10 +41,16 @@ BASE="/Library/Application Support"
 PARENT="$BASE/HkdfGuard"
 TARGET="$PARENT/v1"
 
+# The only Team whose signatures this script installs. Pinned here, in the
+# script, rather than read from the files being installed: anyone able to
+# tamper with the payload could also change a Team ID shipped beside it.
+# Keep it in sync with DEVELOPMENT_TEAM in the Xcode project.
+PINNED_TEAM_ID="MFW3T8R8J3"
+
 fail() { echo "error: $*" >&2; exit 1; }
 
 SOURCE="$ROOT/dist"
-TEAM_ID=""
+TEAM_ID="$PINNED_TEAM_ID"
 UNINSTALL=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -146,7 +151,6 @@ for f in "$DYLIB_NAME" "$CLI_NAME"; do
     info="$(codesign -dvv "$STAGE/$f" 2>&1)"
     team="$(sed -n 's/^TeamIdentifier=//p' <<<"$info")"
     [ -n "$team" ] && [ "$team" != "not set" ] || fail "$f: no Team ID (ad-hoc signed?)"
-    [ -n "$TEAM_ID" ] || TEAM_ID="$team"
     [ "$team" = "$TEAM_ID" ] || fail "$f: signed by team $team, expected $TEAM_ID"
     grep -q '^Authority=Developer ID Application:' <<<"$info" || DEVELOPER_ID=0
 done
