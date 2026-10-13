@@ -206,6 +206,45 @@ private enum HKDFGuardStatus: Int32 {
     /// not-found or one of the access-denial codes above — e.g. no
     /// keychain available at all, or an unexpected item shape.
     case keychainReadFailed = -18
+
+    // MARK: Wrapped-key file failures — returned only by
+    // `hkdfguard_open_file`, which reads a payload from disk and never
+    // touches the keychain or the Secure Enclave.
+
+    /// No file at the path, or a component of the path is not a directory
+    /// (`ENOENT`, `ENOTDIR`).
+    case fileNotFound = -19
+
+    /// The file or a directory on its path can't be read by this process
+    /// (`EACCES`, `EPERM`).
+    case fileAccessDenied = -20
+
+    /// The path names a symbolic link, directory, FIFO, socket, or device
+    /// rather than a regular file. A symlink is refused rather than
+    /// followed (`O_NOFOLLOW`), and a FIFO is opened non-blocking so it can't
+    /// hang the caller.
+    case fileNotRegular = -21
+
+    /// `open`, `fstat`, or `read` failed for any other reason.
+    case fileReadFailed = -22
+
+    /// Fewer bytes than a wrapped payload — truncated, or not a payload —
+    /// and not recognizable as a plaintext DEK (that is `fileUnprotectedKey`).
+    case fileTooShort = -23
+
+    /// More bytes than a wrapped payload. Detected from the file's size
+    /// before anything is read, so an arbitrarily large file costs nothing.
+    case fileTooLong = -24
+
+    /// Exactly the payload's length, but not a payload: its ephemeral public
+    /// key is not a valid P-256 point, or its KEK fingerprint is all zeros.
+    case fileMalformed = -25
+
+    /// The file holds a bare, unwrapped 32-byte DEK — raw, or as base64 or
+    /// hex text — instead of a wrapped payload. The key was stored without
+    /// protection: treat it as exposed, and rotate it rather than wrap it
+    /// now. Its bytes are never copied to the caller's buffer.
+    case fileUnprotectedKey = -26
 }
 
 // MARK: - Secure Enclave KEK lookup / provisioning
@@ -932,5 +971,183 @@ public func hkdfguard_unwrap_dek(
     }
     outLen.pointee = Int32(plaintext.count)
 
+    return HKDFGuardStatus.success.rawValue
+}
+
+// MARK: - Read a wrapped payload from a file
+
+/// Maps an `open(2)` failure to the status `hkdfguard_open_file` reports.
+private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
+    switch code {
+    case ENOENT, ENOTDIR:
+        return .fileNotFound
+    case EACCES, EPERM:
+        return .fileAccessDenied
+    case ELOOP:
+        // O_NOFOLLOW: the final path component is a symbolic link.
+        return .fileNotRegular
+    default:
+        return .fileReadFailed
+    }
+}
+
+/// Reads at most `buffer.count` bytes of the regular file at `path` into
+/// `buffer`, returning how many were read. A file whose size already
+/// exceeds a wrapped payload is rejected from `fstat` alone, before any
+/// read. The caller zeroes `buffer`, which may end up holding a plaintext
+/// DEK.
+private func readWrappedFile(
+    path: UnsafePointer<CChar>,
+    into buffer: inout [UInt8]
+) -> (status: HKDFGuardStatus, count: Int) {
+    // O_NOFOLLOW: a symlink is refused, not followed. O_NONBLOCK: a FIFO
+    // with no writer would otherwise block here; it has no effect on the
+    // regular files actually accepted.
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else {
+        return (fileOpenStatus(errno: errno), 0)
+    }
+    defer { close(fd) }
+
+    var info = stat()
+    guard fstat(fd, &info) == 0 else {
+        return (.fileReadFailed, 0)
+    }
+    guard info.st_mode & S_IFMT == S_IFREG else {
+        return (.fileNotRegular, 0)
+    }
+    guard info.st_size <= off_t(hkdfguardWrappedLength) else {
+        return (.fileTooLong, 0)
+    }
+
+    // Read until EOF or the buffer is full, whatever fstat said: the file
+    // may change between the two, and the bytes actually read decide.
+    var count = 0
+    while count < buffer.count {
+        let n = buffer.withUnsafeMutableBytes { raw in
+            read(fd, raw.baseAddress! + count, raw.count - count)
+        }
+        if n > 0 {
+            count += n
+        } else if n == 0 {
+            break
+        } else if errno != EINTR {
+            return (.fileReadFailed, 0)
+        }
+    }
+    return (.success, count)
+}
+
+/// True when `bytes` look like a bare 32-byte DEK rather than a wrapped
+/// payload: exactly 32 raw bytes, or — ignoring surrounding ASCII
+/// whitespace, as the CLI's `--dek-file` accepts — the 44-character padded
+/// or 43-character unpadded base64 (standard or URL alphabet), or the
+/// 64-character hex, encoding of 32 bytes. Checked on length and alphabet
+/// only, so nothing is decoded and no further copy of a key is made.
+private func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool {
+    if bytes.count == hkdfguardDekLength {
+        return true
+    }
+
+    func isWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
+    }
+    func isHex(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte) || (0x41...0x46).contains(byte) || (0x61...0x66).contains(byte)
+    }
+    func isBase64(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte) || (0x41...0x5A).contains(byte) || (0x61...0x7A).contains(byte)
+            || byte == 0x2B || byte == 0x2F || byte == 0x2D || byte == 0x5F // + / - _
+    }
+
+    guard let first = bytes.firstIndex(where: { !isWhitespace($0) }),
+          let last = bytes.lastIndex(where: { !isWhitespace($0) }) else {
+        return false
+    }
+    let text = bytes[first...last]
+
+    switch text.count {
+    case hkdfguardDekLength * 2:
+        return text.allSatisfy(isHex)
+    case 44:
+        return text.last == 0x3D && text.dropLast().allSatisfy(isBase64) // trailing '='
+    case 43:
+        return text.allSatisfy(isBase64)
+    default:
+        return false
+    }
+}
+
+/// Reads the wrapped payload stored at `path` — the 156-byte file the CLI's
+/// `wrap` writes — validates it, and copies it to `out`, ready for
+/// `hkdfguard_unwrap_dek`. Never touches the keychain or the Secure
+/// Enclave, and never unwraps anything.
+///
+/// `*outLen` is the capacity on entry and is written on every return path:
+/// 156 on success or `outputBufferTooSmall` (the required size, reported
+/// before the file is opened), 0 on every other failure. `out` is written
+/// only on success, so a rejected file — in particular one holding a
+/// plaintext DEK — never reaches the caller's buffer.
+@_cdecl("hkdfguard_open_file")
+public func hkdfguard_open_file(
+    pathPtr: UnsafePointer<CChar>?,
+    outPtr: UnsafeMutablePointer<UInt8>?,
+    outLen: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    guard let outPtr, let outLen else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    guard Int(outLen.pointee) >= hkdfguardWrappedLength else {
+        outLen.pointee = Int32(hkdfguardWrappedLength)
+        return HKDFGuardStatus.outputBufferTooSmall.rawValue
+    }
+    outLen.pointee = 0
+    guard let pathPtr else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+
+    // One byte more than a payload, so a file that grew past the fstat
+    // check is still seen as too long without reading the rest of it.
+    var buffer = [UInt8](repeating: 0, count: hkdfguardWrappedLength + 1)
+    defer {
+        buffer.withUnsafeMutableBytes { raw in
+            raw.initializeMemory(as: UInt8.self, repeating: 0)
+        }
+    }
+
+    let (readStatus, count) = readWrappedFile(path: pathPtr, into: &buffer)
+    guard readStatus == .success else {
+        return readStatus.rawValue
+    }
+
+    guard count <= hkdfguardWrappedLength else {
+        return HKDFGuardStatus.fileTooLong.rawValue
+    }
+    guard count == hkdfguardWrappedLength else {
+        // A plaintext DEK is always shorter than a payload; naming it
+        // matters more than "too short", because the key is now exposed.
+        return looksLikePlaintextDek(buffer[0..<count])
+            ? HKDFGuardStatus.fileUnprotectedKey.rawValue
+            : HKDFGuardStatus.fileTooShort.rawValue
+    }
+
+    // Structural checks only -- authenticity is AES-GCM's job at unwrap.
+    // A SHA-256 fingerprint of all zeros does not occur in practice, and the
+    // ephemeral key must be a point on P-256 for any unwrap to succeed. The
+    // point is checked through its X9.63 form (0x04 || x || y):
+    // `PublicKey(rawRepresentation:)` accepts any 64 bytes, on the curve or
+    // not, and only ECDH would notice.
+    let fingerprint = buffer[0..<hkdfguardFingerprintLength]
+    var ephemeralX963: [UInt8] = [0x04]
+    ephemeralX963 += buffer[hkdfguardFingerprintLength..<(hkdfguardFingerprintLength + hkdfguardEphemeralPublicKeyLength)]
+    guard fingerprint.contains(where: { $0 != 0 }),
+          (try? P256.KeyAgreement.PublicKey(x963Representation: ephemeralX963)) != nil else {
+        return HKDFGuardStatus.fileMalformed.rawValue
+    }
+
+    buffer.withUnsafeBytes { raw in
+        _ = memcpy(outPtr, raw.baseAddress!, hkdfguardWrappedLength)
+    }
+    outLen.pointee = Int32(hkdfguardWrappedLength)
     return HKDFGuardStatus.success.rawValue
 }

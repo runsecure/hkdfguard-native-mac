@@ -30,7 +30,8 @@ FOUNDATION_EXPORT const unsigned char HkdfGuardNativeMacOSVersionString[];
 // Every pointer parameter below is required. Under clang that is checked
 // at the call site; elsewhere this macro is documentation. At run time a
 // NULL is never dereferenced: it is reported as invalidInputLength (-1),
-// or as invalidServiceIdentifier (-8) when it is `service`.
+// or as invalidServiceIdentifier (-8) when it is `service`. A NULL `path`
+// is invalidInputLength (-1).
 #if defined(__clang__)
 #  define HKDFGUARD_NONNULL _Nonnull
 #else
@@ -111,6 +112,31 @@ extern "C" {
 //  -18  keychainReadFailed       (SecItemCopyMatching failed for a reason
 //                                 other than not-found or the access-denial
 //                                 conditions above)
+//
+//  -19 to -26 are returned only by hkdfguard_open_file:
+//  -19  fileNotFound             (no file at the path, or a path component
+//                                 is not a directory)
+//  -20  fileAccessDenied         (this process may not read the file or a
+//                                 directory on its path)
+//  -21  fileNotRegular           (a symbolic link -- refused, never
+//                                 followed -- directory, FIFO, socket, or
+//                                 device)
+//  -22  fileReadFailed           (open/fstat/read failed for any other
+//                                 reason)
+//  -23  fileTooShort             (fewer than 156 bytes, and not a
+//                                 plaintext DEK -- see -26)
+//  -24  fileTooLong              (more than 156 bytes; detected from the
+//                                 file's size before anything is read)
+//  -25  fileMalformed            (156 bytes, but not a payload: the
+//                                 ephemeral public key is not a valid P-256
+//                                 point, or the KEK fingerprint is all
+//                                 zeros)
+//  -26  fileUnprotectedKey       (the file holds a bare, unwrapped 32-byte
+//                                 DEK -- raw, or as base64 or hex text --
+//                                 instead of a wrapped payload. The key was
+//                                 stored unprotected: treat it as exposed
+//                                 and rotate it. Its bytes are never copied
+//                                 to the caller's buffer)
 
 // ---------------------------------------------------------------------------
 // `service`
@@ -263,6 +289,26 @@ int32_t hkdfguard_unwrap_dek(
 // sourcing their own randomness. Never creates a KEK.
 int32_t hkdfguard_generate_and_wrap_dek(
     const char* HKDFGUARD_NONNULL service,
+    uint8_t* HKDFGUARD_NONNULL out,
+    int32_t* HKDFGUARD_NONNULL out_len
+);
+
+// Reads the wrapped payload stored at `path` -- the 156-byte file the CLI's
+// `wrap` command writes -- validates it, and copies it to `out`, ready to
+// pass to hkdfguard_unwrap_dek. Never touches the keychain or the Secure
+// Enclave, and never unwraps: the plaintext DEK does not pass through this
+// function.
+//
+// `path` is a null-terminated filesystem path. It must name a regular file;
+// a symbolic link as its last component is refused (-21), not followed, and
+// a FIFO is refused without blocking.
+//
+// `*out_len` is the capacity of `out` on entry (at least 156) and is
+// written on every return: 156 -- the number of bytes read -- on success,
+// 156 on outputBufferTooSmall (-2, reported before the file is opened), and
+// 0 on every other failure. `out` is written only on success.
+int32_t hkdfguard_open_file(
+    const char* HKDFGUARD_NONNULL path,
     uint8_t* HKDFGUARD_NONNULL out,
     int32_t* HKDFGUARD_NONNULL out_len
 );

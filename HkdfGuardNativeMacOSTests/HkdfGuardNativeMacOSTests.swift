@@ -532,6 +532,39 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(unwrapResult.plaintext == dek)
     }
 
+    /// The real use of `hkdfguard_open_file`: a payload written to disk
+    /// (as the CLI's `wrap` does), read back, and unwrapped. Its other
+    /// behavior needs no enclave and is covered by `HkdfGuardOpenFileTests`.
+    @Test func wrapWriteOpenFileThenUnwrapRecoversOriginalDEK() throws {
+        let service = "com.hkdfguard.tests.roundtrip.file"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createKEK(service: service) == 0)
+        let dek = Self.randomDEK()
+
+        let wrapResult = Self.wrap(dek, service: service)
+        #expect(wrapResult.status == 0)
+
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hkdfguard.roundtrip.\(UUID().uuidString).key")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(wrapResult.wrapped).write(to: file)
+
+        var read = [UInt8](repeating: 0, count: Self.wrappedLength)
+        var readLen = Int32(Self.wrappedLength)
+        let openStatus = file.path.withCString { pathCStr in
+            read.withUnsafeMutableBufferPointer { readBuf in
+                hkdfguard_open_file(pathPtr: pathCStr, outPtr: readBuf.baseAddress!, outLen: &readLen)
+            }
+        }
+        #expect(openStatus == 0)
+        #expect(readLen == Int32(Self.wrappedLength))
+        #expect(read == wrapResult.wrapped)
+
+        let unwrapResult = Self.unwrap(read, service: service)
+        #expect(unwrapResult.status == 0)
+        #expect(unwrapResult.plaintext == dek)
+    }
+
     @Test func wrappedOutputHasExpectedLength() {
         let service = "com.hkdfguard.tests.wrapped.length"
         defer { Self.deleteKEK(service: service) }

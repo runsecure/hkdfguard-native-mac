@@ -89,6 +89,7 @@ int32_t hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int32_t dek_
 int32_t hkdfguard_unwrap_dek(const char* service, const uint8_t* wrapped, int32_t wrapped_len,
                              uint8_t* out, int32_t* out_len);
 int32_t hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int32_t* out_len);
+int32_t hkdfguard_open_file(const char* path, uint8_t* out, int32_t* out_len); // reads a 156-byte payload file
 ```
 
 `*out_len` is the buffer capacity on entry and, on return, either the bytes
@@ -97,6 +98,45 @@ written or — on `outputBufferTooSmall` — the required size (156 for wrap,
 `wrapped_len == 156`, **before** touching the keychain or the enclave, so a
 sizing call costs nothing and a DEK is never decrypted for a caller who
 cannot receive it.
+
+### Reading a wrapped key file: `hkdfguard_open_file`
+
+Reads the 156-byte payload that the CLI's `wrap` writes, validates it, and
+copies it to `out`, ready for `hkdfguard_unwrap_dek`. It never touches the
+keychain or the Secure Enclave and never unwraps, so the plaintext DEK does
+not pass through it:
+
+```c
+uint8_t wrapped[156];
+int32_t wrapped_len = sizeof wrapped;
+int32_t status = hkdfguard_open_file("/etc/example/ingest.key", wrapped, &wrapped_len);
+if (status == 0)
+    status = hkdfguard_unwrap_dek("com.example.ingest", wrapped, wrapped_len, dek, &dek_len);
+```
+
+`*out_len` is the capacity on entry (at least 156) and is always written:
+156 — the bytes read — on success, 156 on `outputBufferTooSmall` (checked
+before the file is opened), and 0 on every other failure. `out` is written
+only on success.
+
+- **Safe opening.** The path must name a regular file. A symbolic link as
+  its last component is refused, not followed (`O_NOFOLLOW`), and a FIFO is
+  refused without blocking. At most 157 bytes are read, and a file larger
+  than a payload is rejected from its size before any read.
+- **Length.** Anything other than exactly 156 bytes is `fileTooShort`
+  (-23) or `fileTooLong` (-24).
+- **Unprotected key.** A file holding a bare 32-byte DEK instead of a
+  payload — raw bytes, or base64 (padded or not, standard or URL alphabet)
+  or hex text, with optional surrounding whitespace — is reported as
+  `fileUnprotectedKey` (-26), not merely as too short. The key was stored
+  unprotected: treat it as exposed and rotate it, rather than wrapping it
+  now. Its bytes never reach the caller's buffer, and the library zeroes
+  its own read buffer on every return.
+- **Malformed.** A 156-byte file whose ephemeral public key is not a valid
+  P-256 point, or whose KEK fingerprint is all zeros, is `fileMalformed`
+  (-25). These are structural checks only: whether the payload is genuine,
+  unaltered, and for this service is decided by `hkdfguard_unwrap_dek`
+  (`-16`, `-6`).
 
 ### Status codes
 
@@ -121,6 +161,14 @@ cannot receive it.
 | `-16` | `fingerprintMismatch` — payload was wrapped under a different KEK |
 | `-17` | `keychainAccessDenied` — locked keychain / no UI session / ACL denial / declined prompt / missing entitlement. **A key likely exists**; don't create or delete anything |
 | `-18` | `keychainReadFailed` |
+| `-19` | `fileNotFound` — no file at the path, or a path component is not a directory (`hkdfguard_open_file` only, as are `-20` to `-26`) |
+| `-20` | `fileAccessDenied` — this process may not read the file or a directory on its path |
+| `-21` | `fileNotRegular` — a symbolic link (refused, never followed), directory, FIFO, socket, or device |
+| `-22` | `fileReadFailed` — `open`/`fstat`/`read` failed for any other reason |
+| `-23` | `fileTooShort` — fewer than 156 bytes, and not a plaintext DEK |
+| `-24` | `fileTooLong` — more than 156 bytes |
+| `-25` | `fileMalformed` — 156 bytes, but the ephemeral key is not a P-256 point or the fingerprint is all zeros |
+| `-26` | `fileUnprotectedKey` — the file holds a bare, unwrapped DEK. **Treat the key as exposed** and rotate it |
 
 ## Keychain modes (hybrid)
 
@@ -833,17 +881,24 @@ C# consumer can drop it straight into a NuGet package's
 
 ## Tests
 
-Two Swift Testing suites, both `.serialized`:
+Three Swift Testing suites:
 
-- **`HkdfGuardNativeMacOSWrapUnwrapTests`** exercises every C entry
-  point in-process: provisioning, idempotence and the first-use race,
+- **`HkdfGuardNativeMacOSWrapUnwrapTests`** (`.serialized`) exercises
+  every C entry point in-process: provisioning, idempotence and the first-use race,
   service-name rules (ASCII bytes, case-insensitivity, length), round trips,
   payload length, nonce/ephemeral uniqueness, per-service isolation,
   fingerprint and ciphertext tamper detection, buffer sizing before any
   enclave work, NULL-pointer handling, corrupt-item reporting, and the
   keychain-mode decision (including that data-protection mode from an
-  unentitled process is reported as `-17`, never as "no key").
-- **`HkdfGuardCommandLineToolTests`** builds and runs the real CLI as a
+  unentitled process is reported as `-17`, never as "no key"), and a
+  wrap → write file → `hkdfguard_open_file` → unwrap round trip.
+- **`HkdfGuardOpenFileTests`** covers `hkdfguard_open_file` without the
+  enclave: exact-length success, too short/too long, plaintext DEKs in
+  every accepted encoding (`-26`, never copied out) versus short text that
+  is not a key, malformed payloads (off-curve ephemeral key, zero
+  fingerprint), missing and unreadable files, symlink/directory/FIFO
+  refusal, buffer sizing before the file is opened, and NULL pointers.
+- **`HkdfGuardCommandLineToolTests`** (`.serialized`) builds and runs the real CLI as a
   subprocess: `provision`/`wrap`/`status`/`retire` semantics, DEK sources
   and their bounds (whitespace, oversized, non-ASCII, missing file),
   rejected arguments, `wrap --fingerprint` (match, mismatch leaves an
@@ -853,8 +908,8 @@ Two Swift Testing suites, both `.serialized`:
   hosted — the bundled CLI's data-protection provision/wrap/retire with
   this host unwrapping.
 
-The library suite needs a real Secure Enclave and is skipped as a whole on
-CI/VM runners; in the CLI suite only the tests that reach the enclave are
+The wrap/unwrap suite needs a real Secure Enclave and is skipped as a whole on
+CI/VM runners; `HkdfGuardOpenFileTests` runs everywhere; in the CLI suite only the tests that reach the enclave are
 skipped there, so its argument-handling tests still run. Every test that
 provisions a key deletes its keychain item afterward — in whichever keychain
 the host process's mode uses — so a run leaves the keychain clean. No test

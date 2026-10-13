@@ -430,6 +430,57 @@ struct HkdfGuardCommandLineToolTests {
         #expect(wrapped.count == 156) // 32-byte KEK fingerprint + 64-byte ephemeral pubkey + 12-byte nonce + 32-byte ciphertext + 16-byte tag
     }
 
+    // MARK: - hkdfguard_open_file against the CLI's own files
+
+    /// `hkdfguard_open_file` on `path`, with a 1024-byte buffer.
+    private static func openFile(_ path: String) -> (status: Int32, bytes: [UInt8]) {
+        var out = [UInt8](repeating: 0, count: 1024)
+        var outLen: Int32 = 1024
+        let status = path.withCString { pathCStr in
+            out.withUnsafeMutableBufferPointer { outBuf in
+                hkdfguard_open_file(pathPtr: pathCStr, outPtr: outBuf.baseAddress!, outLen: &outLen)
+            }
+        }
+        return (status, Array(out.prefix(Int(max(outLen, 0)))))
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliWrappedFileIsReadByOpenFile() throws {
+        // The file format contract between the CLI (writer) and the library
+        // (reader): whatever `wrap` writes -- 0600, fsynced, 156 bytes --
+        // hkdfguard_open_file accepts byte for byte.
+        let service = "com.hkdfguard.tests.cli.openfile"
+        defer { Self.deleteKEK(service: service) }
+
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+
+        try Self.provision(service: service)
+        let result = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
+
+        let opened = Self.openFile(keyFilePath)
+        #expect(opened.status == 0)
+        #expect(opened.bytes == Array(try Data(contentsOf: URL(fileURLWithPath: keyFilePath))))
+    }
+
+    @Test func cliDekInputFileIsReportedAsUnprotectedByOpenFile() throws {
+        // The mistake hkdfguard_open_file's -26 exists for: an application
+        // pointed at the plaintext DEK file given to `wrap --dek-file`
+        // (base64 plus a newline) instead of the wrapped key file `wrap`
+        // wrote. Needs no enclave: the plaintext file is never wrapped here.
+        let dekFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: dekFilePath) }
+        try Self.base64Stdin(Self.randomDEK()).write(to: URL(fileURLWithPath: dekFilePath))
+
+        let opened = Self.openFile(dekFilePath)
+        #expect(opened.status == -26) // fileUnprotectedKey
+        #expect(opened.bytes.isEmpty, "no byte of a plaintext key may reach the caller")
+    }
+
     // MARK: - File handling: refuses to clobber, --force overwrites correctly
 
     @Test(.enabled(if: legacyCrossProcessRoundTripEnabled && SecureEnclave.isAvailable, interactiveKeychainAndSecureEnclaveComment))
