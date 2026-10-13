@@ -120,9 +120,25 @@ before the file is opened), and 0 on every other failure. `out` is written
 only on success.
 
 - **Safe opening.** The path must name a regular file. A symbolic link as
-  its last component is refused, not followed (`O_NOFOLLOW`), and a FIFO is
-  refused without blocking. At most 157 bytes are read, and a file larger
-  than a payload is rejected from its size before any read.
+  its last component is refused, not followed (`O_NOFOLLOW`); symlinks in
+  directory components resolve as usual, so `/etc/...` works. A FIFO,
+  socket, directory, or device is refused without blocking. Every check is
+  made on the opened descriptor (`fstat`), so it describes the file that is
+  actually read. At most 157 bytes are read, and a file larger than a
+  payload is rejected from its size before any read.
+- **Ownership.** The file must be owned by the process's effective user,
+  writable by no one else, and have a single hard link — exactly what the
+  CLI's `wrap` writes — or it is `fileInsecure` (-27). This matches the
+  one-user model (the user who wrapped is the user who unwraps) and turns a
+  file someone else could have replaced, or an older payload hard-linked
+  into place, into a loud error rather than a silent rollback. Group- or
+  world-*readable* is allowed: the payload is ciphertext.
+- **Pass a trusted, absolute path.** The function opens what it is told.
+  Don't hand it paths from untrusted input (its status codes say whether a
+  file exists, is readable, and its size class — a small oracle if a
+  privileged process is pointed at arbitrary files), and don't use relative
+  paths, which resolve against a working directory the caller may not
+  control. Keep the file in a directory only its owner can write.
 - **Length.** Anything other than exactly 156 bytes is `fileTooShort`
   (-23) or `fileTooLong` (-24).
 - **Unprotected key.** A file holding a bare 32-byte DEK instead of a
@@ -136,7 +152,9 @@ only on success.
   P-256 point, or whose KEK fingerprint is all zeros, is `fileMalformed`
   (-25). These are structural checks only: whether the payload is genuine,
   unaltered, and for this service is decided by `hkdfguard_unwrap_dek`
-  (`-16`, `-6`).
+  (`-16`, `-6`). Reading the file proves nothing about it — pin the KEK by
+  comparing bytes 0–31 with the recorded fingerprint before unwrapping, as
+  with any payload.
 
 ### Status codes
 
@@ -168,7 +186,8 @@ only on success.
 | `-23` | `fileTooShort` — fewer than 156 bytes, and not a plaintext DEK |
 | `-24` | `fileTooLong` — more than 156 bytes |
 | `-25` | `fileMalformed` — 156 bytes, but the ephemeral key is not a P-256 point or the fingerprint is all zeros |
-| `-26` | `fileUnprotectedKey` — the file holds a bare, unwrapped DEK. **Treat the key as exposed** and rotate it |
+| `-26` | `fileUnprotectedKey` — the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
+| `-27` | `fileInsecure` — not owned by this user, writable by group or others, or more than one hard link |
 
 ## Keychain modes (hybrid)
 
@@ -897,7 +916,9 @@ Three Swift Testing suites:
   every accepted encoding (`-26`, never copied out) versus short text that
   is not a key, malformed payloads (off-curve ephemeral key, zero
   fingerprint), missing and unreadable files, symlink/directory/FIFO
-  refusal, buffer sizing before the file is opened, and NULL pointers.
+  refusal, ownership rules (group/world-writable and multiply-linked files
+  refused; 0600/0644/0400 accepted), buffer sizing before the file is
+  opened, and NULL pointers.
 - **`HkdfGuardCommandLineToolTests`** (`.serialized`) builds and runs the real CLI as a
   subprocess: `provision`/`wrap`/`status`/`retire` semantics, DEK sources
   and their bounds (whitespace, oversized, non-ASCII, missing file),

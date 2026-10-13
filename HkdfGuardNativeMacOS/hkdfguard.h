@@ -131,12 +131,23 @@ extern "C" {
 //                                 ephemeral public key is not a valid P-256
 //                                 point, or the KEK fingerprint is all
 //                                 zeros)
-//  -26  fileUnprotectedKey       (the file holds a bare, unwrapped 32-byte
-//                                 DEK -- raw, or as base64 or hex text --
-//                                 instead of a wrapped payload. The key was
-//                                 stored unprotected: treat it as exposed
-//                                 and rotate it. Its bytes are never copied
-//                                 to the caller's buffer)
+//  -26  fileUnprotectedKey       (the file appears to hold a bare, unwrapped
+//                                 32-byte DEK -- raw, or as base64 or hex
+//                                 text -- instead of a wrapped payload.
+//                                 Judged on length and alphabet only, so
+//                                 any 32-byte value stored that way matches,
+//                                 a fingerprint saved as 64 hex characters
+//                                 included. If it is a key, it was stored
+//                                 unprotected: treat it as exposed and
+//                                 rotate it. Its bytes are never copied to
+//                                 the caller's buffer)
+//  -27  fileInsecure             (the file is not owned by this process's
+//                                 effective user, is writable by group or
+//                                 others, or has more than one hard link,
+//                                 so someone other than its owner could have
+//                                 replaced or replayed its contents. The
+//                                 CLI's `wrap` writes 0600 with one link;
+//                                 keep it that way)
 
 // ---------------------------------------------------------------------------
 // `service`
@@ -299,14 +310,31 @@ int32_t hkdfguard_generate_and_wrap_dek(
 // Enclave, and never unwraps: the plaintext DEK does not pass through this
 // function.
 //
-// `path` is a null-terminated filesystem path. It must name a regular file;
-// a symbolic link as its last component is refused (-21), not followed, and
-// a FIFO is refused without blocking.
+// `path` is a null-terminated filesystem path. It must name a regular file
+// owned by this process's effective user, writable by no one else, with a
+// single hard link (-27 otherwise -- what the CLI's `wrap` writes). A
+// symbolic link as its last component is refused (-21), not followed;
+// symlinks in directory components resolve as usual (/etc, /tmp). A FIFO,
+// socket, directory, or device is refused (-21) without blocking. Every
+// check is made on the opened descriptor, so it describes the file that is
+// read.
+//
+// Pass an absolute path your application controls -- not one taken from an
+// untrusted source, and not relative (it would resolve against the current
+// directory, which the caller may not control). The status codes describe
+// the file (exists, readable, size class), so a privileged process that
+// opened attacker-chosen paths would leak that much about them. Store the
+// file in a directory only its owner can write.
 //
 // `*out_len` is the capacity of `out` on entry (at least 156) and is
 // written on every return: 156 -- the number of bytes read -- on success,
 // 156 on outputBufferTooSmall (-2, reported before the file is opened), and
 // 0 on every other failure. `out` is written only on success.
+//
+// Reading the file proves nothing about it: whether the payload is genuine,
+// unaltered, and for this service is decided by hkdfguard_unwrap_dek (-16,
+// -6). Pin the KEK by comparing bytes 0-31 with the fingerprint recorded at
+// provisioning before unwrapping.
 int32_t hkdfguard_open_file(
     const char* HKDFGUARD_NONNULL path,
     uint8_t* HKDFGUARD_NONNULL out,

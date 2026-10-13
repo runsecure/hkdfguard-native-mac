@@ -15,7 +15,7 @@ import CryptoKit
 ///   0 = success, -1 = invalidInputLength, -2 = outputBufferTooSmall,
 ///   -19 = fileNotFound, -20 = fileAccessDenied, -21 = fileNotRegular,
 ///   -22 = fileReadFailed, -23 = fileTooShort, -24 = fileTooLong,
-///   -25 = fileMalformed, -26 = fileUnprotectedKey.
+///   -25 = fileMalformed, -26 = fileUnprotectedKey, -27 = fileInsecure.
 ///
 /// `hkdfguard_open_file` never touches the keychain or the Secure Enclave,
 /// so unlike `HkdfGuardNativeMacOSWrapUnwrapTests` this suite runs anywhere,
@@ -251,6 +251,55 @@ struct HkdfGuardOpenFileTests {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         #expect(Self.openFile(dir.path).status == -21)
+    }
+
+    // MARK: - Ownership, permissions, links
+
+    @Test func acceptsOwnerOnlyAndOwnerWritableFiles() throws {
+        // 0600 is what the CLI writes; 0644 (the test helper's default) is
+        // readable by others but writable by no one else, so it passes too.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for mode in [0o600, 0o644, 0o400] {
+            let file = dir.appendingPathComponent("mode.\(String(mode, radix: 8))")
+            try Self.write(Self.structurallyValidPayload(), to: file)
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: file.path)
+            #expect(Self.openFile(file.path).status == 0, "mode \(String(mode, radix: 8))")
+        }
+    }
+
+    @Test func refusesAFileWritableByGroupOrOthers() throws {
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for mode in [0o620, 0o602, 0o666, 0o777] {
+            let file = dir.appendingPathComponent("mode.\(String(mode, radix: 8))")
+            try Self.write(Self.structurallyValidPayload(), to: file)
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: file.path)
+            let result = Self.openFile(file.path)
+            #expect(result.status == -27, "mode \(String(mode, radix: 8))")
+            #expect(result.untouched, "mode \(String(mode, radix: 8))")
+        }
+    }
+
+    @Test func refusesAFileWithMoreThanOneHardLink() throws {
+        // A second name for the same inode could have been created by anyone
+        // with write access to some directory and read access to an older
+        // payload -- the replay the check exists to catch. The link is
+        // refused through either name.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let original = dir.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: original)
+        #expect(Self.openFile(original.path).status == 0)
+
+        let alias = dir.appendingPathComponent("alias.key")
+        try FileManager.default.linkItem(at: original, to: alias)
+        #expect(Self.openFile(original.path).status == -27)
+        #expect(Self.openFile(alias.path).status == -27)
+
+        // Removing the extra link restores the file.
+        try FileManager.default.removeItem(at: alias)
+        #expect(Self.openFile(original.path).status == 0)
     }
 
     @Test(.timeLimit(.minutes(1)))

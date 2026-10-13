@@ -240,11 +240,41 @@ private enum HKDFGuardStatus: Int32 {
     /// key is not a valid P-256 point, or its KEK fingerprint is all zeros.
     case fileMalformed = -25
 
-    /// The file holds a bare, unwrapped 32-byte DEK — raw, or as base64 or
-    /// hex text — instead of a wrapped payload. The key was stored without
-    /// protection: treat it as exposed, and rotate it rather than wrap it
-    /// now. Its bytes are never copied to the caller's buffer.
+    /// The file appears to hold a bare, unwrapped 32-byte DEK — raw, or as
+    /// base64 or hex text — instead of a wrapped payload. Judged on length
+    /// and alphabet alone, so any 32-byte value stored that way matches
+    /// (a fingerprint saved as 64 hex characters, for one). If it is a key,
+    /// it was stored without protection: treat it as exposed and rotate it.
+    /// Its bytes are never copied to the caller's buffer.
     case fileUnprotectedKey = -26
+
+    /// The file is not owned by this process's effective user, is writable
+    /// by group or others, or has more than one hard link — so a process
+    /// other than its owner could have replaced its contents or linked an
+    /// older payload into its place. Matches what the CLI's `wrap` writes
+    /// (owner-only, 0600, one link) and the one-user model: the user who
+    /// wrapped is the user who unwraps.
+    case fileInsecure = -27
+}
+
+// MARK: - Zeroing secrets
+
+/// Zeroes `bytes` with `memset_s`, which the C standard forbids the compiler
+/// from eliding as a dead store — unlike a plain memset/`initializeMemory`
+/// right before the buffer is freed. Best effort still: it covers only the
+/// copy it is handed.
+private func secureZero(_ bytes: inout Data) {
+    bytes.withUnsafeMutableBytes { raw in
+        guard let base = raw.baseAddress, raw.count > 0 else { return }
+        _ = memset_s(base, raw.count, 0, raw.count)
+    }
+}
+
+private func secureZero(_ bytes: inout [UInt8]) {
+    bytes.withUnsafeMutableBytes { raw in
+        guard let base = raw.baseAddress, raw.count > 0 else { return }
+        _ = memset_s(base, raw.count, 0, raw.count)
+    }
 }
 
 // MARK: - Secure Enclave KEK lookup / provisioning
@@ -465,11 +495,7 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
     // to zero and which is freed, unzeroed, when `newKey` goes out of scope
     // at the end of this function.
     var representation = newKey.dataRepresentation
-    defer {
-        _ = representation.withUnsafeMutableBytes { raw in
-            raw.initializeMemory(as: UInt8.self, repeating: 0)
-        }
-    }
+    defer { secureZero(&representation) }
 
     let status = storeKEKDataRepresentation(
         representation,
@@ -841,11 +867,7 @@ public func hkdfguard_generate_and_wrap_dek(
         return HKDFGuardStatus.encryptionFailed.rawValue
     }
 
-    defer {
-        _ = dek.withUnsafeMutableBytes { raw in
-            raw.initializeMemory(as: UInt8.self, repeating: 0)
-        }
-    }
+    defer { secureZero(&dek) }
 
     return dek.withUnsafeBytes { raw -> Int32 in
         wrapDekCore(
@@ -950,11 +972,7 @@ public func hkdfguard_unwrap_dek(
         }
     }
 
-    defer {
-        _ = plaintext.withUnsafeMutableBytes { raw in
-            raw.initializeMemory(as: UInt8.self, repeating: 0)
-        }
-    }
+    defer { secureZero(&plaintext) }
 
     guard plaintext.count == hkdfguardDekLength else {
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
@@ -983,8 +1001,9 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
         return .fileNotFound
     case EACCES, EPERM:
         return .fileAccessDenied
-    case ELOOP:
-        // O_NOFOLLOW: the final path component is a symbolic link.
+    case ELOOP, EOPNOTSUPP:
+        // ELOOP: O_NOFOLLOW found a symbolic link as the final component (or
+        // the path loops). EOPNOTSUPP: the path names a socket.
         return .fileNotRegular
     default:
         return .fileReadFailed
@@ -1000,21 +1019,37 @@ private func readWrappedFile(
     path: UnsafePointer<CChar>,
     into buffer: inout [UInt8]
 ) -> (status: HKDFGuardStatus, count: Int) {
-    // O_NOFOLLOW: a symlink is refused, not followed. O_NONBLOCK: a FIFO
-    // with no writer would otherwise block here; it has no effect on the
-    // regular files actually accepted.
-    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    // O_NOFOLLOW: a symlink as the final component is refused, not followed
+    // (symlinks in directory components still resolve, so /etc and /tmp --
+    // themselves symlinks into /private -- work). O_NONBLOCK: a FIFO with
+    // no writer would otherwise block here; it has no effect on the regular
+    // files actually accepted. O_CLOEXEC: never inherited by a child.
+    var fd: Int32
+    repeat {
+        fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    } while fd < 0 && errno == EINTR
     guard fd >= 0 else {
         return (fileOpenStatus(errno: errno), 0)
     }
     defer { close(fd) }
 
+    // Everything below is judged on the open descriptor, so it describes the
+    // file that will be read, not whatever the path names by now.
     var info = stat()
     guard fstat(fd, &info) == 0 else {
         return (.fileReadFailed, 0)
     }
     guard info.st_mode & S_IFMT == S_IFREG else {
         return (.fileNotRegular, 0)
+    }
+    // Same rules the CLI's `wrap` writes to (0600, one link) and the
+    // install scripts apply to the library itself: nobody but the owner --
+    // who must be this user -- can have put these bytes here. A file linked
+    // in from elsewhere (st_nlink > 1) could be an older payload replayed.
+    guard info.st_uid == geteuid(),
+          info.st_mode & (S_IWGRP | S_IWOTH) == 0,
+          info.st_nlink == 1 else {
+        return (.fileInsecure, 0)
     }
     guard info.st_size <= off_t(hkdfguardWrappedLength) else {
         return (.fileTooLong, 0)
@@ -1023,19 +1058,21 @@ private func readWrappedFile(
     // Read until EOF or the buffer is full, whatever fstat said: the file
     // may change between the two, and the bytes actually read decide.
     var count = 0
-    while count < buffer.count {
-        let n = buffer.withUnsafeMutableBytes { raw in
-            read(fd, raw.baseAddress! + count, raw.count - count)
+    let status: HKDFGuardStatus = buffer.withUnsafeMutableBytes { raw in
+        while count < raw.count {
+            let n = read(fd, raw.baseAddress! + count, raw.count - count)
+            let readErrno = errno // captured before anything else can run
+            if n > 0 {
+                count += n
+            } else if n == 0 {
+                return .success
+            } else if readErrno != EINTR {
+                return .fileReadFailed
+            }
         }
-        if n > 0 {
-            count += n
-        } else if n == 0 {
-            break
-        } else if errno != EINTR {
-            return (.fileReadFailed, 0)
-        }
+        return .success
     }
-    return (.success, count)
+    return (status, status == .success ? count : 0)
 }
 
 /// True when `bytes` look like a bare 32-byte DEK rather than a wrapped
@@ -1107,13 +1144,10 @@ public func hkdfguard_open_file(
     }
 
     // One byte more than a payload, so a file that grew past the fstat
-    // check is still seen as too long without reading the rest of it.
+    // check is still seen as too long without reading the rest of it. Zeroed
+    // on every exit: a rejected file may have been a plaintext key.
     var buffer = [UInt8](repeating: 0, count: hkdfguardWrappedLength + 1)
-    defer {
-        buffer.withUnsafeMutableBytes { raw in
-            raw.initializeMemory(as: UInt8.self, repeating: 0)
-        }
-    }
+    defer { secureZero(&buffer) }
 
     let (readStatus, count) = readWrappedFile(path: pathPtr, into: &buffer)
     guard readStatus == .success else {
