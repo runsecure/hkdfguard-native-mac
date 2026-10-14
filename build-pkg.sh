@@ -41,6 +41,11 @@
 # dist/ once every check has passed.
 set -euo pipefail
 
+# This script signs what every machine will trust; don't let the caller's
+# PATH decide which codesign/productbuild/security/curl it runs.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
 LIB_DIR="$DIST/osx-arm64"
@@ -119,6 +124,9 @@ for f in "$LIB_DIR/$DYLIB_NAME" "$LIB_DIR/$CLI_NAME" "$APP_SRC"; do
         || fail "$f is not an arm64 build"
     info="$(codesign -dvv "$f" 2>&1)"
     grep -q "^TeamIdentifier=$TEAM_ID\$" <<<"$info" || fail "$f: not signed by team $TEAM_ID"
+    # Hardened runtime: library validation and no DYLD_* overrides, as
+    # build-dist.sh signed it. Re-checked here in case dist/ was touched.
+    grep -q 'flags=0x10000(runtime)' <<<"$info" || fail "$f: hardened runtime flag missing"
     if [ "$UNSIGNED" != 1 ]; then
         grep -q '^Authority=Developer ID Application:' <<<"$info" \
             || fail "$f: not Developer ID signed -- package only a HKDFGUARD_RELEASE=1 build"
@@ -287,8 +295,14 @@ for f in "$DYLIB_NAME" "$HEADER_NAME" "$CLI_NAME"; do
     cmp -s "$LIB_DIR/$f" "$CPKG/Payload/v1/$f" || fail "packaged $f differs from $LIB_DIR/$f"
 done
 codesign --verify --strict --deep "$CPKG/Payload/v1/$APP_NAME" || fail "packaged app does not verify"
+if [ "$UNSIGNED" != 1 ]; then
+    xcrun stapler validate "$CPKG/Payload/v1/$APP_NAME" >/dev/null \
+        || fail "packaged app lost its stapled notarization ticket"
+fi
 
-# Every payload entry root:wheel (uid 0, gid 0); nothing group/other-writable.
+# Every payload entry root:wheel (uid 0, gid 0); nothing group/other-writable;
+# no setuid/setgid/sticky bits (lsbom prints st_mode in octal, e.g. 100755;
+# the fourth digit from the right holds those bits).
 bom="$(lsbom -p fugm "$CPKG/Bom")"
 bad_owner="$(awk -F'\t' '$2 != 0 || $3 != 0' <<<"$bom")"
 [ -z "$bad_owner" ] || fail "payload entries not owned by root:wheel:
@@ -296,6 +310,9 @@ $bad_owner"
 bad_mode="$(awk -F'\t' '{ m = substr($4, length($4) - 2); g = substr(m, 2, 1); o = substr(m, 3, 1); if (g ~ /[2367]/ || o ~ /[2367]/) print }' <<<"$bom")"
 [ -z "$bad_mode" ] || fail "payload entries writable by group or others:
 $bad_mode"
+bad_special="$(awk -F'\t' '{ if (length($4) >= 4 && substr($4, length($4) - 3, 1) != "0") print }' <<<"$bom")"
+[ -z "$bad_special" ] || fail "payload entries with setuid, setgid, or sticky bits:
+$bad_special"
 grep -q "\./v1/$CLI_NAME	0	0	100755" <<<"$bom" || fail "CLI is not root:wheel 0755 in the payload"
 
 [ -x "$CPKG/Scripts/postinstall" ] || fail "postinstall missing from the package"

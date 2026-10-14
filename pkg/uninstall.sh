@@ -25,11 +25,19 @@ if [ -L "$link" ] && [ "$(readlink "$link")" = "$cli" ]; then
     echo "==> Removed $link"
 fi
 
-if [ -d "$root_dir/v1" ] && [ ! -L "$root_dir/v1" ]; then
-    rm -rf "$root_dir/v1"
-    echo "==> Removed $root_dir/v1"
+# Delete only through a real, root-owned HkdfGuard folder: were it a symlink
+# or someone else's, `rm -rf .../v1` would resolve into wherever it pointed.
+if [ -e "$root_dir" ] || [ -L "$root_dir" ]; then
+    if [ -L "$root_dir" ] || [ ! -d "$root_dir" ] || [ "$(stat -f '%u' "$root_dir")" != 0 ]; then
+        echo "error: $root_dir is not a root-owned folder; refusing to remove anything under it" >&2
+        exit 1
+    fi
+    if [ -d "$root_dir/v1" ] && [ ! -L "$root_dir/v1" ]; then
+        rm -rf "$root_dir/v1"
+        echo "==> Removed $root_dir/v1"
+    fi
+    rmdir "$root_dir" 2>/dev/null || true
 fi
-rmdir "$root_dir" 2>/dev/null || true
 
 pkgutil --forget com.hkdfguard.native.v1 >/dev/null 2>&1 \
     && echo "==> Forgot package receipt com.hkdfguard.native.v1" || true

@@ -10,6 +10,14 @@
 # that already exists (Homebrew on Intel Macs owns it). This creates only
 # what is missing, root:wheel 0755, and never changes an existing folder.
 #
+# The symlink is created only when /usr/local/bin is a real folder owned by
+# root and writable by root alone. Anyone else who could write that folder
+# could repoint the symlink at their own program -- which an operator would
+# then run while provisioning keys -- and could swap the folder for a
+# symlink between this script's checks and its `ln`, steering root into
+# creating or replacing a file elsewhere. In that case nothing is linked
+# and the install log says to call the CLI by its full path.
+#
 # Never fails the install: the library is already in place, and a missing
 # convenience symlink is reported in the install log (/var/log/install.log)
 # rather than rolled back.
@@ -27,26 +35,29 @@ link="$bin_dir/hkdfguard-v1-initialize"
 
 log() { echo "hkdfguard postinstall: $*"; }
 
+if [ ! -x "$volume$cli" ]; then
+    log "$volume$cli is missing; no PATH symlink"
+    exit 0
+fi
+
 for dir in "$volume/usr/local" "$bin_dir"; do
     if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
         mkdir -m 0755 "$dir" && chown root:wheel "$dir" \
             || { log "could not create $dir; no PATH symlink"; exit 0; }
     fi
+    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+        log "$dir is not a plain folder; no PATH symlink"
+        exit 0
+    fi
 done
-if [ -L "$bin_dir" ] || [ ! -d "$bin_dir" ]; then
-    log "$bin_dir is not a plain folder; no PATH symlink"
-    exit 0
-fi
 
-# Whoever can write /usr/local/bin can replace the symlink with their own
-# program, which an operator would then run while provisioning keys. Still
-# created -- the operator asked for it -- but flagged.
 owner="$(stat -f '%u' "$bin_dir")"
 mode="$(stat -f '%Lp' "$bin_dir")"
 if [ "$owner" != 0 ] || [ $(( 0$mode & 022 )) -ne 0 ]; then
-    log "warning: $bin_dir is not root-owned and root-writable only (uid $owner, mode $mode);"
-    log "         anyone who can write it can replace the hkdfguard-v1-initialize symlink."
-    log "         Call $cli by its full path when provisioning keys."
+    log "warning: $bin_dir is not owned by root and writable by root alone (uid $owner, mode $mode);"
+    log "         anyone who can write it could replace a symlink there with their own program."
+    log "         No PATH symlink created. Call $cli by its full path when provisioning keys."
+    exit 0
 fi
 
 # Replace our own (or any) symlink; never clobber a real file someone put there.

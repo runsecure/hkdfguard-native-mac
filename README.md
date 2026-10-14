@@ -706,7 +706,10 @@ Double-clicking the package in Finder works too. For a fleet, upload the
 package to your MDM (Jamf, Intune, Kandji, …) and scope the policy to Apple
 silicon Macs; MDM tools verify the Developer ID Installer signature
 themselves. Installing a newer package over an older one upgrades `v1/` in
-place.
+place. Installer does not refuse an *older* package over a newer one — it
+replaces `v1/` as a whole, so the result is a consistent downgrade, not a
+mix — so have the MDM policy or the operator compare
+`pkgutil --pkg-info com.hkdfguard.native.v1` first.
 
 ### The `PATH` symlink
 
@@ -716,12 +719,14 @@ payload: a payload containing `/usr/local/bin` would let Installer reset the
 owner and mode of a folder that already exists (Homebrew on Intel Macs owns
 it). The script creates `/usr/local` and `/usr/local/bin` only if missing
 (`root:wheel 0755`), never changes an existing folder, never overwrites a
-real file at that path, and never fails the install. It logs what it did
-to `/var/log/install.log` — including a warning when `/usr/local/bin` is
-writable by anyone but root, because then anyone who can write it can
-replace the symlink with their own program. In that case, call the CLI by
-its full path when provisioning keys. The data-protection build is not on
-`PATH`; call it by its full path (see the CLI section above).
+real file at that path, and never fails the install. It creates the symlink
+**only when `/usr/local/bin` is a real folder owned by root and writable by
+root alone**: anyone else who could write that folder could repoint the
+symlink at their own program, which an operator would then run while
+provisioning keys. Otherwise it logs a warning to `/var/log/install.log`
+and links nothing; call the CLI by its full path in that case. The
+data-protection build is never on `PATH`; call it by its full path (see the
+CLI section above).
 
 ### Uninstalling
 
