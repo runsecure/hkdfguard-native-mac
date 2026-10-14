@@ -248,12 +248,14 @@ private enum HKDFGuardStatus: Int32 {
     /// Its bytes are never copied to the caller's buffer.
     case fileUnprotectedKey = -26
 
-    /// The file is not owned by this process's effective user, is writable
-    /// by group or others, or has more than one hard link — so a process
-    /// other than its owner could have replaced its contents or linked an
-    /// older payload into its place. Matches what the CLI's `wrap` writes
-    /// (owner-only, 0600, one link) and the one-user model: the user who
-    /// wrapped is the user who unwraps.
+    /// The file is owned by someone other than this process's effective user
+    /// or root, is writable by group or others, or has more than one hard
+    /// link — so a party other than its owner could have replaced its
+    /// contents or linked an older payload into its place. Root is accepted
+    /// so an administrator or MDM can deploy key files a service account
+    /// reads; root can already alter anything on the machine, so this adds
+    /// no new party who could tamper with the file. The CLI's `wrap` writes
+    /// owner-only, 0600, one link, which always passes.
     case fileInsecure = -27
 }
 
@@ -1043,10 +1045,12 @@ private func readWrappedFile(
         return (.fileNotRegular, 0)
     }
     // Same rules the CLI's `wrap` writes to (0600, one link) and the
-    // install scripts apply to the library itself: nobody but the owner --
-    // who must be this user -- can have put these bytes here. A file linked
-    // in from elsewhere (st_nlink > 1) could be an older payload replayed.
-    guard info.st_uid == geteuid(),
+    // install scripts apply to the library itself: nobody but the owner can
+    // have put these bytes here, and the owner is either this user or root
+    // (an admin- or MDM-deployed file; root can alter anything anyway). A
+    // file linked in from elsewhere (st_nlink > 1) could be an older payload
+    // replayed.
+    guard info.st_uid == geteuid() || info.st_uid == 0,
           info.st_mode & (S_IWGRP | S_IWOTH) == 0,
           info.st_nlink == 1 else {
         return (.fileInsecure, 0)

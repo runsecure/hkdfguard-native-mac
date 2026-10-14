@@ -126,13 +126,19 @@ only on success.
   made on the opened descriptor (`fstat`), so it describes the file that is
   actually read. At most 157 bytes are read, and a file larger than a
   payload is rejected from its size before any read.
-- **Ownership.** The file must be owned by the process's effective user,
-  writable by no one else, and have a single hard link — exactly what the
-  CLI's `wrap` writes — or it is `fileInsecure` (-27). This matches the
-  one-user model (the user who wrapped is the user who unwraps) and turns a
-  file someone else could have replaced, or an older payload hard-linked
-  into place, into a loud error rather than a silent rollback. Group- or
-  world-*readable* is allowed: the payload is ciphertext.
+- **Ownership.** The file must be owned by the process's effective user
+  **or by root**, writable by no one but its owner, and have a single hard
+  link, or it is `fileInsecure` (-27). The CLI's `wrap` output (0600, one
+  link) always passes. Root is accepted so an administrator or MDM can
+  deploy key files that a service account reads; root can already alter
+  anything on the machine, so this adds no new party who could tamper with
+  the file. A file owned by any *other* user is refused, because that user
+  could swap in a different payload or hard-link an older one into place,
+  and that would otherwise be a silent rollback rather than a loud error.
+  Group- or world-*readable* is allowed, since the payload is ciphertext. A
+  root-owned file must still be readable by the reading account: `0644`, or
+  `0640` with a group the account belongs to. Otherwise it is
+  `fileAccessDenied` (-20).
 - **Pass a trusted, absolute path.** The function opens what it is told.
   Don't hand it paths from untrusted input (its status codes say whether a
   file exists, is readable, and its size class — a small oracle if a
@@ -187,7 +193,7 @@ only on success.
 | `-24` | `fileTooLong` — more than 156 bytes |
 | `-25` | `fileMalformed` — 156 bytes, but the ephemeral key is not a P-256 point or the fingerprint is all zeros |
 | `-26` | `fileUnprotectedKey` — the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
-| `-27` | `fileInsecure` — not owned by this user, writable by group or others, or more than one hard link |
+| `-27` | `fileInsecure` — owned by someone other than this user or root, writable by group or others, or more than one hard link |
 
 ## Keychain modes (hybrid)
 
@@ -917,7 +923,8 @@ Three Swift Testing suites:
   is not a key, malformed payloads (off-curve ephemeral key, zero
   fingerprint), missing and unreadable files, symlink/directory/FIFO
   refusal, ownership rules (group/world-writable and multiply-linked files
-  refused; 0600/0644/0400 accepted), buffer sizing before the file is
+  refused; 0600/0644/0400 and root-owned files accepted), buffer sizing
+  before the file is
   opened, and NULL pointers.
 - **`HkdfGuardCommandLineToolTests`** (`.serialized`) builds and runs the real CLI as a
   subprocess: `provision`/`wrap`/`status`/`retire` semantics, DEK sources

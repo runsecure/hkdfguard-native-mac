@@ -141,13 +141,13 @@ extern "C" {
 //                                 unprotected: treat it as exposed and
 //                                 rotate it. Its bytes are never copied to
 //                                 the caller's buffer)
-//  -27  fileInsecure             (the file is not owned by this process's
-//                                 effective user, is writable by group or
-//                                 others, or has more than one hard link,
-//                                 so someone other than its owner could have
-//                                 replaced or replayed its contents. The
-//                                 CLI's `wrap` writes 0600 with one link;
-//                                 keep it that way)
+//  -27  fileInsecure             (the file is owned by someone other than
+//                                 this process's effective user or root, is
+//                                 writable by group or others, or has more
+//                                 than one hard link, so someone other than
+//                                 its owner could have replaced or replayed
+//                                 its contents. The CLI's `wrap` writes 0600
+//                                 with one link; keep it that way)
 
 // ---------------------------------------------------------------------------
 // `service`
@@ -311,8 +311,11 @@ int32_t hkdfguard_generate_and_wrap_dek(
 // function.
 //
 // `path` is a null-terminated filesystem path. It must name a regular file
-// owned by this process's effective user, writable by no one else, with a
-// single hard link (-27 otherwise -- what the CLI's `wrap` writes). A
+// owned by this process's effective user or by root, writable by no one but
+// its owner, with a single hard link (-27 otherwise; the CLI's `wrap`
+// writes such a file). A root-owned file deployed by an administrator must
+// still be readable by the caller -- 0644, or 0640 with a shared group --
+// or it is fileAccessDenied (-20). A
 // symbolic link as its last component is refused (-21), not followed;
 // symlinks in directory components resolve as usual (/etc, /tmp). A FIFO,
 // socket, directory, or device is refused (-21) without blocking. Every

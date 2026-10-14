@@ -281,6 +281,21 @@ struct HkdfGuardOpenFileTests {
         }
     }
 
+    @Test func acceptsARootOwnedFileForAnAdministratorDeployment() throws {
+        // A test can't create a root-owned file without sudo, so this uses
+        // one the OS ships: root-owned, 0444, one link. It isn't a payload,
+        // so it can't succeed -- but it must get past the ownership check
+        // and fail on its size (-24), never as fileInsecure (-27).
+        let path = "/System/Library/CoreServices/SystemVersion.plist"
+        var info = stat()
+        try #require(stat(path, &info) == 0, "\(path) missing")
+        try #require(info.st_uid == 0 && info.st_mode & (S_IWGRP | S_IWOTH) == 0 && info.st_nlink == 1,
+                     "\(path) is no longer root-owned, owner-writable only, single-link")
+        try #require(info.st_size > off_t(Self.wrappedLength), "\(path) is no longer larger than a payload")
+
+        #expect(Self.openFile(path).status == -24)
+    }
+
     @Test func refusesAFileWithMoreThanOneHardLink() throws {
         // A second name for the same inode could have been created by anyone
         // with write access to some directory and read access to an older
