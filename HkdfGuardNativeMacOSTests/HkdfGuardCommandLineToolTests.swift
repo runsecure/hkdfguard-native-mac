@@ -202,7 +202,7 @@ struct HkdfGuardCommandLineToolTests {
         // from an earlier build caused the CLI subprocess launched below to
         // silently load that wrong, outdated dylib instead of the current
         // one at build/Release — producing a pre-fingerprint 124-byte
-        // wrapped payload instead of 156, and in other runs, behavior odd
+        // wrapped payload instead of 146, and in other runs, behavior odd
         // enough to hang. Stripping DYLD_* here removes that whole class of
         // environment leakage regardless of what DerivedData happens to
         // contain.
@@ -427,7 +427,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(permissions == 0o600)
 
         let wrapped = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
-        #expect(wrapped.count == 156) // 32-byte KEK fingerprint + 64-byte ephemeral pubkey + 12-byte nonce + 32-byte ciphertext + 16-byte tag
+        #expect(wrapped.count == 146) // 32-byte KEK fingerprint + 1-byte suite id + 65-byte HPKE encapsulated key + 32-byte ciphertext + 16-byte tag
     }
 
     // MARK: - hkdfguard_open_file against the CLI's own files
@@ -447,7 +447,7 @@ struct HkdfGuardCommandLineToolTests {
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
     func cliWrappedFileIsReadByOpenFile() throws {
         // The file format contract between the CLI (writer) and the library
-        // (reader): whatever `wrap` writes -- 0600, fsynced, 156 bytes --
+        // (reader): whatever `wrap` writes -- 0600, fsynced, 146 bytes --
         // hkdfguard_open_file accepts byte for byte.
         let service = "com.hkdfguard.tests.cli.openfile"
         defer { Self.deleteKEK(service: service) }
@@ -712,7 +712,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
         #expect(!result.stderr.contains("warning:"))
         let wrapped = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
-        #expect(wrapped.count == 156)
+        #expect(wrapped.count == 146)
     }
 
     @Test(.enabled(if: legacyCrossProcessRoundTripEnabled && SecureEnclave.isAvailable, interactiveKeychainAndSecureEnclaveComment))
@@ -750,7 +750,7 @@ struct HkdfGuardCommandLineToolTests {
         let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", service, "--dek-file", dekFilePath])
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
         let wrapped = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
-        #expect(wrapped.count == 156)
+        #expect(wrapped.count == 146)
     }
 
     @Test func cliRejectsDekAsCommandLineArgument() throws {
@@ -820,8 +820,8 @@ struct HkdfGuardCommandLineToolTests {
         )
         #expect(result.exitCode == 0, "CLI --force failed: \(result.stderr)")
 
-        // The replacement: a fresh 156-byte, 0600 file.
-        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 156)
+        // The replacement: a fresh 146-byte, 0600 file.
+        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 146)
         let attributes = try FileManager.default.attributesOfItem(atPath: keyFilePath)
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
 
@@ -912,7 +912,7 @@ struct HkdfGuardCommandLineToolTests {
         let padded = Data(("  \t" + Data(Self.randomDEK()).base64EncodedString() + "\r\n\r\n").utf8)
         let result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"], stdin: padded)
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
-        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 156)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 146)
     }
 
     @Test func cliDekFileThatCannotBeOpenedIsReported() throws {
@@ -1101,7 +1101,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(wrap.stdout.contains("keychain: data-protection"), "stdout: \(wrap.stdout)")
 
         let wrapped = try Array(Data(contentsOf: URL(fileURLWithPath: keyFilePath)))
-        #expect(wrapped.count == 156)
+        #expect(wrapped.count == 146)
         let recovered = Self.unwrapInApplicationCode(wrapped, service: service)
         #expect(recovered.status == 0, "unwrap in the entitled host failed with \(recovered.status)")
         #expect(recovered.dek == dek)

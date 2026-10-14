@@ -48,7 +48,7 @@ let hkdfguardDylibPath = "\(hkdfguardDylibDir)/libhkdfguard_v1.dylib"
 
 let package = Package(
     name: "hkdfguard-v1-initialize",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
             name: "hkdfguard-v1-initialize",

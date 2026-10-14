@@ -14,7 +14,7 @@
 #
 # and its postinstall script adds a root-owned symlink
 # /usr/local/bin/hkdfguard-v1-initialize -> v1/hkdfguard-v1-initialize.
-# It installs only on Apple silicon running macOS 13 or later, only to a
+# It installs only on Apple silicon running macOS 14 or later, only to a
 # system volume (never a user's home), with no customization.
 #
 # Usage, after a release build (HKDFGUARD_RELEASE=1 ./build-dist.sh):
@@ -211,7 +211,7 @@ pkgbuild \
     --ownership recommended \
     "$STAGE/component/component.pkg" >/dev/null
 
-# Distribution: Apple silicon, macOS 13+, system domain only, no choices.
+# Distribution: Apple silicon, macOS 14+, system domain only, no choices.
 DIST_XML="$STAGE/distribution.xml"
 cat >"$DIST_XML" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -220,7 +220,7 @@ cat >"$DIST_XML" <<EOF
     <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
     <allowed-os-versions>
-        <os-version min="13.0"/>
+        <os-version min="14.0"/>
     </allowed-os-versions>
     <choices-outline>
         <line choice="default">

@@ -24,7 +24,8 @@ import Security
 ///   -10 = kekNotFound, -11 = kekCorrupted, -12 = accessControlCreationFailed,
 ///   -13 = keyGenerationFailed, -14 = keychainWriteFailed,
 ///   -15 = kekVerificationFailed, -16 = fingerprintMismatch,
-///   -17 = keychainAccessDenied, -18 = keychainReadFailed.
+///   -17 = keychainAccessDenied, -18 = keychainReadFailed,
+///   -28 = unsupportedCiphersuite.
 ///
 /// Important behavior change worth calling out here, not just in the
 /// individual tests below: `hkdfguard_wrap_dek`/`hkdfguard_unwrap_dek`/
@@ -73,11 +74,20 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     // MARK: - Helpers
 
     private static let dekLength = 32
-    private static let wrappedLength = 156 // 32-byte KEK fingerprint + 64-byte ephemeral pubkey + 12-byte nonce + 32-byte ciphertext + 16-byte tag
+    private static let wrappedLength = 146 // 32-byte KEK fingerprint + 1-byte suite id + 65-byte HPKE encapsulated key + 32-byte ciphertext + 16-byte tag
     private static let maxServiceNameLength = 128
 
     private static func randomDEK() -> [UInt8] {
         (0..<dekLength).map { _ in UInt8.random(in: .min ... .max) }
+    }
+
+    /// A payload-length blob of zeros with the one byte that is checked
+    /// before the keychain -- the suite id at offset 32 -- set to the
+    /// supported value, so a test gets to the keychain lookup it is about.
+    private static func zeroPayloadWithValidSuite() -> [UInt8] {
+        var blob = [UInt8](repeating: 0, count: wrappedLength)
+        blob[32] = 0x01
+        return blob
     }
 
     /// Deletes the keychain item backing a service's Secure Enclave key,
@@ -480,7 +490,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(exists.exists == false)
         #expect(Self.createKEK(service: service) == -11)
         #expect(Self.wrap(Self.randomDEK(), service: service).status == -11)
-        #expect(Self.unwrap([UInt8](repeating: 0, count: Self.wrappedLength), service: service).status == -11)
+        #expect(Self.unwrap(Self.zeroPayloadWithValidSuite(), service: service).status == -11)
 
         // Still corrupt, still present: createKEK above must not have
         // replaced it.
@@ -506,12 +516,9 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // No defer/cleanup needed: hkdfguard_unwrap_dek must not create
         // anything here either.
         //
-        // The KEK lookup now happens before the fingerprint/ephemeral-key/
-        // SealedBox are even parsed, so content doesn't matter here —
-        // only that the blob is longer than the fixed 96-byte
-        // fingerprint+ephemeral-key prefix, matching any real wrapped
-        // payload's minimum shape.
-        let arbitraryBlob = [UInt8](repeating: 0, count: Self.wrappedLength)
+        // Only the length and the suite byte are checked before the KEK
+        // lookup, so the rest of the content doesn't matter here.
+        let arbitraryBlob = Self.zeroPayloadWithValidSuite()
         let result = Self.unwrap(arbitraryBlob, service: service)
         #expect(result.status == -10) // kekNotFound
     }
@@ -789,13 +796,55 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
 
         var wrapped = Self.wrap(Self.randomDEK(), service: service).wrapped
         // Flip a bit inside the AES-GCM ciphertext/tag region (well past
-        // the fingerprint + ephemeral-public-key prefix), leaving the
-        // fingerprint itself untouched so this exercises the AES-GCM tag
-        // check specifically, not the fingerprint check.
+        // the fingerprint + suite + encapsulated-key prefix), leaving the
+        // fingerprint itself untouched so this exercises the AEAD tag check
+        // specifically, not the fingerprint check.
         wrapped[wrapped.count - 1] ^= 0xFF
 
         let result = Self.unwrap(wrapped, service: service)
         #expect(result.status == -6) // decryptionFailed — the GCM tag check must catch this
+    }
+
+    @Test func unwrapRejectsTamperedEncapsulatedKey() {
+        // A flipped bit in the HPKE encapsulated key: either no longer a
+        // point on the curve, or a different point -- both make the key
+        // schedule disagree with the sender's, so the AEAD open fails.
+        let service = "com.hkdfguard.tests.tamper.encapsulated"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createKEK(service: service) == 0)
+
+        var wrapped = Self.wrap(Self.randomDEK(), service: service).wrapped
+        wrapped[40] ^= 0x01
+
+        #expect(Self.unwrap(wrapped, service: service).status == -6)
+    }
+
+    @Test func unwrapRejectsACompressedOrMisprefixedEncapsulatedKey() {
+        // The encapsulated key must be an uncompressed X9.63 point (0x04).
+        // A 0x02/0x03 compressed prefix on a 65-byte field, or a 0x00, is a
+        // malformed point: rejected by CryptoKit's deserialization, never
+        // reinterpreted, never a crash.
+        let service = "com.hkdfguard.tests.enc.prefix"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createKEK(service: service) == 0)
+
+        let wrapped = Self.wrap(Self.randomDEK(), service: service).wrapped
+        #expect(wrapped[33] == 0x04, "encapsulated key must be an uncompressed X9.63 point")
+        for prefix: UInt8 in [0x02, 0x03, 0x00] {
+            var tampered = wrapped
+            tampered[33] = prefix
+            #expect(Self.unwrap(tampered, service: service).status == -6, "prefix \(prefix)")
+        }
+    }
+
+    @Test func unwrapRejectsAnUnsupportedSuiteByteBeforeTouchingTheKeychain() {
+        // Byte 32 names the ciphersuite. No KEK exists for this service, yet
+        // the answer is -28, not -10: the suite is checked first.
+        let service = "com.hkdfguard.tests.unsupported.suite"
+        var blob = [UInt8](repeating: 0x5A, count: Self.wrappedLength)
+        blob[32] = 0x02
+        #expect(Self.unwrap(blob, service: service).status == -28)
+        #expect(Self.kekExists(service: service).exists == false, "nothing may have been created")
     }
 
     @Test func unwrapRejectsTamperedFingerprint() {

@@ -4,7 +4,8 @@
 //
 //  Public C ABI of the HkdfGuard macOS key-protection library: wraps and
 //  unwraps 32-byte Data Encryption Keys (DEKs) under a per-service Key
-//  Encryption Key (KEK) held in the Secure Enclave.
+//  Encryption Key (KEK) held in the Secure Enclave, using HPKE (RFC 9180,
+//  base mode) with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, and AES-256-GCM.
 //
 //  Plain C. Includable from C, C++, Objective-C, and any FFI layer
 //  (P/Invoke, ctypes, cgo, JNA) without Foundation; the Objective-C-only
@@ -46,10 +47,10 @@ extern "C" {
 // Status codes returned by every function below
 // ---------------------------------------------------------------------------
 //    0  success
-//   -1  invalidInputLength     (dek_len != 32, wrapped_len != 156, or a NULL
+//   -1  invalidInputLength     (dek_len != 32, wrapped_len != 146, or a NULL
 //                               buffer/length pointer)
 //   -2  outputBufferTooSmall   (*out_len has been set to the required size:
-//                               156 for wrap, 32 for unwrap. Reported before
+//                               146 for wrap, 32 for unwrap. Reported before
 //                               any keychain or Secure Enclave work, so a
 //                               caller can size a buffer with a first call
 //                               that costs nothing)
@@ -123,12 +124,12 @@ extern "C" {
 //                                 device)
 //  -22  fileReadFailed           (open/fstat/read failed for any other
 //                                 reason)
-//  -23  fileTooShort             (fewer than 156 bytes, and not a
+//  -23  fileTooShort             (fewer than 146 bytes, and not a
 //                                 plaintext DEK -- see -26)
-//  -24  fileTooLong              (more than 156 bytes; detected from the
+//  -24  fileTooLong              (more than 146 bytes; detected from the
 //                                 file's size before anything is read)
-//  -25  fileMalformed            (156 bytes, but not a payload: the
-//                                 ephemeral public key is not a valid P-256
+//  -25  fileMalformed            (146 bytes, but not a payload: the
+//                                 encapsulated key is not a valid P-256
 //                                 point, or the KEK fingerprint is all
 //                                 zeros)
 //  -26  fileUnprotectedKey       (the file appears to hold a bare, unwrapped
@@ -148,6 +149,13 @@ extern "C" {
 //                                 its owner could have replaced or replayed
 //                                 its contents. The CLI's `wrap` writes 0600
 //                                 with one link; keep it that way)
+//  -28  unsupportedCiphersuite   (the payload's suite byte names a
+//                                 ciphersuite this build does not
+//                                 implement -- written by a newer or
+//                                 different build. Not tampering. Returned
+//                                 by hkdfguard_unwrap_dek and
+//                                 hkdfguard_open_file before any keychain
+//                                 or Secure Enclave work)
 
 // ---------------------------------------------------------------------------
 // `service`
@@ -169,11 +177,19 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // Lengths are trusted: `dek_len`, `wrapped_len`, and `*out_len` on entry
 // must describe real, readable/writable memory of exactly that size. A
-// wrapped payload is always exactly 156 bytes:
+// wrapped payload is always exactly 146 bytes:
 //
-//   [ 32-byte KEK fingerprint (SHA-256 of the KEK's public key) ]
-//   [ 64-byte ephemeral P-256 public key, raw x || y                ]
-//   [ 12-byte AES-GCM nonce || 32-byte ciphertext || 16-byte tag    ]
+//   [ 32-byte KEK fingerprint (SHA-256 of the KEK's public key)        ]
+//   [  1-byte ciphersuite id: 0x01                                     ]
+//   [ 65-byte HPKE encapsulated key: X9.63 P-256 point, 0x04 || x || y ]
+//   [ 32-byte AES-256-GCM ciphertext || 16-byte tag                    ]
+//
+// The suite id names the HPKE ciphersuite the rest of the payload was
+// sealed with; 0x01 is the only one this library implements (see -28). The
+// header (fingerprint || suite id) is the AEAD's additional authenticated
+// data and the service name is in the HPKE `info`
+// ("com.hkdfguard.hpke.v1" || 0x00 || service), so a payload is bound to
+// its KEK, its suite, and its service.
 //
 // On return, `*out_len` is always set: to the bytes written on success, or
 // to the required size on outputBufferTooSmall.
@@ -269,7 +285,7 @@ int32_t hkdfguard_create_kek(
     const char* HKDFGUARD_NONNULL service);
 
 // Wraps the 32-byte DEK at `dek` under the KEK for `service` and writes the
-// 156-byte payload to `out`. Never creates a KEK: expects kekNotFound (-10)
+// 146-byte payload to `out`. Never creates a KEK: expects kekNotFound (-10)
 // if hkdfguard_create_kek has not been called for this service in this
 // process's keychain mode.
 int32_t hkdfguard_wrap_dek(
@@ -280,11 +296,12 @@ int32_t hkdfguard_wrap_dek(
     int32_t* HKDFGUARD_NONNULL out_len
 );
 
-// Unwraps a 156-byte payload produced by hkdfguard_wrap_dek or
+// Unwraps a 146-byte payload produced by hkdfguard_wrap_dek or
 // hkdfguard_generate_and_wrap_dek, writing the 32-byte DEK to `out`. Checks
-// the payload's embedded KEK fingerprint against the KEK `service` resolves
-// to before attempting any ECDH or AES-GCM, failing with fingerprintMismatch
-// (-16) on a different KEK. Never creates a KEK.
+// the suite byte (-28 if unsupported) and then the payload's embedded KEK
+// fingerprint against the KEK `service` resolves to, before attempting any
+// key agreement or decryption, failing with fingerprintMismatch (-16) on a
+// different KEK. Never creates a KEK.
 int32_t hkdfguard_unwrap_dek(
     const char* HKDFGUARD_NONNULL service,
     const uint8_t* HKDFGUARD_NONNULL wrapped,
@@ -304,7 +321,7 @@ int32_t hkdfguard_generate_and_wrap_dek(
     int32_t* HKDFGUARD_NONNULL out_len
 );
 
-// Reads the wrapped payload stored at `path` -- the 156-byte file the CLI's
+// Reads the wrapped payload stored at `path` -- the 146-byte file the CLI's
 // `wrap` command writes -- validates it, and copies it to `out`, ready to
 // pass to hkdfguard_unwrap_dek. Never touches the keychain or the Secure
 // Enclave, and never unwraps: the plaintext DEK does not pass through this
@@ -329,9 +346,9 @@ int32_t hkdfguard_generate_and_wrap_dek(
 // opened attacker-chosen paths would leak that much about them. Store the
 // file in a directory only its owner can write.
 //
-// `*out_len` is the capacity of `out` on entry (at least 156) and is
-// written on every return: 156 -- the number of bytes read -- on success,
-// 156 on outputBufferTooSmall (-2, reported before the file is opened), and
+// `*out_len` is the capacity of `out` on entry (at least 146) and is
+// written on every return: 146 -- the number of bytes read -- on success,
+// 146 on outputBufferTooSmall (-2, reported before the file is opened), and
 // 0 on every other failure. `out` is written only on success.
 //
 // Reading the file proves nothing about it: whether the payload is genuine,
