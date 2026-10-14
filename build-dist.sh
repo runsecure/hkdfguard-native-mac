@@ -219,29 +219,49 @@ assert_in_ticket() {
     fail "$file (cdhash $cdhash) is not in the notarization ticket: $(cat "$log")"
 }
 
-# Asserts Gatekeeper accepts `file` as notarized. A bare dylib or executable
-# cannot carry a stapled ticket, so Gatekeeper looks the ticket up online.
-# Both are assessed by their own signature (--type open with the
-# primary-signature context): `--type execute` on a bare executable only
-# says "does not seem to be an app" and never reports a source. Gatekeeper
-# caches lookups by cdhash, so one that was assessed before it was notarized
-# can keep reporting "Unnotarized" for a while -- hence the long retry.
-assert_notarized() {
-    local file="$1" assessment attempt
+# Apple's ticket service: where Gatekeeper on any Mac fetches the
+# notarization ticket of a bare dylib or executable (which, unlike an app or
+# package, cannot carry a stapled one), keyed by cdhash. `stapler` uses the
+# same service.
+TICKET_LOOKUP_URL="https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
+
+# Asserts the ticket service publishes a notarization ticket for `file` --
+# what every *other* Mac will find when it first runs it. Checked against
+# the service directly rather than through this Mac's `spctl`: syspolicyd
+# caches lookups by cdhash, and a negative answer it cached once has been
+# seen to outlast a published ticket by many minutes. The build is
+# reproducible, so the same cdhash recurs across builds of unchanged code.
+# Retries cover the short delay between "Accepted" and publication.
+assert_ticket_published() {
+    local file="$1" cdhash response attempt
+    cdhash="$(codesign -dvvv "$file" 2>&1 | sed -n 's/^CDHash=//p')"
+    [ -n "$cdhash" ] || fail "$file: could not read its cdhash"
+    response="$WORK/ticket-$cdhash.json"
     for attempt in $(seq 1 12); do
-        assessment="$(spctl --assess --type open --context context:primary-signature -vv "$file" 2>&1)" || true
-        grep -q 'source=Notarized Developer ID' <<<"$assessment" && return 0
+        if curl -fsS -m 20 -X POST -H 'Content-Type: application/json' \
+                -d "{\"records\":[{\"recordName\":\"2/2/$cdhash\"}]}" \
+                "$TICKET_LOOKUP_URL" -o "$response" 2>/dev/null \
+            && [ "$(plist_value "$response" records.0.recordType)" = DeveloperIDTicket ] \
+            && [ -n "$(plist_value "$response" records.0.fields.signedTicket.value)" ]; then
+            return 0
+        fi
         sleep 15
     done
-    fail "$(cat <<EOF
-Gatekeeper does not report $file as notarized after 3 minutes:
-$assessment
-Apple's ticket does list it (checked above), so this Mac's Gatekeeper is
-likely answering from a cached lookup made before notarization, or cannot
-reach Apple. Re-run later, or check by hand with:
-  spctl --assess --type open --context context:primary-signature -vv <file>
-EOF
-)"
+    fail "Apple's ticket service has no notarization ticket for $file (cdhash $cdhash) after 3 minutes: $(cat "$response" 2>/dev/null)"
+}
+
+# Reports what this Mac's Gatekeeper says about `file`, as a warning only --
+# see assert_ticket_published for why it is not the authority. Assessed by
+# the file's own signature (--type open with the primary-signature context):
+# `--type execute` on a bare executable only says "does not seem to be an
+# app" and never reports a source.
+report_local_gatekeeper() {
+    local file="$1" assessment
+    assessment="$(spctl --assess --type open --context context:primary-signature -vv "$file" 2>&1)" || true
+    if ! grep -q 'source=Notarized Developer ID' <<<"$assessment"; then
+        echo "    note: this Mac's Gatekeeper does not yet report $(basename "$file") as notarized"
+        echo "          (likely a cached lookup; Apple's ticket service has the ticket, checked above)"
+    fi
 }
 
 # Notarizes the dylib and bare CLI in dist/<rid>/. Nothing is
@@ -265,8 +285,10 @@ notarize_arch() {
         || fail "could not fetch the notarization log for $rid (submission $id)"
     assert_in_ticket "$out/$DYLIB_NAME" "$log"
     assert_in_ticket "$out/hkdfguard-v1-initialize" "$log"
-    assert_notarized "$out/$DYLIB_NAME"
-    assert_notarized "$out/hkdfguard-v1-initialize"
+    assert_ticket_published "$out/$DYLIB_NAME"
+    assert_ticket_published "$out/hkdfguard-v1-initialize"
+    report_local_gatekeeper "$out/$DYLIB_NAME"
+    report_local_gatekeeper "$out/hkdfguard-v1-initialize"
 }
 
 # build_arch <xcode-arch> <rid>

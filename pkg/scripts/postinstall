@@ -1,0 +1,62 @@
+#!/bin/sh
+# postinstall for com.hkdfguard.native.v1. Runs as root after the payload is
+# in place. Its only job is the PATH symlink:
+#
+#   /usr/local/bin/hkdfguard-v1-initialize
+#       -> /Library/Application Support/HkdfGuard/v1/hkdfguard-v1-initialize
+#
+# Made here rather than shipped in the payload: a payload containing
+# /usr/local/bin would let Installer reset the owner and mode of a folder
+# that already exists (Homebrew on Intel Macs owns it). This creates only
+# what is missing, root:wheel 0755, and never changes an existing folder.
+#
+# Never fails the install: the library is already in place, and a missing
+# convenience symlink is reported in the install log (/var/log/install.log)
+# rather than rolled back.
+set -u
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# $3 is the target volume ("/" for a normal install).
+volume="${3:-/}"
+volume="${volume%/}"
+
+cli="/Library/Application Support/HkdfGuard/v1/hkdfguard-v1-initialize"
+bin_dir="$volume/usr/local/bin"
+link="$bin_dir/hkdfguard-v1-initialize"
+
+log() { echo "hkdfguard postinstall: $*"; }
+
+for dir in "$volume/usr/local" "$bin_dir"; do
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        mkdir -m 0755 "$dir" && chown root:wheel "$dir" \
+            || { log "could not create $dir; no PATH symlink"; exit 0; }
+    fi
+done
+if [ -L "$bin_dir" ] || [ ! -d "$bin_dir" ]; then
+    log "$bin_dir is not a plain folder; no PATH symlink"
+    exit 0
+fi
+
+# Whoever can write /usr/local/bin can replace the symlink with their own
+# program, which an operator would then run while provisioning keys. Still
+# created -- the operator asked for it -- but flagged.
+owner="$(stat -f '%u' "$bin_dir")"
+mode="$(stat -f '%Lp' "$bin_dir")"
+if [ "$owner" != 0 ] || [ $(( 0$mode & 022 )) -ne 0 ]; then
+    log "warning: $bin_dir is not root-owned and root-writable only (uid $owner, mode $mode);"
+    log "         anyone who can write it can replace the hkdfguard-v1-initialize symlink."
+    log "         Call $cli by its full path when provisioning keys."
+fi
+
+# Replace our own (or any) symlink; never clobber a real file someone put there.
+if [ -e "$link" ] && [ ! -L "$link" ]; then
+    log "$link exists and is not a symlink; left untouched, no PATH symlink"
+    exit 0
+fi
+if ln -sfh "$cli" "$link" && chown -h root:wheel "$link"; then
+    log "linked $link -> $cli"
+else
+    log "could not create $link"
+fi
+exit 0

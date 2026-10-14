@@ -391,14 +391,14 @@ keychain mode:
 | `hkdfguard-v1-initialize` (plain executable) | legacy | provision and wrap for consumers that run in legacy mode — any `dlopen`/FFI host |
 | `hkdfguard-v1-initialize.app` (app bundle) | data-protection | provision, wrap, and retire for consumers that are Team-signed app bundles in the same `com.hkdfguard.keys` access group |
 
-Run the bundled build by its executable inside the bundle; a symlink onto
-your `PATH` works:
+The installer package installs both (see
+[Installing on a machine](#installing-on-a-machine)). The legacy-mode CLI is
+on `PATH` as `/usr/local/bin/hkdfguard-v1-initialize`; run the
+data-protection build by the executable inside its bundle:
 
 ```sh
-cp -R hkdfguard-v1-initialize.app /Applications/
-ln -s /Applications/hkdfguard-v1-initialize.app/Contents/MacOS/hkdfguard-v1-initialize \
-      /usr/local/bin/hkdfguard-v1-initialize-dp
-hkdfguard-v1-initialize-dp status -sn com.example.ingest   # prints "keychain: data-protection"
+"/Library/Application Support/HkdfGuard/v1/hkdfguard-v1-initialize.app/Contents/MacOS/hkdfguard-v1-initialize" \
+    status -sn com.example.ingest   # prints "keychain: data-protection"
 ```
 
 Its access group is prefixed with the signing Team ID
@@ -436,11 +436,10 @@ dylib and both CLI builds target **macOS 13.0+**; the test bundle and test
 host target 14.0; the framework target uses the SDK's recommended
 deployment target.
 
-Supporting scripts: `build-dist.sh` (release artifacts, below),
-`install-user.sh` / `install-system.sh` (put a build at a fixed path on a
-Mac for other applications to load; see
-[Installing on a machine](#installing-on-a-machine)), and
-`setup-hosted-test-kek.sh` (a one-time, per-developer provisioning of a
+Supporting scripts: `build-dist.sh` (signed, notarized build artifacts,
+below), `build-pkg.sh` with `pkg/` (the installer package — the only way the
+library is installed; see [Installing on a machine](#installing-on-a-machine)),
+and `setup-hosted-test-kek.sh` (a one-time, per-developer provisioning of a
 data-protection KEK in the test-only access group, under
 `com.hkdfguard.fixture.hostedtests`; see Tests).
 
@@ -464,8 +463,10 @@ xcodebuild test -scheme HkdfGuardNativeMacOSTests
 
 ### Distribution: `build-dist.sh`
 
-Builds everything a downstream consumer needs into `dist/osx-arm64/`
-(dylib, header, CLI, `SHA256SUMS`), named for the .NET runtime identifier.
+Builds the signed artifacts the installer package is made from (see
+[`build-pkg.sh`](#the-installer-package-build-pkgsh)) into `dist/osx-arm64/`
+(dylib, header, CLI, `SHA256SUMS`) and `dist/osx-arm64-app/` (the
+data-protection CLI app).
 **arm64 (Apple silicon) is the only supported architecture**: there is no
 Intel build, and the script refuses to run on an Intel Mac. It builds the
 dylib and the CLI, rewrites the CLI's rpath to `@executable_path` so it finds the
@@ -577,194 +578,189 @@ HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary \
 The script checks for the Developer ID certificate before building
 anything, so a missing one fails in seconds. The Developer ID provisioning
 profile is created by `xcodebuild` during export (automatic signing,
-`-allowProvisioningUpdates`); this path has not yet been run end to end,
-since it needs the certificate above.
+`-allowProvisioningUpdates`).
 
 ## Publishing a release
 
-Distribution is a tagged GitHub Release carrying the `dist/` output as
-assets — not a package published to PyPI/npm/Maven/NuGet. That keeps a
-single, manually-signed artifact as the only thing every consumer trusts,
-which matches how this project is built (no CI; a person runs
-`build-dist.sh` and signs locally).
+The only distribution is a signed, notarized **installer package** attached
+to a tagged GitHub Release. There are no zips, no NuGet package, and no
+install scripts: a Mac gets the library by installing the package, and
+nothing else puts it in place. That keeps one manually signed artifact —
+built by a person on one Mac, with no CI — as the only thing every machine
+trusts.
 
 ```sh
-VERSION=v1.2.0
+VERSION=v0.9.0   # must equal MARKETING_VERSION in the Xcode project
 
 HKDFGUARD_RELEASE=1 \
 HKDFGUARD_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary \
 ./build-dist.sh
 
-(cd dist/osx-arm64 && zip -r "../hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip" .)
-# ditto, not zip, for the app bundle: it preserves the bundle's signature.
-ditto -c -k --keepParent dist/osx-arm64-app/hkdfguard-v1-initialize.app \
-  "dist/hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip"
+HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary ./build-pkg.sh
+PKG="hkdfguard-native-macos-v1-${VERSION#v}-osx-arm64.pkg"
 
-# Checksums of the release assets themselves, published in the release
-# notes -- outside the assets, so replacing an asset cannot also replace
-# the value it is checked against.
-(cd dist && shasum -a 256 \
-  "hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip" \
-  "hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip" > RELEASE-SHA256SUMS)
+# The checksum goes in the release notes -- outside the asset, so replacing
+# the package cannot also replace the value it is checked against.
 {
-  echo "See README for the C ABI and per-language consumption notes."
+  echo "Install with: sudo installer -pkg $PKG -target /"
   echo
-  echo "SHA-256 of each asset (verify with \`shasum -a 256 -c\`):"
+  echo "SHA-256 (verify with \`shasum -a 256 -c\`):"
   echo '```'
-  cat dist/RELEASE-SHA256SUMS
+  cat "dist/$PKG.sha256"
   echo '```'
 } > dist/release-notes.md
 
 git tag -s "$VERSION" -m "$VERSION"   # signed tag; -a if you have no signing key
 git push origin "$VERSION"
 
-gh release create "$VERSION" \
-  dist/hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip \
-  "dist/hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip" \
+gh release create "$VERSION" "dist/$PKG" \
   --title "$VERSION" \
   --notes-file dist/release-notes.md
 ```
 
-Publish only a `HKDFGUARD_RELEASE=1` build. A development-signed or
-unnotarized build runs only on your own Macs; elsewhere Gatekeeper blocks
-the dylib, the CLI, and the bundle.
+`build-pkg.sh` refuses anything but a `HKDFGUARD_RELEASE=1` build. Beyond
+the checksum, every machine checks the package's own Developer ID Installer
+signature and stapled notarization ticket when it installs. Confirm the tag
+before pushing it or running `gh release create` — a release, unlike a
+local build, is visible and hard to fully retract once someone has pulled
+it.
 
-Each zip also contains its own `SHA256SUMS` (written by `build-dist.sh`).
-That file detects corruption only: anyone able to replace a zip can replace
-the `SHA256SUMS` inside it too. Integrity comes from the checksums in the
-release notes, which live outside the assets. Consumers should check a
-downloaded zip against those first, then its contents against the inner
-`SHA256SUMS`. The app bundle is additionally covered by its own Developer ID
-signature and notarization (`spctl --assess`). Confirm the tag before pushing it or
-running `gh release create` — a release, unlike a local build, is visible
-and hard to fully retract once someone has pulled it.
+### The installer package: `build-pkg.sh`
+
+Builds `dist/hkdfguard-native-macos-v1-<version>-osx-arm64.pkg` and its
+`.sha256` from `build-dist.sh`'s output. The version is the app's
+`CFBundleShortVersionString`, i.e. `MARKETING_VERSION` in the Xcode project —
+the one place it is set.
+
+Signing a package needs a **Developer ID Installer** certificate, separate
+from the Developer ID Application certificate that signs the code: Xcode →
+Settings → Accounts → your team → Manage Certificates → **+** → Developer ID
+Installer (Account Holder role). Check with `security find-identity -v`
+(without `-p codesigning`, which hides installer identities). Notarization
+uses the same `notarytool` profile as `build-dist.sh`.
+
+Before anything reaches `dist/`, the script checks:
+
+- **its input**: the dylib, CLI, and app Developer ID signed by the
+  project's Team, arm64, matching `SHA256SUMS`; the bare dylib and CLI
+  notarized (checked against Apple's ticket service, like `build-dist.sh`);
+  the app stapled;
+- **the package**: signed with Developer ID Installer by that Team,
+  timestamped, notarized, stapled, and accepted by Gatekeeper
+  (`spctl --assess --type install`);
+- **its contents**: exactly the expected files, byte-for-byte identical to
+  `dist/`, the app's signature intact, every entry `root:wheel` and writable
+  only by its owner, the CLI `0755`, the `postinstall` script present, and
+  the arm64 restriction in the distribution.
+
+The app bundle is marked non-relocatable. Without that, Installer looks for
+another copy of the same bundle ID anywhere on disk — the one in `dist/`, a
+download folder — and "upgrades" that copy in place instead of installing
+to the target path.
+
+| Variable | Meaning |
+|---|---|
+| `HKDFGUARD_NOTARY_PROFILE` | required: the `notarytool` keychain profile |
+| `HKDFGUARD_PKG_VERSION` | optional: must equal the built app's version if given |
+| `HKDFGUARD_INSTALLER_IDENTITY` | optional: defaults to the "Developer ID Installer" identity for the project's Team |
+| `HKDFGUARD_TEAM_ID` | optional: defaults to the project's `DEVELOPMENT_TEAM` |
+| `HKDFGUARD_PKG_UNSIGNED` | `1` for a local layout test only: no signing or notarization, output named `-UNSIGNED`; Gatekeeper and MDM tools refuse it |
 
 ## Installing on a machine
 
-Applications should load the dylib from a fixed, absolute path rather than
-from their working directory or a search path, so nothing earlier on that
-path can substitute a different library. Two scripts put a build at one of
-two such paths:
-
-| Script | Installs to | Owned by | Use it for |
-|---|---|---|---|
-| `install-user.sh` | `~/.hkdfguard/v1/` | the current user | a developer's own Mac |
-| `sudo ./install-system.sh` | `/Library/Application Support/HkdfGuard/v1/` | root | shared, build, and team machines; MDM rollout |
-
-Either one installs the four files of the `osx-arm64` build directly into
-`v1/`:
+The installer package is the **only** supported way to install the library.
+It installs, all `root:wheel`, into
+`/Library/Application Support/HkdfGuard/v1/`:
 
 ```
-v1/libhkdfguard_v1.dylib
-v1/hkdfguard.h
-v1/hkdfguard-v1-initialize
-v1/SHA256SUMS
+libhkdfguard_v1.dylib          0644   the library
+hkdfguard.h                    0644   its C header
+hkdfguard-v1-initialize        0755   the CLI, legacy keychain mode
+hkdfguard-v1-initialize.app           the CLI, data-protection keychain mode
+SHA256SUMS                     0644   checksums of the first three
+uninstall.sh                   0755   removes all of it
 ```
 
-Both refuse to run on an Intel Mac. They check the hardware (`sysctl
-hw.optional.arm64`), not the shell, so a script run under Rosetta still
-installs. Consumers must run on a native arm64 runtime: an x64 .NET,
+and a root-owned symlink `/usr/local/bin/hkdfguard-v1-initialize` → the
+legacy-mode CLI. It installs only on **Apple silicon** running **macOS 13 or
+later**, only to a system volume (never a user's home folder), with no
+customization. Consumers must run on a native arm64 runtime: an x64 .NET,
 Python, or Java runtime under Rosetta cannot load the arm64 dylib.
 
-### Pushing a build
+### Installing
 
-From a local build, after `./build-dist.sh`:
-
-```sh
-./install-user.sh                 # installs dist/osx-arm64
-sudo ./install-system.sh
-```
-
-From a published release, verify the zip against the release notes first
-(see [Publishing a release](#publishing-a-release)), then point `--from` at
-the extracted folder:
+Check the package against the release notes, then install it:
 
 ```sh
-VERSION=v1.2.0
-ZIP="hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip"
-gh release download "$VERSION" --pattern "$ZIP"
-shasum -a 256 "$ZIP"              # must match the value in the release notes
-mkdir hkdfguard-$VERSION && ditto -x -k "$ZIP" hkdfguard-$VERSION
-
-sudo ./install-system.sh --from hkdfguard-$VERSION
+VERSION=v0.9.0
+PKG="hkdfguard-native-macos-v1-${VERSION#v}-osx-arm64.pkg"
+gh release download "$VERSION" --pattern "$PKG"
+shasum -a 256 "$PKG"                      # must match the release notes
+pkgutil --check-signature "$PKG"          # Developer ID Installer: <Name> (<TEAMID>); notarized
+sudo installer -pkg "$PKG" -target /
+pkgutil --pkg-info com.hkdfguard.native.v1   # the receipt, with the installed version
 ```
 
-`--from` accepts either a `build-dist.sh`-style folder holding `osx-arm64/`
-or the extracted `osx-arm64` release folder itself.
+Double-clicking the package in Finder works too. For a fleet, upload the
+package to your MDM (Jamf, Intune, Kandji, …) and scope the policy to Apple
+silicon Macs; MDM tools verify the Developer ID Installer signature
+themselves. Installing a newer package over an older one upgrades `v1/` in
+place.
 
-For a fleet, have your MDM (Jamf, Intune, Kandji, ...) run
-`install-system.sh --from <folder>` as root, with the release zip
-extracted into `<folder>`, and scope the policy to Apple silicon Macs.
+### The `PATH` symlink
 
-`install-system.sh` only installs binaries signed by the Team pinned in
-the script (`PINNED_TEAM_ID`, which must match `DEVELOPMENT_TEAM` in the
-Xcode project); a build signed by anyone else is refused. The pin lives in
-the script rather than in the payload, so tampering with the files being
-installed cannot change it. `--team-id <TEAMID>` overrides it, for a build
-signed by a different team such as a fork.
+The package's `postinstall` script creates
+`/usr/local/bin/hkdfguard-v1-initialize`, rather than shipping it in the
+payload: a payload containing `/usr/local/bin` would let Installer reset the
+owner and mode of a folder that already exists (Homebrew on Intel Macs owns
+it). The script creates `/usr/local` and `/usr/local/bin` only if missing
+(`root:wheel 0755`), never changes an existing folder, never overwrites a
+real file at that path, and never fails the install. It logs what it did
+to `/var/log/install.log` — including a warning when `/usr/local/bin` is
+writable by anyone but root, because then anyone who can write it can
+replace the symlink with their own program. In that case, call the CLI by
+its full path when provisioning keys. The data-protection build is not on
+`PATH`; call it by its full path (see the CLI section above).
 
-To remove an install: `./install-user.sh --uninstall` or
-`sudo ./install-system.sh --uninstall`.
+### Uninstalling
 
-### What the scripts check
+```sh
+sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
+```
 
-Before anything at the destination changes, each script copies the files
-into a staging folder next to `v1/` and verifies **the staged copy** — so a
-file in the `--from` folder cannot be swapped between the check and the
-install:
+Removes `v1/`, the `PATH` symlink (only if it still points at this CLI), and
+the package receipt. **KEKs are not touched**: they live in each user's
+keychain, not in the install folder. Retire any that should go *before*
+uninstalling, while the CLI still exists (see `retire` above).
 
-- `SHA256SUMS` lists exactly the three payload files, and they match it.
-- The dylib and CLI are thin arm64 binaries.
-- Both signatures verify (`codesign --verify --strict`) and carry a Team
-  ID (not ad-hoc). `install-system.sh` requires that Team ID to be the
-  pinned one (or `--team-id`); `install-user.sh` requires both to share
-  one Team ID, and match `--team-id` when given.
+### Why this location
 
-Only then is the old `v1/` swapped out for the new one; a failed run leaves
-an existing install untouched. Extended attributes, including quarantine,
-are not copied, as with a `.pkg` installer: the checks above stand in for
-Gatekeeper's.
-
-Each script also refuses to install through a symlink, or under a folder
-that the wrong owner or another user could write:
-
-- `install-user.sh` refuses to run as root, takes the home folder from the
-  directory service (`dscl`) rather than `$HOME`, and requires the home
-  folder, `~/.hkdfguard`, and `v1/` to be owned by the user and not group-
-  or world-writable. Files are mode 644, the CLI and folders 755.
-- `install-system.sh` requires root, runs with a fixed `PATH`, and requires
-  `/`, `/Library`, `/Library/Application Support`, `HkdfGuard/`, and
-  everything it installs to be root-owned and writable only by root (files
-  `root:wheel` 644, the CLI and folders 755). It warns when the binaries are
-  not Developer ID signed.
-
-`/Library/Application Support` is used rather than `/usr/local/lib`
-because Homebrew on Intel Macs makes `/usr/local`'s subfolders writable by
-a user; `/usr/lib` is protected by SIP; and `/Users/Shared` or `/tmp` are
-writable by everyone.
-
-A per-user install is only as trusted as that user's account: anything
-running as the user can replace it. It is meant for development. Use the
-system install anywhere the library protects production data.
+Every folder from `/` down to `/Library/Application Support` is owned by
+root and writable only by root, so no other user can substitute a library or
+a folder above it. It is outside SIP, so a package can write it, and it is
+Apple's documented place for machine-wide support files.
+`/usr/local/lib` is avoided because Homebrew on Intel Macs makes
+`/usr/local`'s subfolders writable by a user; `/usr/lib` is protected by
+SIP; `/Users/Shared` and `/tmp` are writable by everyone.
 
 ### Loading the installed library
 
-Consumers should look in the system location first and fall back to the
-per-user one, so an administrator's install cannot be overridden by a
-per-user copy:
+There is exactly one place to load the library from:
 
-1. `/Library/Application Support/HkdfGuard/v1/libhkdfguard_v1.dylib`
-2. `<home>/.hkdfguard/v1/libhkdfguard_v1.dylib`, with `<home>` looked up
-   from the user database (`getpwuid(getuid())`), not `$HOME`
+```
+/Library/Application Support/HkdfGuard/v1/libhkdfguard_v1.dylib
+```
 
-Load the chosen file by its absolute path. Do not take extra search folders
-from an environment variable or config file. A hardened consumer also
-re-checks what the scripts enforce before loading: resolve the path with
-`realpath` and confirm it is still one of the two above, then check that
-every folder from the install root down and the dylib itself are owned by
-root (system) or the current user (per-user) and not group- or
-world-writable.
+Load it by that absolute path. Do not search other folders, and do not take
+a path or search folder from an environment variable or config file. A
+hardened consumer also re-checks what the package guarantees before loading:
+resolve the path with `realpath` and confirm it is still exactly the path
+above, then check that every folder from `/` down and the dylib itself are
+owned by root and not group- or world-writable. It can also verify the
+dylib's code signature against the expected Team ID
+(`SecStaticCodeCreateWithPath` + `SecStaticCodeCheckValidity`): a `dotnet`,
+`python`, or `java` host has no library validation of its own.
 
 For C#, route the `DllImport` name to that path with a resolver, so the
 existing `[DllImport("hkdfguard_v1")]` declarations stay unchanged:
@@ -772,7 +768,7 @@ existing `[DllImport("hkdfguard_v1")]` declarations stay unchanged:
 ```csharp
 NativeLibrary.SetDllImportResolver(typeof(HkdfGuardInterop).Assembly, (name, assembly, searchPath) =>
     name == "hkdfguard_v1"
-        ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath()) // system, then per-user; checks above
+        ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath()) // the fixed path; checks above
         : IntPtr.Zero);
 ```
 
@@ -781,12 +777,12 @@ Other languages load the same absolute path in place of the
 
 ## Consuming this library
 
-Every consumer needs three files from a release's zip:
-`libhkdfguard_v1.dylib`, `hkdfguard.h` (for the
-exact signatures — see [C ABI](#c-abi)), and, if provisioning from that
-process, `hkdfguard-v1-initialize`. Before loading anything, check the
-zip's SHA-256 against the value in the release notes, then the files inside
-against the zip's own `SHA256SUMS` (see "Publishing a release").
+Every consumer uses the files the installer package puts in
+`/Library/Application Support/HkdfGuard/v1/`: `libhkdfguard_v1.dylib`,
+loaded by that absolute path (see
+[Loading the installed library](#loading-the-installed-library));
+`hkdfguard.h`, for the exact signatures (see [C ABI](#c-abi)); and, for
+provisioning, the `hkdfguard-v1-initialize` CLI.
 
 A `dlopen`/FFI host in any of these languages runs in **legacy keychain
 mode** (see [Keychain modes](#keychain-modes-hybrid)) unless the host
@@ -868,10 +864,6 @@ int status = hkdfguard_create_kek("com.example.ingest");
 `libhkdfguard_v1.dylib` here by adding the platform's `lib` prefix and
 extension, so the same `DllImport` works wherever the library follows the
 standard naming.
-
-The `dist/osx-arm64` folder name is already a .NET runtime identifier, so a
-C# consumer can drop it straight into a NuGet package's
-`runtimes/{rid}/native/` layout instead of loading the zip by hand.
 
 ## Signing and entitlements
 
