@@ -1,10 +1,13 @@
 # hkdfguard-native-macos
 
 Core key and key-material protection for macOS. Sibling of
-`hkdfguard-native-linux` and the Windows native library; the three share one
-payload format — HPKE (RFC 9180), described below — and one CLI contract,
-while every key is bound to the machine it was created on and never
-leaves it.
+`hkdfguard-native-linux` and the Windows native library: the three share
+the C ABI, the status codes, the service-name rules, and the CLI contract,
+so one consumer and one pipeline work on every platform. They do **not**
+share payload bytes, and nothing requires them to: a KEK is bound to the
+Secure Enclave of the machine that created it and never leaves it, so a
+wrapped key file is only ever read on the machine that wrote it. The macOS
+payload is HPKE (RFC 9180), described below.
 
 `HkdfGuardNativeMacOS` wraps and unwraps 32-byte Data Encryption
 Keys (DEKs) under a per-service Key Encryption Key (KEK) that lives in the
@@ -78,22 +81,36 @@ Secure Enclave can hold its key — is a parse-time dispatch, not a new file
 format: the key schedule, AEAD, `info`, AAD, and parser stay as they are
 and only the KEM changes.
 
-### Sender authentication (not implemented)
+### Sender authentication — the trust boundary
 
 Base-mode HPKE, like any public-key encryption, authenticates nothing about
 *who* wrapped a payload: anyone holding a KEK's public key can produce one
-that unwraps. What stops a forged key file today is file ownership
-(`hkdfguard_open_file`'s `-27`) and the one-user model, not cryptography.
-HPKE's **Auth mode** would close that: the wrapper mixes its own long-term
-private key into the key agreement, and `hkdfguard_unwrap_dek` would reject
-any payload not produced by the holder of a pinned sender public key —
-verified to work with the Secure Enclave recipient key. It only helps,
-though, if the sender's key is somewhere the file's owner cannot reach,
-which means the **pipeline wraps off the machine** (wrapping needs only the
-KEK public key) with a key in its own HSM/KMS, the CLI exports the KEK
-public key at provisioning, and the machine pins the pipeline's public key
-in root-owned storage. That is a deployment-model change, not a crypto
-swap; the suite byte and the HPKE construction leave room for it.
+that unwraps. **This is a deliberate decision, not a gap.** The deployment
+model is that the pipeline hands the plaintext DEK to the CLI *on the
+machine*, which wraps it as the same user who will later unwrap it. In that
+model a sender key would live on the same machine as the same user, so
+HPKE's Auth mode (sender-authenticated encryption, which CryptoKit supports
+with the Secure Enclave recipient key) would add a check the file's owner
+could always pass themselves. It is therefore not used.
+
+What this design defends against, and what it leaves to the account:
+
+- A key file can be **read** by anyone, safely: it is ciphertext under a
+  key that never leaves this Mac's Secure Enclave.
+- A key file can be **swapped or forged** only by someone who can write it
+  as its owner (or root). `hkdfguard_open_file` refuses files owned by
+  anyone else, writable by anyone else, or hard-linked (`-27`); the AEAD
+  rejects any alteration of a genuine file; `wrap --fingerprint` and the
+  fingerprint check at unwrap reject a payload for the wrong KEK.
+- Whoever **is** the owning user — or has code running as them — can wrap a
+  DEK of their choosing, or put back an older genuine file. That is the
+  user account's boundary, the same one the login keychain already draws,
+  and it is where the protection stops.
+
+Were the deployment model ever to change so the pipeline wrapped off the
+machine with a key of its own, Auth mode plus a pinned sender key is the
+mechanism, and the suite byte leaves room for it; nothing in the current
+format precludes it.
 
 There is no in-band format version. **A change of payload format is
 signalled by adopting a new service name** (and therefore a new KEK).
@@ -837,15 +854,33 @@ process is itself a Team-signed app bundle carrying the
 keychain, gated by the login session being unlocked, not by an access group
 shared with a signed app bundle.
 
-**Legacy mode trusts the runtime, not your code.** The login keychain's ACL
-identifies the *executable* that asks for the item. For an interpreted or
-managed consumer that executable is the interpreter or runtime (`python3`,
-`node`, `java`, `dotnet`), so the operator's "Always Allow" is granted to
-that runtime as a whole. From then on, **any** script or program run by
-that runtime, as that user, can unwrap every DEK under that service with no
-prompt. For production, package the consumer as a Team-signed app bundle
-entitled for the shared access group so it runs in data-protection mode,
-where access is granted to your signed identity alone.
+**Legacy mode is the production mode for these consumers**, and its
+boundary is the user account plus the login keychain's per-item ACL. That
+ACL identifies the *main executable* that asks for the item, so what the
+operator's one-time "Always Allow" is granted to depends on how the
+consumer is launched:
+
+- Run as `dotnet MyApp.dll`, `python3 app.py`, `java -jar …`, the
+  executable is the shared runtime. The approval then covers **every**
+  program that runtime runs as that user, with no further prompt.
+- Run as **its own executable** — a .NET apphost (`./MyApp`, the default
+  `UseAppHost=true` build, or a self-contained single-file publish), a
+  PyInstaller/Nuitka binary, a Go binary — the approval covers that program
+  alone.
+
+So ship the consumer as its own executable and **sign it with your
+Developer ID** (a .NET apphost needs the `com.apple.security.cs.allow-jit`
+entitlement if you also enable the hardened runtime). A Developer ID
+signature is identified by its Team, so rebuilds and certificate renewals
+keep the approval; an ad-hoc signature is identified by the binary's hash,
+so every rebuild re-prompts — the same rule the CLI section gives for the
+CLI. The first unwrap on a machine is interactive (the "Always Allow"
+prompt) and needs the login keychain unlocked; run headless consumers as a
+LaunchAgent in a logged-in session (see "Access policy and headless use").
+
+Data-protection mode remains available for a consumer that *is* a
+Team-signed app bundle: there, access follows the signed identity with no
+prompt at all. It is not required.
 
 **Python** (`ctypes`, standard library):
 

@@ -7,6 +7,7 @@ import Testing
 import Foundation
 import CryptoKit
 import Security
+import os
 @testable import HkdfGuardNativeMacOS
 
 /// Exercises the public C-ABI entry points exposed by
@@ -272,23 +273,40 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         let service = "com.hkdfguard.tests.kek.create.concurrent.\(UUID().uuidString.filter { $0 != "-" })"
         defer { Self.deleteKEK(service: service) }
 
-        let lock = NSLock()
-        var statuses: [Int32] = []
+        // Sendable shared state, since the creators below run in @Sendable
+        // closures on GCD.
+        let statuses = OSAllocatedUnfairLock<[Int32]>(initialState: [])
 
         // 3 concurrent creators is enough to exercise the unique-index
         // race (needs >=2); observed directly that pushing much more
         // simultaneous load at the real Secure Enclave/securityd IPC
         // layer causes severe contention on this hardware, so this stays
         // deliberately modest rather than maximizing concurrency.
-        DispatchQueue.concurrentPerform(iterations: 3) { _ in
-            let status = Self.createKEK(service: service)
-            lock.lock()
-            statuses.append(status)
-            lock.unlock()
+        //
+        // The creators run on GCD's global pool and this thread waits with
+        // a deadline rather than joining them: the SEP/securityd IPC has
+        // been seen to stall outright under concurrent first use, and a
+        // thread blocked inside it cannot be cancelled -- `.timeLimit`
+        // alone would record the failure but leave the whole run hung. On
+        // a stall this records an issue and returns; the stuck threads are
+        // abandoned (they hold no test state) and don't block the run.
+        // A normal run completes in well under a second.
+        let creators = DispatchGroup()
+        for _ in 0..<3 {
+            DispatchQueue.global(qos: .userInitiated).async(group: creators) {
+                let status = Self.createKEK(service: service)
+                statuses.withLock { $0.append(status) }
+            }
+        }
+        guard creators.wait(timeout: .now() + 60) == .success else {
+            let finished = statuses.withLock { $0.count }
+            Issue.record("Secure Enclave/securityd stalled: only \(finished) of 3 concurrent hkdfguard_create_kek calls returned within 60 s")
+            return
         }
 
-        #expect(statuses.count == 3)
-        #expect(statuses.allSatisfy { $0 == 0 })
+        let collected = statuses.withLock { $0 }
+        #expect(collected.count == 3)
+        #expect(collected.allSatisfy { $0 == 0 })
     }
 
     @Test func kekExistsRejectsInvalidServiceIdentifier() {
