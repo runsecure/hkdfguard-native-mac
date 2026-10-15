@@ -2,14 +2,14 @@
 # Removes what the com.hkdfguard.native.v1 package installed:
 #
 #   /Library/Application Support/HkdfGuard/v1/
-#   /usr/local/bin/hkdfguard-v1-initialize   (only if it is still our symlink)
+#   /usr/local/bin/hkdfguard   (only if it is still our symlink)
 #   the package receipt                      (pkgutil --forget)
 #
 # Usage: sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
 #
 # KEKs are NOT touched: they live in each user's keychain, not here. Retire
 # any that should go *before* uninstalling, while the CLI still exists:
-#   hkdfguard-v1-initialize retire --service-name <name> --fingerprint <hex>
+#   hkdfguard retire --service-name <name> --fingerprint <hex>
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
@@ -17,8 +17,8 @@ export PATH
 [ "$(id -u)" -eq 0 ] || { echo "error: must run as root: sudo $0" >&2; exit 1; }
 
 root_dir="/Library/Application Support/HkdfGuard"
-cli="$root_dir/v1/hkdfguard-v1-initialize"
-link="/usr/local/bin/hkdfguard-v1-initialize"
+cli="$root_dir/v1/hkdfguard"
+link="/usr/local/bin/hkdfguard"
 
 if [ -L "$link" ] && [ "$(readlink "$link")" = "$cli" ]; then
     rm -f "$link"

@@ -1,23 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  Runs HkdfGuardNativeMacOSTests hosted inside HkdfGuardNativeMacOSTestHost.app
-  (the DebugHosted configuration sets TEST_HOST), so the whole suite executes
-  in data-protection keychain mode, and builds the bundled CLI
-  (hkdfguard-v1-initialize.app) alongside it for the cross-process
-  data-protection round-trip test.
-
-  Both app targets need a Mac App Development provisioning profile carrying
-  the com.hkdfguard.keys keychain access group. Run with:
-
-      xcodebuild test -scheme HkdfGuardNativeMacOSTests-Hosted \
-          -allowProvisioningUpdates
-
-  The plain HkdfGuardNativeMacOSTests scheme stays unhosted (legacy
-  mode) and needs no profile.
--->
 <Scheme
    LastUpgradeVersion = "2700"
-   version = "1.7">
+   version = "1.3">
    <BuildAction
       parallelizeBuildables = "YES"
       buildImplicitDependencies = "YES"
@@ -46,8 +30,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "C1A7E5700002000000000001"
-               BuildableName = "hkdfguard-v1-initialize.app"
-               BlueprintName = "hkdfguard-v1-initialize-app"
+               BuildableName = "hkdfguard.app"
+               BlueprintName = "hkdfguard-app"
                ReferencedContainer = "container:HkdfGuardNativeMacOS.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>

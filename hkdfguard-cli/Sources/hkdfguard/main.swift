@@ -37,14 +37,14 @@
 // `--service-name`; there is no further structure to it.
 //
 // Usage:
-//   hkdfguard-v1-initialize provision --service-name|-sn <name>
+//   hkdfguard provision --service-name|-sn <name>
 //
-//   hkdfguard-v1-initialize retire --service-name|-sn <name> \
+//   hkdfguard retire --service-name|-sn <name> \
 //       ( --fingerprint|-fp <64 hex chars> | --corrupt )
 //
-//   hkdfguard-v1-initialize status --service-name|-sn <name>
+//   hkdfguard status --service-name|-sn <name>
 //
-//   hkdfguard-v1-initialize wrap \
+//   hkdfguard wrap \
 //       --key-file-path|-kf <key-file-path> \
 //       --service-name|-sn <name> \
 //       ( --dek-stdin | --dek-file <path> ) \
@@ -208,7 +208,7 @@ func describeStatus(_ code: Int32) -> String {
 
 // MARK: - Argument parsing
 
-let programName = "hkdfguard-v1-initialize"
+let programName = "hkdfguard"
 let dekLen = 32
 // Generous starting capacity for the wrapped payload -- retried once at
 // the library-reported size on outputBufferTooSmall, so this only needs to

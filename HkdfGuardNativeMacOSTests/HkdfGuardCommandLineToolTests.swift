@@ -8,8 +8,8 @@ import Foundation
 import CryptoKit
 @testable import HkdfGuardNativeMacOS
 
-/// Exercises the actual `hkdfguard-v1-initialize` command-line tool
-/// (`../hkdfguard-v1-initialize`) as a real, separate process — not the
+/// Exercises the actual `hkdfguard` command-line tool
+/// (`../hkdfguard-cli`) as a real, separate process — not the
 /// `hkdfguard_wrap_dek` C ABI function it calls internally, which every
 /// other test in this suite already covers directly. This is the one
 /// place that answers "does the tool a real caller runs actually work,
@@ -32,7 +32,7 @@ import CryptoKit
 ///
 ///   securityd: displaying keychain prompt for .../xctest(59175);
 ///   ACL: ThresholdAclSubject(1 of 2)
-///     [CodeSignatureAclSubject[path: .../hkdfguard-v1-initialize]]
+///     [CodeSignatureAclSubject[path: .../hkdfguard]]
 ///     [KeychainPromptAclSubject(desc: com.hkdfguard.tests.cli.roundtrip.1)]
 ///
 /// The first time this test host (as a new, not-yet-approved requesting
@@ -122,7 +122,7 @@ struct HkdfGuardCommandLineToolTests {
     // This file lives at <repo>/HkdfGuardNativeMacOSTests/…, so
     // its own path is a stable way to find the repo root regardless of
     // where/how the test bundle itself is run from — the same technique
-    // hkdfguard-v1-initialize/Package.swift uses to locate the dylib it
+    // hkdfguard-cli/Package.swift uses to locate the dylib it
     // links against.
     private static let repoRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent() // HkdfGuardNativeMacOSTests/
@@ -133,10 +133,10 @@ struct HkdfGuardCommandLineToolTests {
         .path
 
     private static let cliPackageDir = repoRoot
-        .appendingPathComponent("hkdfguard-v1-initialize")
+        .appendingPathComponent("hkdfguard-cli")
 
     private static let cliExecutablePath = repoRoot
-        .appendingPathComponent("hkdfguard-v1-initialize/.build/release/hkdfguard-v1-initialize")
+        .appendingPathComponent("hkdfguard-cli/.build/release/hkdfguard")
         .path
 
     private struct ToolBuildError: Error, CustomStringConvertible {
@@ -266,7 +266,7 @@ struct HkdfGuardCommandLineToolTests {
         }
     }
 
-    /// Builds the `hkdfguard-v1-initialize` executable via SwiftPM. Must run
+    /// Builds the `hkdfguard` executable via SwiftPM. Must run
     /// after `buildDylib()` — the tool links against the dylib's fixed path
     /// at build time (see its own Package.swift) as well as at run time via
     /// `-rpath`.
@@ -277,11 +277,11 @@ struct HkdfGuardCommandLineToolTests {
             currentDirectory: cliPackageDir
         )
         guard result.exitCode == 0, FileManager.default.fileExists(atPath: cliExecutablePath) else {
-            throw ToolBuildError(description: "failed to build hkdfguard-v1-initialize (exit \(result.exitCode)):\n\(result.stdout)\n\(result.stderr)")
+            throw ToolBuildError(description: "failed to build hkdfguard (exit \(result.exitCode)):\n\(result.stdout)\n\(result.stderr)")
         }
     }
 
-    /// Runs the built `hkdfguard-v1-initialize` executable with
+    /// Runs the built `hkdfguard` executable with
     /// `arguments`, building it first if needed.
     private static func runCLI(_ arguments: [String], stdin: Data? = nil) throws -> (exitCode: Int32, stdout: String, stderr: String) {
         try toolsBuilt.get()
@@ -313,7 +313,7 @@ struct HkdfGuardCommandLineToolTests {
     /// Deletes the keychain item for `service`, via the `security` CLI
     /// rather than a direct `SecItemDelete` call. This isn't stylistic:
     /// every KEK this suite needs to clean up was created by the separate,
-    /// differently-signed `hkdfguard-v1-initialize` process, and a plain
+    /// differently-signed `hkdfguard` process, and a plain
     /// `SecItemDelete` from *this* process (the test host) against such an
     /// item fails outright — confirmed directly while developing this
     /// suite, returning errSecInvalidOwnerEdit (-25244, "Invalid attempt
@@ -1036,7 +1036,7 @@ struct HkdfGuardCommandLineToolTests {
 
     // MARK: - Data-protection mode: the bundled CLI provisions, the entitled host unwraps
 
-    /// The bundled build of the CLI (`hkdfguard-v1-initialize-app` target):
+    /// The bundled build of the CLI (`hkdfguard-app` target):
     /// the same main.swift inside an app bundle with an embedded provisioning
     /// profile and the test-only `com.hkdfguard.tests.keys` access group (its
     /// Debug/DebugHosted entitlements; Release ships `com.hkdfguard.keys`), which is
@@ -1044,7 +1044,7 @@ struct HkdfGuardCommandLineToolTests {
     /// products directory as the host app this bundle runs in.
     private static let bundledCLIPath = Bundle.main.bundleURL
         .deletingLastPathComponent()
-        .appendingPathComponent("hkdfguard-v1-initialize.app/Contents/MacOS/hkdfguard-v1-initialize")
+        .appendingPathComponent("hkdfguard.app/Contents/MacOS/hkdfguard")
         .path
 
     private static let dataProtectionRoundTripEnabled =

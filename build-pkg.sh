@@ -7,13 +7,13 @@
 #
 #   libhkdfguard_v1.dylib          the library
 #   hkdfguard.h                    its C header
-#   hkdfguard-v1-initialize        the CLI, legacy keychain mode
-#   hkdfguard-v1-initialize.app    the CLI, data-protection keychain mode
+#   hkdfguard        the CLI, legacy keychain mode
+#   hkdfguard.app    the CLI, data-protection keychain mode
 #   SHA256SUMS                     checksums of the first three
 #   uninstall.sh                   removes all of it (sudo)
 #
 # and its postinstall script adds a root-owned symlink
-# /usr/local/bin/hkdfguard-v1-initialize -> v1/hkdfguard-v1-initialize.
+# /usr/local/bin/hkdfguard -> v1/hkdfguard.
 # It installs only on Apple silicon running macOS 14 or later, only to a
 # system volume (never a user's home), with no customization.
 #
@@ -49,13 +49,13 @@ export PATH
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
 LIB_DIR="$DIST/osx-arm64"
-APP_SRC="$DIST/osx-arm64-app/hkdfguard-v1-initialize.app"
+APP_SRC="$DIST/osx-arm64-app/hkdfguard.app"
 PKG_RES="$ROOT/pkg"
 
 DYLIB_NAME="libhkdfguard_v1.dylib"
 HEADER_NAME="hkdfguard.h"
-CLI_NAME="hkdfguard-v1-initialize"
-APP_NAME="hkdfguard-v1-initialize.app"
+CLI_NAME="hkdfguard"
+APP_NAME="hkdfguard.app"
 PKG_ID="com.hkdfguard.native.v1"
 INSTALL_LOCATION="/Library/Application Support/HkdfGuard"
 

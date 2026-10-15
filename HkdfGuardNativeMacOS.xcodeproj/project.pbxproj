@@ -78,9 +78,9 @@
 		C1A7E5700001000000000002 /* HkdfGuardNativeMacOSTestHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = HkdfGuardNativeMacOSTestHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C1A7E5700001000000000003 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		C1A7E5700001000000000005 /* HkdfGuardNativeMacOSTestHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HkdfGuardNativeMacOSTestHost.entitlements; sourceTree = "<group>"; };
-		C1A7E5700002000000000002 /* hkdfguard-v1-initialize.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "hkdfguard-v1-initialize.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-		C1A7E5700002000000000003 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = main.swift; path = "hkdfguard-v1-initialize/Sources/hkdfguard-v1-initialize/main.swift"; sourceTree = "<group>"; };
-		C1A7E5700002000000000005 /* hkdfguard-v1-initialize.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = "hkdfguard-v1-initialize.entitlements"; path = "hkdfguard-v1-initialize/hkdfguard-v1-initialize.entitlements"; sourceTree = "<group>"; };
+		C1A7E5700002000000000002 /* hkdfguard.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "hkdfguard.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		C1A7E5700002000000000003 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = main.swift; path = "hkdfguard-cli/Sources/hkdfguard/main.swift"; sourceTree = "<group>"; };
+		C1A7E5700002000000000005 /* hkdfguard.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = "hkdfguard.entitlements"; path = "hkdfguard-cli/hkdfguard.entitlements"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -135,7 +135,7 @@
 				A8009863305CDD39003A51EC /* HkdfGuardNativeMacOSTests.xctest */,
 				26F6201A383E44E0B578B634 /* libhkdfguard_v1.dylib */,
 				C1A7E5700001000000000002 /* HkdfGuardNativeMacOSTestHost.app */,
-				C1A7E5700002000000000002 /* hkdfguard-v1-initialize.app */,
+				C1A7E5700002000000000002 /* hkdfguard.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -146,7 +146,7 @@
 				95AAC891B3674E0989355D62 /* HkdfGuardNativeMacOS */,
 				A8009867305CDD39003A51EC /* HkdfGuardNativeMacOSTests */,
 				C1A7E5700001000000000006 /* HkdfGuardNativeMacOSTestHost */,
-				C1A7E5700002000000000006 /* hkdfguard-v1-initialize-app */,
+				C1A7E5700002000000000006 /* hkdfguard-app */,
 				04CE6420354E4779808F6ACC /* Products */,
 			);
 			sourceTree = "<group>";
@@ -171,13 +171,13 @@
 			path = HkdfGuardNativeMacOSTestHost;
 			sourceTree = "<group>";
 		};
-		C1A7E5700002000000000006 /* hkdfguard-v1-initialize-app */ = {
+		C1A7E5700002000000000006 /* hkdfguard-app */ = {
 			isa = PBXGroup;
 			children = (
 				C1A7E5700002000000000003 /* main.swift */,
-				C1A7E5700002000000000005 /* hkdfguard-v1-initialize.entitlements */,
+				C1A7E5700002000000000005 /* hkdfguard.entitlements */,
 			);
-			name = "hkdfguard-v1-initialize-app";
+			name = "hkdfguard-app";
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -236,9 +236,9 @@
 			productReference = C1A7E5700001000000000002 /* HkdfGuardNativeMacOSTestHost.app */;
 			productType = "com.apple.product-type.application";
 		};
-		C1A7E5700002000000000001 /* hkdfguard-v1-initialize-app */ = {
+		C1A7E5700002000000000001 /* hkdfguard-app */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = C1A7E570000200000000000F /* Build configuration list for PBXNativeTarget "hkdfguard-v1-initialize-app" */;
+			buildConfigurationList = C1A7E570000200000000000F /* Build configuration list for PBXNativeTarget "hkdfguard-app" */;
 			buildPhases = (
 				C1A7E5700002000000000007 /* Sources */,
 				C1A7E5700002000000000008 /* Frameworks */,
@@ -250,9 +250,9 @@
 			dependencies = (
 				C1A7E570000200000000000E /* PBXTargetDependency */,
 			);
-			name = "hkdfguard-v1-initialize-app";
-			productName = "hkdfguard-v1-initialize";
-			productReference = C1A7E5700002000000000002 /* hkdfguard-v1-initialize.app */;
+			name = "hkdfguard-app";
+			productName = "hkdfguard";
+			productReference = C1A7E5700002000000000002 /* hkdfguard.app */;
 			productType = "com.apple.product-type.application";
 		};
 		E98493A6F0084622A53E8C41 /* HkdfGuardNativeMacOS */ = {
@@ -338,7 +338,7 @@
 				A8009862305CDD39003A51EC /* HkdfGuardNativeMacOSTests */,
 				FF27DBFDA52E432DA1F55DD4 /* HkdfGuardNativeMacOSDylib */,
 				C1A7E5700001000000000001 /* HkdfGuardNativeMacOSTestHost */,
-				C1A7E5700002000000000001 /* hkdfguard-v1-initialize-app */,
+				C1A7E5700002000000000001 /* hkdfguard-app */,
 			);
 		};
 /* End PBXProject section */
@@ -746,7 +746,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
-				CODE_SIGN_ENTITLEMENTS = "hkdfguard-v1-initialize/hkdfguard-v1-initialize.tests.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "hkdfguard-cli/hkdfguard.tests.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -760,8 +760,8 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 0.9.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.hkdfguard.hkdfguard-v1-initialize";
-				PRODUCT_NAME = "hkdfguard-v1-initialize";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.hkdfguard.cli";
+				PRODUCT_NAME = "hkdfguard";
 				SDKROOT = macosx;
 				SWIFT_VERSION = 5.0;
 			};
@@ -771,7 +771,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
-				CODE_SIGN_ENTITLEMENTS = "hkdfguard-v1-initialize/hkdfguard-v1-initialize.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "hkdfguard-cli/hkdfguard.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -785,8 +785,8 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 0.9.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.hkdfguard.hkdfguard-v1-initialize";
-				PRODUCT_NAME = "hkdfguard-v1-initialize";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.hkdfguard.cli";
+				PRODUCT_NAME = "hkdfguard";
 				SDKROOT = macosx;
 				SWIFT_VERSION = 5.0;
 			};
@@ -987,7 +987,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
-				CODE_SIGN_ENTITLEMENTS = "hkdfguard-v1-initialize/hkdfguard-v1-initialize.tests.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "hkdfguard-cli/hkdfguard.tests.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -1001,8 +1001,8 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 0.9.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.hkdfguard.hkdfguard-v1-initialize";
-				PRODUCT_NAME = "hkdfguard-v1-initialize";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.hkdfguard.cli";
+				PRODUCT_NAME = "hkdfguard";
 				SDKROOT = macosx;
 				SWIFT_VERSION = 5.0;
 			};
@@ -1061,7 +1061,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		C1A7E570000200000000000F /* Build configuration list for PBXNativeTarget "hkdfguard-v1-initialize-app" */ = {
+		C1A7E570000200000000000F /* Build configuration list for PBXNativeTarget "hkdfguard-app" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				C1A7E5700002000000000010 /* Debug */,

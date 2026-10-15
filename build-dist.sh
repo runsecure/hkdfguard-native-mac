@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Builds the Release dylib and the hkdfguard-v1-initialize CLI for arm64
+# Builds the Release dylib and the hkdfguard CLI for arm64
 # (Apple silicon) -- the only supported architecture -- signs both with the
 # hardened runtime, verifies them, and collects what a downstream consumer
 # needs (dylib, C header, CLI, SHA256SUMS) into dist/osx-arm64/, named for
 # the .NET runtime identifier. It must run on an Apple silicon Mac.
 #
-# It also builds the bundled CLI, dist/osx-arm64-app/hkdfguard-v1-initialize.app:
+# It also builds the bundled CLI, dist/osx-arm64-app/hkdfguard.app:
 # the same CLI as an arm64 app bundle carrying the shared
 # com.hkdfguard.keys keychain access group and an embedded provisioning
 # profile, which is what lets it run in data-protection keychain mode. It is
@@ -43,7 +43,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
-CLI_PKG="$ROOT/hkdfguard-v1-initialize"
+CLI_PKG="$ROOT/hkdfguard-cli"
 DYLIB_NAME="libhkdfguard_v1.dylib"
 HEADER="$ROOT/HkdfGuardNativeMacOS/hkdfguard.h"
 
@@ -79,9 +79,9 @@ case "${HKDFGUARD_APP_EXPORT:-}" in
         ;;
 esac
 
-APP_SCHEME="hkdfguard-v1-initialize-app"
-APP_NAME="hkdfguard-v1-initialize.app"
-APP_EXECUTABLE="hkdfguard-v1-initialize"
+APP_SCHEME="hkdfguard-app"
+APP_NAME="hkdfguard.app"
+APP_EXECUTABLE="hkdfguard"
 ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
 
 # Credentials. None are stored in this script or the repository; each input
@@ -271,9 +271,9 @@ notarize_arch() {
     local rid="$1" out="$2"
     local bundle="$WORK/notarize-$rid" submission="$WORK/notarize-$rid.zip" result="$WORK/notary-$rid.json"
     local log="$WORK/notary-log-$rid.json" id
-    echo "==> Notarizing $rid ($DYLIB_NAME, hkdfguard-v1-initialize) with keychain profile \"$NOTARY_PROFILE\""
+    echo "==> Notarizing $rid ($DYLIB_NAME, hkdfguard) with keychain profile \"$NOTARY_PROFILE\""
     mkdir -p "$bundle"
-    cp "$out/$DYLIB_NAME" "$out/hkdfguard-v1-initialize" "$bundle/"
+    cp "$out/$DYLIB_NAME" "$out/hkdfguard" "$bundle/"
     ditto -c -k --keepParent "$bundle" "$submission"
     xcrun notarytool submit "$submission" --keychain-profile "$NOTARY_PROFILE" \
         --wait --output-format json >"$result" \
@@ -284,11 +284,11 @@ notarize_arch() {
     xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" "$log" >/dev/null \
         || fail "could not fetch the notarization log for $rid (submission $id)"
     assert_in_ticket "$out/$DYLIB_NAME" "$log"
-    assert_in_ticket "$out/hkdfguard-v1-initialize" "$log"
+    assert_in_ticket "$out/hkdfguard" "$log"
     assert_ticket_published "$out/$DYLIB_NAME"
-    assert_ticket_published "$out/hkdfguard-v1-initialize"
+    assert_ticket_published "$out/hkdfguard"
     report_local_gatekeeper "$out/$DYLIB_NAME"
-    report_local_gatekeeper "$out/hkdfguard-v1-initialize"
+    report_local_gatekeeper "$out/hkdfguard"
 }
 
 # build_arch <xcode-arch> <rid>
@@ -314,7 +314,7 @@ build_arch() {
         build
     [ -f "$dylib_dir/$DYLIB_NAME" ] || fail "expected $dylib_dir/$DYLIB_NAME after the xcodebuild above"
 
-    echo "==> Building hkdfguard-v1-initialize for $arch (release)"
+    echo "==> Building hkdfguard for $arch (release)"
     # A dedicated --scratch-path: SwiftPM caches the evaluated manifest (and
     # therefore the linker flags derived from HKDFGUARD_DYLIB_DIR) per
     # scratch directory, so a plain `swift build` can't bleed into this one.
@@ -328,21 +328,21 @@ build_arch() {
         --package-path "$CLI_PKG" \
         --scratch-path "$scratch" \
         --show-bin-path)"
-    [ -f "$cli_bin_dir/hkdfguard-v1-initialize" ] || fail "expected CLI at $cli_bin_dir/hkdfguard-v1-initialize"
+    [ -f "$cli_bin_dir/hkdfguard" ] || fail "expected CLI at $cli_bin_dir/hkdfguard"
 
     echo "==> Assembling $out"
     cp "$dylib_dir/$DYLIB_NAME" "$out/"
     cp "$HEADER" "$out/"
-    cp "$cli_bin_dir/hkdfguard-v1-initialize" "$out/"
+    cp "$cli_bin_dir/hkdfguard" "$out/"
 
-    echo "==> Making $rid/hkdfguard-v1-initialize self-contained"
+    echo "==> Making $rid/hkdfguard self-contained"
     # As linked (see Package.swift), the CLI finds the dylib via an -rpath
     # baked in as this machine's absolute build directory -- fine
     # locally, useless once dist/ is copied anywhere else. The dylib's own
     # install_name is the relocatable "@rpath/<name>.dylib", so the CLI
     # only needs an rpath that resolves relative to itself:
     # @executable_path, i.e. "the directory this binary lives in".
-    local cli="$out/hkdfguard-v1-initialize"
+    local cli="$out/hkdfguard"
     install_name_tool -delete_rpath "$dylib_dir" "$cli"
     install_name_tool -add_rpath "@executable_path" "$cli"
     local rpaths
@@ -385,7 +385,7 @@ build_arch() {
     fi
 
     echo "==> Writing $rid/SHA256SUMS"
-    (cd "$out" && shasum -a 256 "$DYLIB_NAME" "$(basename "$HEADER")" hkdfguard-v1-initialize > SHA256SUMS)
+    (cd "$out" && shasum -a 256 "$DYLIB_NAME" "$(basename "$HEADER")" hkdfguard > SHA256SUMS)
 }
 
 # Prints `key`'s raw value from a plist, or nothing if it is absent.
@@ -396,7 +396,7 @@ plist_value() {
 # build_app: archives the bundled CLI (arm64), exports it with the
 # embedded provisioning profile its keychain-access-groups entitlement
 # requires, verifies it, optionally notarizes and staples it, and stages it
-# as osx-arm64-app/hkdfguard-v1-initialize.app.
+# as osx-arm64-app/hkdfguard.app.
 build_app() {
     local out="$STAGE/osx-arm64-app"
     local archive="$WORK/app.xcarchive"

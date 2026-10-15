@@ -2,7 +2,7 @@
 import Foundation
 import PackageDescription
 
-// This package builds one executable, `hkdfguard-v1-initialize`, that links
+// This package builds one executable, `hkdfguard`, that links
 // directly against the sibling Xcode project's already-built
 // libhkdfguard_v1.dylib (the HkdfGuardNativeMacOSDylib
 // target) and calls into it purely through its stable C ABI
@@ -15,7 +15,7 @@ import PackageDescription
 //       -target HkdfGuardNativeMacOSDylib -configuration Release build
 // then build/run this tool from anywhere:
 //   swift build --package-path <this-directory> -c release
-//   <this-directory>/.build/release/hkdfguard-v1-initialize --help
+//   <this-directory>/.build/release/hkdfguard --help
 //
 // The dylib's own `install_name` is `@rpath/libhkdfguard_v1.dylib`
 // (see its build settings' DYLIB_INSTALL_NAME_BASE), so the executable needs
@@ -47,11 +47,11 @@ let hkdfguardDylibDir: String = {
 let hkdfguardDylibPath = "\(hkdfguardDylibDir)/libhkdfguard_v1.dylib"
 
 let package = Package(
-    name: "hkdfguard-v1-initialize",
+    name: "hkdfguard",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "hkdfguard-v1-initialize",
+            name: "hkdfguard",
             linkerSettings: [
                 // The exact dylib path is handed to the linker rather than
                 // `-L<dir> -lhkdfguard_v1`, so the link can only ever pick up

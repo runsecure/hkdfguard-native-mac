@@ -210,7 +210,7 @@ extern "C" {
 //       the hardened mode -- put the shared HkdfGuard group first (or make
 //       it the only one) in every participating bundle's entitlement.
 //   legacy (mode 0): no such entitlement -- a bare executable (the
-//       hkdfguard-v1-initialize CLI as a plain Mach-O, a .NET/Python/Go
+//       hkdfguard CLI as a plain Mach-O, a .NET/Python/Go
 //       host that dlopens this library). Items are stored in the login
 //       keychain, protected by its lock and a per-item ACL keyed to the
 //       creating binary's signature; other identities get an interactive

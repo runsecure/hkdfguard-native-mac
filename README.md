@@ -14,7 +14,7 @@ Keys (DEKs) under a per-service Key Encryption Key (KEK) that lives in the
 device's Secure Enclave, exposed as a plain C ABI so it can be called from
 Swift, Objective-C, C/C++, or any language that can load a Mach-O dylib
 (Python `ctypes`, Go `cgo`, .NET P/Invoke, Java JNA, …). A companion
-command-line tool, `hkdfguard-v1-initialize`, provisions KEKs and wraps DEKs
+command-line tool, `hkdfguard`, provisions KEKs and wraps DEKs
 for pipelines.
 
 ## What it does
@@ -323,7 +323,7 @@ A legacy-mode KEK item can come back if a backup of the login keychain
 taken before retirement is restored onto the same Mac; account for backups
 if the goal is a true crypto-shred.
 
-## Command-line tool: `hkdfguard-v1-initialize`
+## Command-line tool: `hkdfguard`
 
 Provisions, wraps, and retires KEKs for pipelines. Provisioning and
 wrapping go through the C ABI above only; `retire` additionally deletes the
@@ -331,16 +331,16 @@ keychain item itself, since the library deliberately exports no delete.
 Four commands:
 
 ```
-hkdfguard-v1-initialize provision --service-name|-sn <name>
+hkdfguard provision --service-name|-sn <name>
 
-hkdfguard-v1-initialize status --service-name|-sn <name>
+hkdfguard status --service-name|-sn <name>
 
-hkdfguard-v1-initialize wrap --key-file-path|-kf <path> \
+hkdfguard wrap --key-file-path|-kf <path> \
                              --service-name|-sn <name> \
                              ( --dek-stdin | --dek-file <path> ) \
                              [--fingerprint|-fp <64 hex chars>] [--force|-f]
 
-hkdfguard-v1-initialize retire --service-name|-sn <name> \
+hkdfguard retire --service-name|-sn <name> \
                                ( --fingerprint|-fp <64 hex chars> | --corrupt )
 ```
 
@@ -445,16 +445,16 @@ keychain mode:
 
 | Build | Keychain mode | Use it to |
 |---|---|---|
-| `hkdfguard-v1-initialize` (plain executable) | legacy | provision and wrap for consumers that run in legacy mode — any `dlopen`/FFI host |
-| `hkdfguard-v1-initialize.app` (app bundle) | data-protection | provision, wrap, and retire for consumers that are Team-signed app bundles in the same `com.hkdfguard.keys` access group |
+| `hkdfguard` (plain executable) | legacy | provision and wrap for consumers that run in legacy mode — any `dlopen`/FFI host |
+| `hkdfguard.app` (app bundle) | data-protection | provision, wrap, and retire for consumers that are Team-signed app bundles in the same `com.hkdfguard.keys` access group |
 
 The installer package installs both (see
 [Installing on a machine](#installing-on-a-machine)). The legacy-mode CLI is
-on `PATH` as `/usr/local/bin/hkdfguard-v1-initialize`; run the
+on `PATH` as `/usr/local/bin/hkdfguard`; run the
 data-protection build by the executable inside its bundle:
 
 ```sh
-"/Library/Application Support/HkdfGuard/v1/hkdfguard-v1-initialize.app/Contents/MacOS/hkdfguard-v1-initialize" \
+"/Library/Application Support/HkdfGuard/v1/hkdfguard.app/Contents/MacOS/hkdfguard" \
     status -sn com.example.ingest   # prints "keychain: data-protection"
 ```
 
@@ -468,12 +468,12 @@ its own Team.
 Example pipeline use:
 
 ```sh
-hkdfguard-v1-initialize provision -sn com.example.ingest      # prints "fingerprint: <hex>" -- record it
-printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap -kf /etc/example/ingest.key -sn com.example.ingest \
+hkdfguard provision -sn com.example.ingest      # prints "fingerprint: <hex>" -- record it
+printf '%s' "$DEK_B64" | hkdfguard wrap -kf /etc/example/ingest.key -sn com.example.ingest \
     --dek-stdin -fp <recorded fingerprint>                     # refuses if the KEK is not that one
 
 # Later, after migrating everything to a new service name:
-hkdfguard-v1-initialize retire -sn com.example.ingest -fp <fingerprint printed by provision>
+hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 ```
 
 ## Project layout
@@ -483,8 +483,8 @@ hkdfguard-v1-initialize retire -sn com.example.ingest -fp <fingerprint printed b
 | `HkdfGuardNativeMacOS` | `HkdfGuardNativeMacOS.framework` | Embed in a signed macOS app; carries the public header and an app-sandbox entitlement |
 | `HkdfGuardNativeMacOSDylib` | `libhkdfguard_v1.dylib` | Flat shared library for `dlopen`-based FFI from arbitrary, often unsandboxed, host processes |
 | `HkdfGuardNativeMacOSTests` | `.xctest` | Swift Testing suites for the C entry points and for the CLI as a real subprocess |
-| `hkdfguard-v1-initialize/` | `hkdfguard-v1-initialize` | SwiftPM package for the CLI; links the dylib through its C ABI only. Bare Mach-O → legacy keychain mode |
-| `hkdfguard-v1-initialize-app` | `hkdfguard-v1-initialize.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
+| `hkdfguard-cli/` | `hkdfguard` | SwiftPM package for the CLI; links the dylib through its C ABI only. Bare Mach-O → legacy keychain mode |
+| `hkdfguard-app` | `hkdfguard.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
 | `HkdfGuardNativeMacOSTestHost` | `HkdfGuardNativeMacOSTestHost.app` | Minimal entitled host app for the test bundle, so the suite can run in data-protection mode (see Tests) |
 
 All library targets build from the single `HkdfGuardNativeMacOS.swift`.
@@ -512,7 +512,7 @@ xcodebuild -project HkdfGuardNativeMacOS.xcodeproj \
   -target HkdfGuardNativeMacOSDylib -configuration Release build
 
 # CLI (links against build/Release by default; override with HKDFGUARD_DYLIB_DIR):
-swift build -c release --package-path hkdfguard-v1-initialize
+swift build -c release --package-path hkdfguard
 
 # Tests (real Secure Enclave required — see Tests):
 xcodebuild test -scheme HkdfGuardNativeMacOSTests
@@ -576,7 +576,7 @@ disables `DYLD_*` environment overrides (which can otherwise redirect which
 dylib a process loads) and enforces library validation, so the CLI only
 loads dylibs signed by the same Team or by Apple.
 
-It also builds the bundled CLI into `dist/osx-arm64-app/hkdfguard-v1-initialize.app`
+It also builds the bundled CLI into `dist/osx-arm64-app/hkdfguard.app`
 — an arm64 bundle with the dylib embedded. Xcode
 archives and exports it, because only an export embeds the provisioning
 profile that the `keychain-access-groups` entitlement requires. Before
@@ -733,13 +733,13 @@ It installs, all `root:wheel`, into
 ```
 libhkdfguard_v1.dylib          0644   the library
 hkdfguard.h                    0644   its C header
-hkdfguard-v1-initialize        0755   the CLI, legacy keychain mode
-hkdfguard-v1-initialize.app           the CLI, data-protection keychain mode
+hkdfguard        0755   the CLI, legacy keychain mode
+hkdfguard.app           the CLI, data-protection keychain mode
 SHA256SUMS                     0644   checksums of the first three
 uninstall.sh                   0755   removes all of it
 ```
 
-and a root-owned symlink `/usr/local/bin/hkdfguard-v1-initialize` → the
+and a root-owned symlink `/usr/local/bin/hkdfguard` → the
 legacy-mode CLI. It installs only on **Apple silicon** running **macOS 14 or
 later**, only to a system volume (never a user's home folder), with no
 customization. Consumers must run on a native arm64 runtime: an x64 .NET,
@@ -771,7 +771,7 @@ mix — so have the MDM policy or the operator compare
 ### The `PATH` symlink
 
 The package's `postinstall` script creates
-`/usr/local/bin/hkdfguard-v1-initialize`, rather than shipping it in the
+`/usr/local/bin/hkdfguard`, rather than shipping it in the
 payload: a payload containing `/usr/local/bin` would let Installer reset the
 owner and mode of a folder that already exists (Homebrew on Intel Macs owns
 it). The script creates `/usr/local` and `/usr/local/bin` only if missing
@@ -844,7 +844,7 @@ Every consumer uses the files the installer package puts in
 loaded by that absolute path (see
 [Loading the installed library](#loading-the-installed-library));
 `hkdfguard.h`, for the exact signatures (see [C ABI](#c-abi)); and, for
-provisioning, the `hkdfguard-v1-initialize` CLI.
+provisioning, the `hkdfguard` CLI.
 
 A `dlopen`/FFI host in any of these languages runs in **legacy keychain
 mode** (see [Keychain modes](#keychain-modes-hybrid)) unless the host
@@ -1038,7 +1038,7 @@ the `DebugHosted` configuration, which sets `TEST_HOST` to
 `HkdfGuardNativeMacOSTestHost.app` — a Team-signed app entitled for the
 **test-only** `com.hkdfguard.tests.keys` access group — so the whole suite
 runs in data-protection mode, and additionally builds the bundled CLI
-(`hkdfguard-v1-initialize.app`, same test group). That enables the test
+(`hkdfguard.app`, same test group). That enables the test
 that matters most: the bundled CLI provisions a KEK and wraps a DEK, and
 this differently-signed host unwraps it through the library **with no
 interactive prompt** — the production topology, with access granted by

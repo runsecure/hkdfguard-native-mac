@@ -2,8 +2,8 @@
 # postinstall for com.hkdfguard.native.v1. Runs as root after the payload is
 # in place. Its only job is the PATH symlink:
 #
-#   /usr/local/bin/hkdfguard-v1-initialize
-#       -> /Library/Application Support/HkdfGuard/v1/hkdfguard-v1-initialize
+#   /usr/local/bin/hkdfguard
+#       -> /Library/Application Support/HkdfGuard/v1/hkdfguard
 #
 # Made here rather than shipped in the payload: a payload containing
 # /usr/local/bin would let Installer reset the owner and mode of a folder
@@ -29,9 +29,9 @@ export PATH
 volume="${3:-/}"
 volume="${volume%/}"
 
-cli="/Library/Application Support/HkdfGuard/v1/hkdfguard-v1-initialize"
+cli="/Library/Application Support/HkdfGuard/v1/hkdfguard"
 bin_dir="$volume/usr/local/bin"
-link="$bin_dir/hkdfguard-v1-initialize"
+link="$bin_dir/hkdfguard"
 
 log() { echo "hkdfguard postinstall: $*"; }
 
