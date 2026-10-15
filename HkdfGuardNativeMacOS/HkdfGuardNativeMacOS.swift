@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Security
+import os // Logger: hkdfguard_harden_process's advisory signature warning
 
 #if compiler(<6.2)
 #error("HkdfGuardNativeMacOS requires a Swift 6.2 or later toolchain.")
@@ -151,159 +152,178 @@ private func keychainItemAttributes(service: String, mode: KeychainMode) -> [Str
 
 // MARK: - Status codes returned across the C boundary
 
+/// The numbering is the shared HkdfGuard status table defined by
+/// hkdfguard-native-linux's include/hkdfguard.h, the source of record: a
+/// name has the same number on every platform. Common codes keep their
+/// common number; macOS-only refinements live in the -96..-111 band and each
+/// refines `HKDFGUARD_ERR_PROVIDER_ERROR` (-4). Numbers not listed here are
+/// reserved by that table. Case names stay macOS-flavored; the comment on
+/// each gives the shared `HKDFGUARD_*` name.
 private enum HKDFGuardStatus: Int32 {
+    /// HKDFGUARD_OK
     case success = 0
+    /// HKDFGUARD_ERR_INVALID_ARGUMENT: a NULL pointer, a DEK that isn't 32
+    /// bytes, or an empty `path`.
     case invalidInputLength = -1
+    /// HKDFGUARD_ERR_BUFFER_TOO_SMALL
     case outputBufferTooSmall = -2
-    /// Reserved but no longer returned by anything below — every path that
-    /// used to collapse into this now has its own, more specific code at
-    /// -10 or below (see `kekNotFound`, `kekCorrupted`,
-    /// `accessControlCreationFailed`, `keyGenerationFailed`,
-    /// `keychainWriteFailed`, `kekVerificationFailed`). Kept defined,
-    /// rather than deleted, so the numeric value -3 stays reserved and a
-    /// caller pattern-matching on it doesn't silently start matching
-    /// something unrelated.
-    case keyUnavailable = -3
-    /// Reserved; never returned. A KEK's public key is derived from the
-    /// reconstructed Secure Enclave key itself, so there is no state in which
-    /// a key loads but its public key does not -- failure to load is already
-    /// `kekCorrupted` / `keychainReadFailed` / `keychainAccessDenied`. Kept
-    /// defined, like `keyUnavailable` (-3), so the value is never reused for
-    /// something else a caller may already be matching on.
-    case publicKeyUnavailable = -4
+    /// HKDFGUARD_ERR_PROVIDER_UNAVAILABLE: no Secure Enclave on this machine.
+    case enclaveUnavailable = -3
+    /// HKDFGUARD_ERR_CRYPTO_ERROR: the RNG or HPKE sealing failed.
     case encryptionFailed = -5
-    case decryptionFailed = -6
-    case unexpectedOutputLength = -7
+    /// HKDFGUARD_ERR_INTERNAL_ERROR: the library produced output of a length
+    /// it never should. Points at a bug here, not at the caller's input.
+    case unexpectedOutputLength = -6
+    /// HKDFGUARD_ERR_INVALID_SERVICE_NAME
     case invalidServiceIdentifier = -8
-    case enclaveUnavailable = -9
 
-    // MARK: KEK-lifecycle failures — each a distinct reason that used to
-    // collapse into the single `keyUnavailable` (-3) above. Split out so a
-    // caller can actually tell "no key yet" (ordinary, often not even an
-    // error) apart from "the Secure Enclave/keychain refused to cooperate"
-    // (worth surfacing/logging) apart from "this looks like a bug in this
-    // library" (worth reporting).
+    // MARK: Wrapped payload
 
-    /// No keychain item exists yet for this service — the ordinary,
-    /// expected state before the first `hkdfguard_create_kek` call for a
-    /// given service, surfaced by `hkdfguard_wrap_dek`/
-    /// `hkdfguard_unwrap_dek` now that they no longer create one
-    /// implicitly.
-    case kekNotFound = -10
+    /// HKDFGUARD_ERR_PAYLOAD_MALFORMED: `wrapped_len` is not the length every
+    /// payload this library produces has.
+    case payloadMalformed = -10
 
-    /// A keychain item exists under this service, but its stored data
-    /// representation could not be reconstructed into a usable Secure
-    /// Enclave key — a corrupt or foreign entry. Deliberately never
-    /// "healed" by generating a replacement: that would silently orphan
-    /// whatever the original key protected.
-    case kekCorrupted = -11
+    /// HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED: AES-GCM authentication failed: the
+    /// payload or its embedded fingerprint was altered, or it was wrapped for
+    /// a different service under the same KEK. A different KEK is caught
+    /// earlier, as `fingerprintMismatch`.
+    case decryptionFailed = -11
 
-    /// `SecAccessControlCreateWithFlags` failed while provisioning a new
-    /// KEK, before any Secure Enclave key was even requested.
-    case accessControlCreationFailed = -12
+    /// HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: the payload's suite byte names a
+    /// ciphersuite this build does not implement — a payload written by a
+    /// newer or different build, not a tampered one. Returned by
+    /// hkdfguard_unwrap_dek and hkdfguard_open_file before any keychain or
+    /// Secure Enclave work.
+    case unsupportedCiphersuite = -12
 
-    /// The Secure Enclave refused to generate a new P-256 key-agreement
-    /// key for this service (distinct from the enclave being entirely
-    /// unavailable, which is `enclaveUnavailable` above).
-    case keyGenerationFailed = -13
+    // MARK: KEK
 
-    /// `SecItemAdd` failed while persisting a newly generated KEK, with an
-    /// `OSStatus` other than success or "another caller already won the
-    /// race" (`errSecDuplicateItem`, which is not an error — see
-    /// `createKEK`'s handling of it).
-    case keychainWriteFailed = -14
-
-    /// A KEK was just generated and successfully stored, but immediately
-    /// reloading and reconstructing it afterward — the verification step
-    /// that confirms what's now persisted is actually usable — failed.
-    /// Should not happen in practice; kept distinct rather than folded
-    /// into `kekCorrupted` because it points at a different moment
-    /// (verification of a write this process just made, not a
-    /// pre-existing item found on lookup).
-    case kekVerificationFailed = -15
-
-    /// The wrapped payload's embedded KEK fingerprint (see
-    /// `kekFingerprint` below) doesn't match the public key of the KEK
-    /// this service currently resolves to — this payload was not wrapped
-    /// under the key `hkdfguard_unwrap_dek` is about to use. Detected and
-    /// returned before any ECDH/AES-GCM decryption is attempted, not
-    /// derived from one: unlike `decryptionFailed`, this specifically
-    /// means "wrong KEK," not "right KEK, but tampered/mismatched data."
+    /// HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: the wrapped payload's embedded
+    /// KEK fingerprint (see `kekFingerprint` below) doesn't match the public
+    /// key of the KEK this service currently resolves to — this payload was
+    /// not wrapped under the key `hkdfguard_unwrap_dek` is about to use.
+    /// Detected and returned before any key agreement or AES-GCM is
+    /// attempted: unlike `decryptionFailed`, this specifically means "wrong
+    /// KEK," not "right KEK, but tampered/mismatched data."
     case fingerprintMismatch = -16
 
-    /// The keychain refused to say whether an item exists for this
-    /// service: the keychain is locked or there is no UI session to
-    /// prompt in (`errSecInteractionNotAllowed` — the headless-daemon
-    /// case), the item's ACL denied this process or the user declined the
-    /// access prompt (`errSecAuthFailed`, `errSecUserCanceled`), or this
-    /// process lacks a required entitlement (`errSecMissingEntitlement`).
-    /// Deliberately distinct from `kekNotFound`/`kekCorrupted`: a key very
-    /// likely *does* exist, and treating this as "no key" or "corrupt key"
-    /// would invite a caller to create a replacement or an operator to
-    /// delete a healthy one.
-    case keychainAccessDenied = -17
+    /// HKDFGUARD_ERR_KEK_NOT_FOUND: no keychain item exists yet for this
+    /// service — the ordinary, expected state before the first
+    /// `hkdfguard_create_kek` call for a given service. Wrap and unwrap never
+    /// create one.
+    case kekNotFound = -17
 
-    /// `SecItemCopyMatching` failed with an `OSStatus` other than
-    /// not-found or one of the access-denial codes above — e.g. no
-    /// keychain available at all, or an unexpected item shape.
-    case keychainReadFailed = -18
+    /// HKDFGUARD_ERR_KEK_ACCESS_DENIED: the keychain refused to say whether
+    /// an item exists for this service: the keychain is locked or there is no
+    /// UI session to prompt in (`errSecInteractionNotAllowed` — the
+    /// headless-daemon case), the item's ACL denied this process or the user
+    /// declined the access prompt (`errSecAuthFailed`, `errSecUserCanceled`),
+    /// or this process lacks a required entitlement
+    /// (`errSecMissingEntitlement`). Deliberately distinct from
+    /// `kekNotFound`/`kekCorrupted`: a key very likely *does* exist, and
+    /// treating this as "no key" or "corrupt key" would invite a caller to
+    /// create a replacement or an operator to delete a healthy one.
+    case keychainAccessDenied = -18
 
-    // MARK: Wrapped-key file failures — returned only by
-    // `hkdfguard_open_file`, which reads a payload from disk and never
-    // touches the keychain or the Secure Enclave.
+    /// HKDFGUARD_ERR_KEK_INVALID: a keychain item exists under this service,
+    /// but its stored data representation could not be reconstructed into a
+    /// usable Secure Enclave key — a corrupt or foreign entry. Deliberately
+    /// never "healed" by generating a replacement: that would silently
+    /// orphan whatever the original key protected.
+    case kekCorrupted = -19
 
-    /// No file at the path, or a component of the path is not a directory
-    /// (`ENOENT`, `ENOTDIR`).
-    case fileNotFound = -19
+    /// HKDFGUARD_ERR_PROCESS_HARDENING_FAILED: `hkdfguard_harden_process`
+    /// could not disable core dumps or deny debugger attachment, or -- with
+    /// HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE -- the host executable's
+    /// code signature still lets same-user processes debug or inject into it.
+    case processHardeningFailed = -20
 
-    /// The file or a directory on its path can't be read by this process
-    /// (`EACCES`, `EPERM`).
-    case fileAccessDenied = -20
+    // MARK: Key file — returned only by `hkdfguard_open_file`, which reads
+    // a payload from disk and never touches the keychain or the Secure
+    // Enclave.
 
-    /// The path names a symbolic link, directory, FIFO, socket, or device
-    /// rather than a regular file. A symlink is refused rather than
-    /// followed (`O_NOFOLLOW`), and a FIFO is opened non-blocking so it can't
-    /// hang the caller.
-    case fileNotRegular = -21
+    /// HKDFGUARD_ERR_FILE_NOT_FOUND: no file at the path, or a component of
+    /// the path is not a directory (`ENOENT`, `ENOTDIR`).
+    case fileNotFound = -32
 
-    /// `open`, `fstat`, or `read` failed for any other reason.
-    case fileReadFailed = -22
+    /// HKDFGUARD_ERR_FILE_ACCESS_DENIED: the file or a directory on its path
+    /// can't be read by this process (`EACCES`, `EPERM`).
+    case fileAccessDenied = -33
 
-    /// Fewer bytes than a wrapped payload — truncated, or not a payload —
-    /// and not recognizable as a plaintext DEK (that is `fileUnprotectedKey`).
-    case fileTooShort = -23
+    /// HKDFGUARD_ERR_FILE_IO: the path names a symbolic link, directory,
+    /// FIFO, socket, or device rather than a regular file, or `open`,
+    /// `fstat`, or `read` failed for any other reason. A symlink is refused
+    /// rather than followed (`O_NOFOLLOW`), and a FIFO is opened non-blocking
+    /// so it can't hang the caller.
+    case fileIO = -34
 
-    /// More bytes than a wrapped payload. Detected from the file's size
-    /// before anything is read, so an arbitrarily large file costs nothing.
-    case fileTooLong = -24
+    /// HKDFGUARD_ERR_FILE_TOO_SHORT: fewer bytes than a wrapped payload —
+    /// truncated, or not a payload — and not recognizable as a plaintext DEK
+    /// (that is `fileUnprotectedKey`).
+    case fileTooShort = -35
 
-    /// Exactly the payload's length, but not a payload: its encapsulated
-    /// key is not a valid P-256 point, or its KEK fingerprint is all zeros.
-    case fileMalformed = -25
+    /// HKDFGUARD_ERR_FILE_TOO_LONG: more bytes than a wrapped payload.
+    /// Detected from the file's size before anything is read, so an
+    /// arbitrarily large file costs nothing.
+    case fileTooLong = -36
 
-    /// The file appears to hold a bare, unwrapped 32-byte DEK — raw, or as
-    /// base64 or hex text — instead of a wrapped payload. Judged on length
-    /// and alphabet alone, so any 32-byte value stored that way matches
-    /// (a fingerprint saved as 64 hex characters, for one). If it is a key,
-    /// it was stored without protection: treat it as exposed and rotate it.
-    /// Its bytes are never copied to the caller's buffer.
-    case fileUnprotectedKey = -26
+    /// HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: the file appears to hold a bare,
+    /// unwrapped 32-byte DEK — raw, or as base64 or hex text — instead of a
+    /// wrapped payload. Judged on length and alphabet alone, so any 32-byte
+    /// value stored that way matches (a fingerprint saved as 64 hex
+    /// characters, for one). If it is a key, it was stored without
+    /// protection: treat it as exposed and rotate it. Its bytes are never
+    /// copied to the caller's buffer.
+    case fileUnprotectedKey = -37
 
-    /// The file is owned by someone other than this process's effective user
-    /// or root, is writable by group or others, or has more than one hard
-    /// link — so a party other than its owner could have replaced its
-    /// contents or linked an older payload into its place. Root is accepted
-    /// so an administrator or MDM can deploy key files a service account
-    /// reads; root can already alter anything on the machine, so this adds
-    /// no new party who could tamper with the file. The CLI's `wrap` writes
-    /// owner-only, 0600, one link, which always passes.
-    case fileInsecure = -27
+    /// HKDFGUARD_ERR_FILE_MALFORMED: exactly the payload's length, but not a
+    /// payload: its encapsulated key is not a valid P-256 point, or its KEK
+    /// fingerprint is all zeros.
+    case fileMalformed = -38
 
-    /// The payload's suite byte names a ciphersuite this build does not
-    /// implement — a payload written by a newer or different build, not a
-    /// tampered one. Returned by hkdfguard_unwrap_dek and hkdfguard_open_file
-    /// before any keychain or Secure Enclave work.
-    case unsupportedCiphersuite = -28
+    /// HKDFGUARD_ERR_FILE_UNTRUSTED: the file is owned by someone other than
+    /// this process's effective user or root, is writable by group or
+    /// others, or has more than one hard link — so a party other than its
+    /// owner could have replaced its contents or linked an older payload
+    /// into its place. Root is accepted so an administrator or MDM can
+    /// deploy key files a service account reads; root can already alter
+    /// anything on the machine, so this adds no new party who could tamper
+    /// with the file. The CLI's `wrap` writes owner-only, 0600, one link,
+    /// which always passes.
+    case fileInsecure = -39
+
+    // MARK: macOS-specific — each refines HKDFGUARD_ERR_PROVIDER_ERROR (-4).
+
+    /// HKDFGUARD_ERR_MAC_ACCESS_CONTROL_CREATION_FAILED:
+    /// `SecAccessControlCreateWithFlags` failed while provisioning a new
+    /// KEK, before any Secure Enclave key was even requested.
+    case accessControlCreationFailed = -96
+
+    /// HKDFGUARD_ERR_MAC_KEY_GENERATION_FAILED: the Secure Enclave refused
+    /// to generate a new P-256 key-agreement key for this service (distinct
+    /// from the enclave being entirely unavailable, `enclaveUnavailable`).
+    case keyGenerationFailed = -97
+
+    /// HKDFGUARD_ERR_MAC_KEYCHAIN_WRITE_FAILED: `SecItemAdd` failed while
+    /// persisting a newly generated KEK, with an `OSStatus` other than
+    /// success or "another caller already won the race"
+    /// (`errSecDuplicateItem`, which is not an error — see `createKEK`'s
+    /// handling of it).
+    case keychainWriteFailed = -98
+
+    /// HKDFGUARD_ERR_MAC_KEK_VERIFICATION_FAILED: a KEK was just generated
+    /// and successfully stored, but immediately reloading and reconstructing
+    /// it afterward failed. Should not happen in practice; kept distinct
+    /// from `kekCorrupted` because it points at a different moment
+    /// (verification of a write this process just made, not a pre-existing
+    /// item found on lookup).
+    case kekVerificationFailed = -99
+
+    /// HKDFGUARD_ERR_MAC_KEYCHAIN_READ_FAILED: `SecItemCopyMatching` failed
+    /// with an `OSStatus` other than not-found or one of the access-denial
+    /// codes above — e.g. no keychain available at all, or an unexpected
+    /// item shape.
+    case keychainReadFailed = -100
 }
 
 // MARK: - Zeroing secrets
@@ -374,12 +394,24 @@ private func isValidServiceByte(_ byte: UInt8) -> Bool {
         || byte == 0x2E                 // '.'
 }
 
+/// The shared HkdfGuard service-name rule (hkdfguard-native-linux's
+/// `cstr_to_service` is the source of record): 1-128 bytes, ASCII letters,
+/// digits, and '.' only, not starting with '.', and with no two consecutive
+/// dots. So a name can never be ".", "..", or a hidden dot-name, and never
+/// has an empty label between dots -- the same names are valid on every
+/// platform.
 private func validServiceName(service: String) -> Bool {
     let bytes = service.utf8
     guard !bytes.isEmpty, bytes.count <= hkdfguardMaxServiceLength else {
         return false
     }
-    return bytes.allSatisfy(isValidServiceByte)
+    guard bytes.allSatisfy(isValidServiceByte) else {
+        return false
+    }
+    guard bytes.first != 0x2E else { // leading '.'
+        return false
+    }
+    return !zip(bytes, bytes.dropFirst()).contains { $0 == 0x2E && $1 == 0x2E } // ".."
 }
 
 /// Every C ABI entry point below calls this immediately after receiving
@@ -395,8 +427,15 @@ private func validServiceName(service: String) -> Bool {
 /// the one normalized form that `validServiceName` re-checks downstream,
 /// the keychain query/store calls use, and the HPKE `info` is built from. Returns `nil` when the name is invalid — the
 /// caller maps that to `invalidServiceIdentifier`.
+///
+/// The terminator is looked for in at most 129 bytes (`strnlen`), as on
+/// Linux, rather than with `String(cString:)`, which reads until it finds a
+/// NUL however far away: an unterminated or over-long string is rejected
+/// without reading past the longest name that could be valid.
 private func normalizedService(from servicePtr: UnsafePointer<CChar>) -> String? {
-    let raw = String(cString: servicePtr)
+    let length = strnlen(servicePtr, hkdfguardMaxServiceLength + 1)
+    guard length <= hkdfguardMaxServiceLength else { return nil }
+    let raw = String(decoding: UnsafeRawBufferPointer(start: servicePtr, count: length), as: UTF8.self)
     guard validServiceName(service: raw) else { return nil }
     let lowered = raw.utf8.map { byte in
         (0x41...0x5A).contains(byte) ? byte + 0x20 : byte
@@ -601,7 +640,7 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
 /// simply no key yet (`kekNotFound` — the ordinary state before
 /// `hkdfguard_create_kek` has been called), the enclave itself is
 /// unavailable, the service name is malformed, or an existing item is
-/// corrupt, instead of one indistinguishable `keyUnavailable`.
+/// corrupt, instead of one indistinguishable failure.
 func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (status: Int32, key: SecureEnclave.P256.KeyAgreement.PrivateKey?) {
     guard validServiceName(service: service) else {
         return (HKDFGuardStatus.invalidServiceIdentifier.rawValue, nil)
@@ -724,6 +763,137 @@ private func wrapDekCore(
     }
     outLen.pointee = Int32(payload.count)
 
+    return HKDFGuardStatus.success.rawValue
+}
+
+// MARK: - Process hardening (opt-in)
+
+/// HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE: make a weak code signature
+/// a failure instead of a logged warning. Same bit on every platform.
+private let hkdfguardHardenRequireProtectedSignature: UInt32 = 0x1
+
+/// Every hardening flag this build knows; any other bit is refused.
+private let hkdfguardHardenAllFlags: UInt32 = hkdfguardHardenRequireProtectedSignature
+
+private let hardeningLog = Logger(subsystem: "com.hkdfguard", category: "hardening")
+
+/// Entitlements that let another process of the same user debug this one
+/// (get-task-allow, which Xcode adds to Debug builds) or load code into it.
+private let debuggableEntitlements = [
+    "com.apple.security.get-task-allow",
+    "com.apple.security.cs.allow-dyld-environment-variables",
+    "com.apple.security.cs.disable-library-validation",
+]
+
+/// Why the host executable's code signature still lets same-user processes
+/// debug or inject into this process -- empty when it doesn't. On macOS that
+/// protection comes from the signature (Hardened Runtime, none of
+/// `debuggableEntitlements`), which a library can read but not change.
+/// Internal, not private, so tests can check it against a known signature.
+func codeSignatureWeaknesses() -> [String] {
+    var code: SecCode?
+    var staticCode: SecStaticCode?
+    var info: CFDictionary?
+    guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess, let code,
+          SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess, let staticCode,
+          SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+          let signing = info as? [String: Any]
+    else {
+        return ["its code signature could not be read"]
+    }
+
+    var weaknesses: [String] = []
+    let flags = (signing[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+    if flags & SecCodeSignatureFlags.runtime.rawValue == 0 {
+        weaknesses.append("it is not signed with the Hardened Runtime (codesign --options runtime)")
+    }
+    let entitlements = signing[kSecCodeInfoEntitlementsDict as String] as? [String: Any] ?? [:]
+    for key in debuggableEntitlements where (entitlements[key] as? Bool) == true {
+        weaknesses.append("it has the \(key) entitlement")
+    }
+    return weaknesses
+}
+
+/// `ptrace(2)` isn't imported into Swift's Darwin module, so it is bound to
+/// the libc symbol directly, with <sys/ptrace.h>'s signature and request.
+@_silgen_name("ptrace")
+private func sys_ptrace(_ request: Int32, _ pid: pid_t, _ addr: UnsafeMutablePointer<CChar>?, _ data: Int32) -> Int32
+private let PT_DENY_ATTACH: Int32 = 31
+
+/// Whether a debugger is attached right now (`P_TRACED`), or nil if that
+/// can't be determined. `PT_DENY_ATTACH` on a traced process terminates it
+/// instead of returning, so it is only ever called after this says "no".
+private func isBeingTraced() -> Bool? {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+    guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0 else {
+        return nil
+    }
+    return info.kp_proc.p_flag & P_TRACED != 0
+}
+
+/// Same as `hkdfguard_harden_process_with_flags(0)`: core dumps off, debugger
+/// attachment denied, and a weak code signature logged but not fatal.
+@_cdecl("hkdfguard_harden_process")
+public func hkdfguard_harden_process() -> Int32 {
+    hkdfguard_harden_process_with_flags(flags: 0)
+}
+
+/// Opt-in hardening of the calling process against memory disclosure, in
+/// the same steps as on Linux where macOS has them:
+///
+/// 1. `RLIMIT_CORE` = 0, soft and hard, so it can't be raised again.
+/// 2. `ptrace(PT_DENY_ATTACH)`: later ptrace attaches fail. Refused (-20)
+///    rather than attempted if a debugger is already attached, because
+///    then the kernel would terminate the process.
+/// 3. The host executable's code signature is checked
+///    (`codeSignatureWeaknesses`). That is what stops a same-user process
+///    from taking this process's task port to read its memory, and only
+///    the host's signer can change it. A weakness is logged as a warning
+///    and the call still succeeds, so development hosts (python, dotnet,
+///    Xcode Debug builds) work -- unless `flags` includes
+///    HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE, which makes it -20.
+///
+/// Steps 1 and 2 are applied before step 3 is judged, so a strict-mode
+/// failure still leaves the process as hardened as it could be made.
+/// Unknown flag bits are -1, before anything changes. Idempotent.
+@_cdecl("hkdfguard_harden_process_with_flags")
+public func hkdfguard_harden_process_with_flags(flags: UInt32) -> Int32 {
+    guard flags & ~hkdfguardHardenAllFlags == 0 else {
+        hardeningLog.error("hkdfguard_harden_process_with_flags: unknown flag bits \(flags & ~hkdfguardHardenAllFlags, format: .hex)")
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+
+    var noCore = rlimit(rlim_cur: 0, rlim_max: 0)
+    guard setrlimit(RLIMIT_CORE, &noCore) == 0 else {
+        hardeningLog.error("hkdfguard: could not disable core dumps (setrlimit RLIMIT_CORE): \(String(cString: strerror(errno)), privacy: .public)")
+        return HKDFGuardStatus.processHardeningFailed.rawValue
+    }
+
+    switch isBeingTraced() {
+    case .some(false):
+        guard sys_ptrace(PT_DENY_ATTACH, 0, nil, 0) == 0 else {
+            hardeningLog.error("hkdfguard: could not deny debugger attachment (ptrace PT_DENY_ATTACH): \(String(cString: strerror(errno)), privacy: .public)")
+            return HKDFGuardStatus.processHardeningFailed.rawValue
+        }
+    case .some(true):
+        hardeningLog.error("hkdfguard: a debugger is attached to this process; it can't be hardened against one")
+        return HKDFGuardStatus.processHardeningFailed.rawValue
+    case .none:
+        hardeningLog.error("hkdfguard: could not tell whether a debugger is attached (sysctl KERN_PROC_PID): \(String(cString: strerror(errno)), privacy: .public)")
+        return HKDFGuardStatus.processHardeningFailed.rawValue
+    }
+
+    let weaknesses = codeSignatureWeaknesses()
+    if !weaknesses.isEmpty {
+        let why = weaknesses.joined(separator: "; ")
+        if flags & hkdfguardHardenRequireProtectedSignature != 0 {
+            hardeningLog.error("hkdfguard: other processes of this user can still debug or inject code into this process: \(why, privacy: .public). Sign the host executable with the Hardened Runtime and without those entitlements.")
+            return HKDFGuardStatus.processHardeningFailed.rawValue
+        }
+        hardeningLog.warning("hkdfguard: process hardened, but other processes of this user can still debug or inject code into it: \(why, privacy: .public). Fine for development; for production, sign the host executable with the Hardened Runtime and without those entitlements, and pass HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE.")
+    }
     return HKDFGuardStatus.success.rawValue
 }
 
@@ -886,8 +1056,40 @@ public func hkdfguard_generate_and_wrap_dek(
 
 // MARK: - Unwrap (decrypt) a DEK using the Secure Enclave KEK
 
+/// Runs `body` -- an entry point that writes into the caller's `out` -- and,
+/// on any non-success status, zeroes every byte of the capacity the caller
+/// declared in `*outLen` on entry, as on Linux: no partial or stale key
+/// material is ever left in `out`. With a NULL `out` or `outLen` there is no
+/// declared buffer that can safely be written, so nothing is.
+private func zeroingOutOnFailure(
+    _ outPtr: UnsafeMutablePointer<UInt8>?,
+    _ outLen: UnsafeMutablePointer<Int32>?,
+    _ body: () -> Int32
+) -> Int32 {
+    let declaredCapacity = outLen.map { Int($0.pointee) } ?? 0
+    let status = body()
+    if status != HKDFGuardStatus.success.rawValue, let outPtr, declaredCapacity > 0 {
+        _ = memset_s(outPtr, declaredCapacity, 0, declaredCapacity)
+    }
+    return status
+}
+
+/// On any failure, every byte of the caller's declared `out` capacity is
+/// zeroed (see `zeroingOutOnFailure`).
 @_cdecl("hkdfguard_unwrap_dek")
 public func hkdfguard_unwrap_dek(
+    servicePtr: UnsafePointer<CChar>?,
+    wrappedPtr: UnsafePointer<UInt8>?,
+    wrappedLen: Int32,
+    outPtr: UnsafeMutablePointer<UInt8>?,
+    outLen: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    zeroingOutOnFailure(outPtr, outLen) {
+        unwrapDekCore(servicePtr: servicePtr, wrappedPtr: wrappedPtr, wrappedLen: wrappedLen, outPtr: outPtr, outLen: outLen)
+    }
+}
+
+private func unwrapDekCore(
     servicePtr: UnsafePointer<CChar>?,
     wrappedPtr: UnsafePointer<UInt8>?,
     wrappedLen: Int32,
@@ -898,18 +1100,19 @@ public func hkdfguard_unwrap_dek(
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
 
-    // Every payload this library produces is exactly hkdfguardWrappedLength
-    // bytes, so anything else is rejected before it is read.
-    guard wrappedLen == Int32(hkdfguardWrappedLength) else {
-        return HKDFGuardStatus.invalidInputLength.rawValue
-    }
-
-    // The plaintext size is a constant too: a too-small buffer is reported
-    // before any keychain lookup or Secure Enclave operation, so a DEK is
-    // never decrypted into memory for a caller who cannot receive it.
+    // The plaintext size is a constant: a too-small buffer is reported
+    // before the payload is even looked at, and so before any keychain
+    // lookup or Secure Enclave operation -- a DEK is never decrypted into
+    // memory for a caller who cannot receive it.
     guard Int(outLen.pointee) >= hkdfguardDekLength else {
         outLen.pointee = Int32(hkdfguardDekLength)
         return HKDFGuardStatus.outputBufferTooSmall.rawValue
+    }
+
+    // Every payload this library produces is exactly hkdfguardWrappedLength
+    // bytes, so anything else is malformed and rejected before it is read.
+    guard wrappedLen == Int32(hkdfguardWrappedLength) else {
+        return HKDFGuardStatus.payloadMalformed.rawValue
     }
 
     guard let servicePtr, let service = normalizedService(from: servicePtr) else {
@@ -993,12 +1196,12 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
         return .fileNotFound
     case EACCES, EPERM:
         return .fileAccessDenied
-    case ELOOP, EOPNOTSUPP:
-        // ELOOP: O_NOFOLLOW found a symbolic link as the final component (or
-        // the path loops). EOPNOTSUPP: the path names a socket.
-        return .fileNotRegular
     default:
-        return .fileReadFailed
+        // Including ELOOP (O_NOFOLLOW found a symbolic link as the final
+        // component, or the path loops) and EOPNOTSUPP (the path names a
+        // socket): HKDFGUARD_ERR_FILE_IO covers "not a regular file" and
+        // "could not be read" alike.
+        return .fileIO
     }
 }
 
@@ -1029,10 +1232,10 @@ private func readWrappedFile(
     // file that will be read, not whatever the path names by now.
     var info = stat()
     guard fstat(fd, &info) == 0 else {
-        return (.fileReadFailed, 0)
+        return (.fileIO, 0)
     }
     guard info.st_mode & S_IFMT == S_IFREG else {
-        return (.fileNotRegular, 0)
+        return (.fileIO, 0)
     }
     // Same rules the CLI's `wrap` writes to (0600, one link) and the
     // install scripts apply to the library itself: nobody but the owner can
@@ -1061,7 +1264,7 @@ private func readWrappedFile(
             } else if n == 0 {
                 return .success
             } else if readErrno != EINTR {
-                return .fileReadFailed
+                return .fileIO
             }
         }
         return .success
@@ -1116,11 +1319,23 @@ private func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool {
 ///
 /// `*outLen` is the capacity on entry and is written on every return path:
 /// 146 on success or `outputBufferTooSmall` (the required size, reported
-/// before the file is opened), 0 on every other failure. `out` is written
-/// only on success, so a rejected file — in particular one holding a
-/// plaintext DEK — never reaches the caller's buffer.
+/// before the file is opened), 0 on every other failure. File contents are
+/// copied to `out` only on success, so a rejected file — in particular one
+/// holding a plaintext DEK — never reaches the caller's buffer; on any
+/// failure every byte of the declared capacity is zeroed instead, as on
+/// Linux (see `zeroingOutOnFailure`).
 @_cdecl("hkdfguard_open_file")
 public func hkdfguard_open_file(
+    pathPtr: UnsafePointer<CChar>?,
+    outPtr: UnsafeMutablePointer<UInt8>?,
+    outLen: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    zeroingOutOnFailure(outPtr, outLen) {
+        openFileCore(pathPtr: pathPtr, outPtr: outPtr, outLen: outLen)
+    }
+}
+
+private func openFileCore(
     pathPtr: UnsafePointer<CChar>?,
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
@@ -1133,7 +1348,7 @@ public func hkdfguard_open_file(
         return HKDFGuardStatus.outputBufferTooSmall.rawValue
     }
     outLen.pointee = 0
-    guard let pathPtr else {
+    guard let pathPtr, pathPtr.pointee != 0 else {
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
 

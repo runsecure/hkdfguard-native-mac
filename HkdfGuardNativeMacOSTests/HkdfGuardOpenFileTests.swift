@@ -13,10 +13,10 @@ import CryptoKit
 ///
 /// Status codes mirrored from the module's private `HKDFGuardStatus`:
 ///   0 = success, -1 = invalidInputLength, -2 = outputBufferTooSmall,
-///   -19 = fileNotFound, -20 = fileAccessDenied, -21 = fileNotRegular,
-///   -22 = fileReadFailed, -23 = fileTooShort, -24 = fileTooLong,
-///   -25 = fileMalformed, -26 = fileUnprotectedKey, -27 = fileInsecure,
-///   -28 = unsupportedCiphersuite.
+///   -12 = unsupportedCiphersuite, -32 = fileNotFound, -33 = fileAccessDenied,
+///   -34 = fileIO, -35 = fileTooShort, -36 = fileTooLong,
+///   -37 = fileUnprotectedKey, -38 = fileMalformed, -39 = fileInsecure
+///   (the shared HkdfGuard status table; see hkdfguard.h).
 ///
 /// `hkdfguard_open_file` never touches the keychain or the Secure Enclave,
 /// so unlike `HkdfGuardNativeMacOSWrapUnwrapTests` this suite runs anywhere,
@@ -54,7 +54,7 @@ struct HkdfGuardOpenFileTests {
     private static func openFile(
         _ path: String,
         bufferCapacity: Int32 = 1024
-    ) -> (status: Int32, bytes: [UInt8], outLen: Int32, untouched: Bool) {
+    ) -> (status: Int32, bytes: [UInt8], outLen: Int32, zeroed: Bool) {
         var out = [UInt8](repeating: 0xA5, count: Int(bufferCapacity))
         var outLen = bufferCapacity
         let status = path.withCString { pathCStr in
@@ -62,7 +62,9 @@ struct HkdfGuardOpenFileTests {
                 hkdfguard_open_file(pathPtr: pathCStr, outPtr: outBuf.baseAddress!, outLen: &outLen)
             }
         }
-        return (status, Array(out.prefix(Int(max(outLen, 0)))), outLen, out.allSatisfy { $0 == 0xA5 })
+        // `zeroed`: on failure the whole declared capacity is cleared (as on
+        // Linux), so no byte of a rejected file -- or the marker -- remains.
+        return (status, Array(out.prefix(Int(max(outLen, 0)))), outLen, out.allSatisfy { $0 == 0 })
     }
 
     // MARK: - Success
@@ -103,9 +105,9 @@ struct HkdfGuardOpenFileTests {
             let file = dir.appendingPathComponent("short.\(length)")
             try Self.write(Array(payload.prefix(length)), to: file)
             let result = Self.openFile(file.path)
-            #expect(result.status == -23, "length \(length)")
+            #expect(result.status == -35, "length \(length)")
             #expect(result.outLen == 0, "length \(length)")
-            #expect(result.untouched, "length \(length): nothing may be written to out")
+            #expect(result.zeroed, "length \(length): out must be zeroed")
         }
     }
 
@@ -118,9 +120,9 @@ struct HkdfGuardOpenFileTests {
             let file = dir.appendingPathComponent("long.\(extra)")
             try Self.write(payload + [UInt8](repeating: 0x41, count: extra), to: file)
             let result = Self.openFile(file.path)
-            #expect(result.status == -24, "extra \(extra)")
+            #expect(result.status == -36, "extra \(extra)")
             #expect(result.outLen == 0, "extra \(extra)")
-            #expect(result.untouched, "extra \(extra)")
+            #expect(result.zeroed, "extra \(extra)")
         }
     }
 
@@ -150,9 +152,9 @@ struct HkdfGuardOpenFileTests {
             let file = dir.appendingPathComponent(name.replacingOccurrences(of: " ", with: "."))
             try Self.write(bytes, to: file)
             let result = Self.openFile(file.path)
-            #expect(result.status == -26, "\(name)")
+            #expect(result.status == -37, "\(name)")
             #expect(result.outLen == 0, "\(name)")
-            #expect(result.untouched, "\(name): a plaintext key must never reach the caller's buffer")
+            #expect(result.zeroed, "\(name): a plaintext key must never reach the caller's buffer")
         }
     }
 
@@ -170,7 +172,7 @@ struct HkdfGuardOpenFileTests {
         for (name, text) in cases {
             let file = dir.appendingPathComponent(name.replacingOccurrences(of: " ", with: "."))
             try Self.write(Array(text.utf8), to: file)
-            #expect(Self.openFile(file.path).status == -23, "\(name)")
+            #expect(Self.openFile(file.path).status == -35, "\(name)")
         }
     }
 
@@ -185,8 +187,8 @@ struct HkdfGuardOpenFileTests {
         try Self.write(payload, to: file)
 
         let result = Self.openFile(file.path)
-        #expect(result.status == -25)
-        #expect(result.untouched)
+        #expect(result.status == -38)
+        #expect(result.zeroed)
     }
 
     @Test func rejectsAPayloadLengthFileWhoseEncapsulatedKeyIsNotOnTheCurve() throws {
@@ -197,7 +199,7 @@ struct HkdfGuardOpenFileTests {
         payload.replaceSubrange(33..<98, with: [UInt8](repeating: 0xFF, count: 65))
         try Self.write(payload, to: file)
 
-        #expect(Self.openFile(file.path).status == -25)
+        #expect(Self.openFile(file.path).status == -38)
     }
 
     @Test func rejectsAnEncapsulatedKeyWithACompressedPrefix() throws {
@@ -210,7 +212,7 @@ struct HkdfGuardOpenFileTests {
             var payload = Self.structurallyValidPayload()
             payload[33] = prefix
             try Self.write(payload, to: file)
-            #expect(Self.openFile(file.path).status == -25, "prefix \(prefix)")
+            #expect(Self.openFile(file.path).status == -38, "prefix \(prefix)")
         }
     }
 
@@ -225,8 +227,8 @@ struct HkdfGuardOpenFileTests {
             payload[32] = suite
             try Self.write(payload, to: file)
             let result = Self.openFile(file.path)
-            #expect(result.status == -28, "suite \(suite)")
-            #expect(result.untouched, "suite \(suite)")
+            #expect(result.status == -12, "suite \(suite)")
+            #expect(result.zeroed, "suite \(suite)")
         }
     }
 
@@ -236,22 +238,43 @@ struct HkdfGuardOpenFileTests {
         let file = dir.appendingPathComponent("zeros")
         try Self.write([UInt8](repeating: 0, count: Self.wrappedLength), to: file)
 
-        #expect(Self.openFile(file.path).status == -25)
+        #expect(Self.openFile(file.path).status == -38)
     }
 
     // MARK: - Path and file type
+
+    @Test func zeroesTheDeclaredOutCapacityOnFailure() throws {
+        // A missing file (-32) and a too-small buffer (-2): either way the
+        // declared capacity is zeroed and nothing past it is touched.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let missing = dir.appendingPathComponent("absent.key").path
+
+        for (declared, status) in [(Int32(200), Int32(-32)), (Int32(100), Int32(-2))] {
+            var out = [UInt8](repeating: 0xAA, count: 256)
+            var outLen = declared
+            let rc = out.withUnsafeMutableBufferPointer { buf in
+                hkdfguard_open_file(pathPtr: missing, outPtr: buf.baseAddress, outLen: &outLen)
+            }
+            #expect(rc == status)
+            #expect(out[0..<Int(declared)].allSatisfy { $0 == 0 }, "declared \(declared)")
+            #expect(out[Int(declared)...].allSatisfy { $0 == 0xAA }, "declared \(declared)")
+        }
+    }
 
     @Test func reportsAMissingFileAsNotFound() throws {
         let dir = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        #expect(Self.openFile(dir.appendingPathComponent("absent.key").path).status == -19)
-        #expect(Self.openFile("").status == -19)
+        #expect(Self.openFile(dir.appendingPathComponent("absent.key").path).status == -32)
+        // An empty path names nothing to look for: an argument error, as on
+        // Linux, not a missing file.
+        #expect(Self.openFile("").status == -1)
 
         // A path that runs *through* a regular file: ENOTDIR.
         let file = dir.appendingPathComponent("ingest.key")
         try Self.write(Self.structurallyValidPayload(), to: file)
-        #expect(Self.openFile(file.path + "/inner").status == -19)
+        #expect(Self.openFile(file.path + "/inner").status == -32)
     }
 
     @Test(.enabled(if: geteuid() != 0, "root bypasses file permissions"))
@@ -262,7 +285,7 @@ struct HkdfGuardOpenFileTests {
         try Self.write(Self.structurallyValidPayload(), to: file)
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
 
-        #expect(Self.openFile(file.path).status == -20)
+        #expect(Self.openFile(file.path).status == -33)
     }
 
     @Test func refusesASymlinkEvenToAValidPayload() throws {
@@ -274,15 +297,15 @@ struct HkdfGuardOpenFileTests {
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
 
         let result = Self.openFile(link.path)
-        #expect(result.status == -21)
-        #expect(result.untouched)
+        #expect(result.status == -34)
+        #expect(result.zeroed)
     }
 
     @Test func refusesADirectory() throws {
         let dir = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        #expect(Self.openFile(dir.path).status == -21)
+        #expect(Self.openFile(dir.path).status == -34)
     }
 
     // MARK: - Ownership, permissions, links
@@ -308,8 +331,8 @@ struct HkdfGuardOpenFileTests {
             try Self.write(Self.structurallyValidPayload(), to: file)
             try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: file.path)
             let result = Self.openFile(file.path)
-            #expect(result.status == -27, "mode \(String(mode, radix: 8))")
-            #expect(result.untouched, "mode \(String(mode, radix: 8))")
+            #expect(result.status == -39, "mode \(String(mode, radix: 8))")
+            #expect(result.zeroed, "mode \(String(mode, radix: 8))")
         }
     }
 
@@ -317,7 +340,7 @@ struct HkdfGuardOpenFileTests {
         // A test can't create a root-owned file without sudo, so this uses
         // one the OS ships: root-owned, 0444, one link. It isn't a payload,
         // so it can't succeed -- but it must get past the ownership check
-        // and fail on its size (-24), never as fileInsecure (-27).
+        // and fail on its size (-36), never as fileInsecure (-39).
         let path = "/System/Library/CoreServices/SystemVersion.plist"
         var info = stat()
         try #require(stat(path, &info) == 0, "\(path) missing")
@@ -325,7 +348,7 @@ struct HkdfGuardOpenFileTests {
                      "\(path) is no longer root-owned, owner-writable only, single-link")
         try #require(info.st_size > off_t(Self.wrappedLength), "\(path) is no longer larger than a payload")
 
-        #expect(Self.openFile(path).status == -24)
+        #expect(Self.openFile(path).status == -36)
     }
 
     @Test func refusesAFileWithMoreThanOneHardLink() throws {
@@ -341,8 +364,8 @@ struct HkdfGuardOpenFileTests {
 
         let alias = dir.appendingPathComponent("alias.key")
         try FileManager.default.linkItem(at: original, to: alias)
-        #expect(Self.openFile(original.path).status == -27)
-        #expect(Self.openFile(alias.path).status == -27)
+        #expect(Self.openFile(original.path).status == -39)
+        #expect(Self.openFile(alias.path).status == -39)
 
         // Removing the extra link restores the file.
         try FileManager.default.removeItem(at: alias)
@@ -357,7 +380,7 @@ struct HkdfGuardOpenFileTests {
         #expect(mkfifo(fifo.path, 0o600) == 0)
 
         // No writer ever opens the FIFO: a blocking open would hang here.
-        #expect(Self.openFile(fifo.path).status == -21)
+        #expect(Self.openFile(fifo.path).status == -34)
     }
 
     // MARK: - Arguments and buffer sizing
