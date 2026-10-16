@@ -226,6 +226,64 @@ it everywhere. Unknown flag bits return -1 before anything changes.
 The `hkdfguard` CLI calls `hkdfguard_harden_process()` at startup and
 refuses to run if it fails, like the Linux tool.
 
+### Audit trail
+
+The library writes one record per security-relevant event to the macOS
+unified log, whatever the host does about logging: subsystem
+`com.hkdfguard`, category `audit`. These are the Linux build's syslog records
+and the Windows build's Event Log events, with the same IDs, meanings and
+fields, so one set of alerts covers all three. To read them:
+
+```sh
+/usr/bin/log show --last 1h --info \
+    --predicate 'subsystem == "com.hkdfguard" AND category == "audit"'
+```
+
+(Use the full path: in zsh, `log` is a shell builtin that shadows the tool.)
+Console.app shows the same records live.
+
+| ID | Level | When |
+|---|---|---|
+| 1000 | default | A KEK was created (not merely found). |
+| 1002 | default | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
+| 1003 | default | A DEK was unwrapped. |
+| 2000 | error | `KEK_ACCESS_DENIED`. |
+| 2002 | fault | `KEK_INVALID`. |
+| 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
+| 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
+| 2007 | error | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. Logged once per process. |
+
+The unified log has no "warning" level, so Linux's info / warning / error
+are `default` / `error` / `fault` here. `default` is the level the log keeps
+on disk by default. Linux's 1001 (a KEK created on a fallback provider) and
+2004 (`POLICY_INVALID`) never occur on macOS: there is one provider, the
+Secure Enclave, and no policy file.
+
+Each record is `key=value` fields followed by a sentence:
+
+```text
+event=1002 op=hkdfguard_wrap_dek result=OK service="com.example.ingest" provider=SECURE_ENCLAVE
+  kek_fingerprint=d7a1... payload_sha256=7fbd... uid=501 euid=501 pid=4242 exe="/usr/local/bin/ingest" msg="DEK wrapped"
+```
+
+The fields identify the caller (`uid`, `euid`, `pid`, `exe`) and the service
+by name, and every field is logged public, so nothing appears as
+`<private>`. Wrap and unwrap records also carry the KEK's fingerprint and a
+SHA-256 of the 146-byte payload. Both are public, and the same payload hashes
+the same in its wrap record and in every unwrap record, which ties each
+unwrap back to the wrap that made it (`shasum -a 256 <file>` hashes a key
+file for comparison). The creation record (1000) also names the keychain
+mode.
+
+The records never contain DEKs, KEKs, shared secrets, derived keys or
+plaintext. Caller mistakes (`INVALID_ARGUMENT`, `BUFFER_TOO_SMALL`,
+`INVALID_SERVICE_NAME`) and `KEK_NOT_FOUND` aren't recorded. Unlike Linux,
+the unwrap-success record (1003) can't be turned off: Linux does that in its
+policy file, and this library takes no configuration. Any process can write
+to the unified log, so these records are an audit aid, not tamper-proof
+evidence.
+
 ### Reading a wrapped key file: `hkdfguard_open_file`
 
 Reads the 146-byte payload that the CLI's `wrap` writes, validates it, and

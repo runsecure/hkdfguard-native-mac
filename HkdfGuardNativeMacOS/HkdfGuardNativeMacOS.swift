@@ -159,7 +159,7 @@ private func keychainItemAttributes(service: String, mode: KeychainMode) -> [Str
 /// refines `HKDFGUARD_ERR_PROVIDER_ERROR` (-4). Numbers not listed here are
 /// reserved by that table. Case names stay macOS-flavored; the comment on
 /// each gives the shared `HKDFGUARD_*` name.
-private enum HKDFGuardStatus: Int32 {
+enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-platform ABI test checks every case against the Linux header
     /// HKDFGUARD_OK
     case success = 0
     /// HKDFGUARD_ERR_INVALID_ARGUMENT: a NULL pointer, a DEK that isn't 32
@@ -324,6 +324,50 @@ private enum HKDFGuardStatus: Int32 {
     /// codes above — e.g. no keychain available at all, or an unexpected
     /// item shape.
     case keychainReadFailed = -100
+}
+
+extension HKDFGuardStatus {
+    /// The shared name of this status, without the `HKDFGUARD_` prefix (e.g.
+    /// `KEK_INVALID`) -- the `result=` value in audit records, as on Linux.
+    /// The cross-platform ABI test checks each against the header.
+    var sharedName: String {
+        switch self {
+        case .success: return "OK"
+        case .invalidInputLength: return "ERR_INVALID_ARGUMENT"
+        case .outputBufferTooSmall: return "ERR_BUFFER_TOO_SMALL"
+        case .enclaveUnavailable: return "ERR_PROVIDER_UNAVAILABLE"
+        case .encryptionFailed: return "ERR_CRYPTO_ERROR"
+        case .unexpectedOutputLength: return "ERR_INTERNAL_ERROR"
+        case .invalidServiceIdentifier: return "ERR_INVALID_SERVICE_NAME"
+        case .payloadMalformed: return "ERR_PAYLOAD_MALFORMED"
+        case .decryptionFailed: return "ERR_PAYLOAD_AUTH_FAILED"
+        case .unsupportedCiphersuite: return "ERR_PAYLOAD_UNSUPPORTED"
+        case .fingerprintMismatch: return "ERR_KEK_FINGERPRINT_MISMATCH"
+        case .kekNotFound: return "ERR_KEK_NOT_FOUND"
+        case .keychainAccessDenied: return "ERR_KEK_ACCESS_DENIED"
+        case .kekCorrupted: return "ERR_KEK_INVALID"
+        case .processHardeningFailed: return "ERR_PROCESS_HARDENING_FAILED"
+        case .fileNotFound: return "ERR_FILE_NOT_FOUND"
+        case .fileAccessDenied: return "ERR_FILE_ACCESS_DENIED"
+        case .fileIO: return "ERR_FILE_IO"
+        case .fileTooShort: return "ERR_FILE_TOO_SHORT"
+        case .fileTooLong: return "ERR_FILE_TOO_LONG"
+        case .fileUnprotectedKey: return "ERR_FILE_PLAINTEXT_KEY"
+        case .fileMalformed: return "ERR_FILE_MALFORMED"
+        case .fileInsecure: return "ERR_FILE_UNTRUSTED"
+        case .accessControlCreationFailed: return "ERR_MAC_ACCESS_CONTROL_CREATION_FAILED"
+        case .keyGenerationFailed: return "ERR_MAC_KEY_GENERATION_FAILED"
+        case .keychainWriteFailed: return "ERR_MAC_KEYCHAIN_WRITE_FAILED"
+        case .kekVerificationFailed: return "ERR_MAC_KEK_VERIFICATION_FAILED"
+        case .keychainReadFailed: return "ERR_MAC_KEYCHAIN_READ_FAILED"
+        }
+    }
+
+    /// The name an audit record shows: Linux's (no `ERR_` prefix), e.g.
+    /// `PAYLOAD_AUTH_FAILED`.
+    var auditName: String {
+        sharedName.hasPrefix("ERR_") ? String(sharedName.dropFirst(4)) : sharedName
+    }
 }
 
 // MARK: - Zeroing secrets
@@ -597,6 +641,7 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
         // Verify store/reload/reconstruct succeeds.
         switch loadKEKDataRepresentation(service: service, mode: mode) {
         case .found(let stored) where reconstructKEK(stored) != nil:
+            auditKekCreated(service: service, mode: mode)
             return HKDFGuardStatus.success.rawValue
         case .accessDenied:
             return HKDFGuardStatus.keychainAccessDenied.rawValue
@@ -752,6 +797,254 @@ private func wrapDekCore(
     outLen.pointee = Int32(payload.count)
 
     return HKDFGuardStatus.success.rawValue
+}
+
+// MARK: - Audit trail
+
+// One system-log record per security-relevant event, written whatever the
+// host does about logging -- the macOS counterpart of the Linux build's
+// syslog records (src/audit.rs) and the Windows build's Event Log events:
+// the same event IDs, meanings, fields and sentences, so one set of alerts
+// reads all three.
+//
+// - Where. The unified log, subsystem `com.hkdfguard`, category `audit`:
+//   `log show --predicate 'subsystem == "com.hkdfguard" AND category ==
+//   "audit"'`, or Console. Every field is logged public (service names,
+//   paths, fingerprints and payload hashes are not secrets), so nothing is
+//   redacted as `<private>`.
+// - Severity. The unified log has no "warning" level: info events are
+//   `default` (notice), the level the log keeps on disk by default; warnings
+//   are `error`; errors are `fault`.
+// - What. `key=value` fields, then a sentence: the event, the C function,
+//   the normalized service name, the result, and who called -- `uid`,
+//   `euid`, `pid` and `exe`. Wrap and unwrap records also carry the KEK's
+//   fingerprint and a SHA-256 of the wrapped payload, both public; the same
+//   payload has the same hash in its wrap record and in every unwrap record.
+// - Never. DEKs, KEKs, shared secrets, derived keys or plaintext. Caller
+//   mistakes (INVALID_ARGUMENT, BUFFER_TOO_SMALL, INVALID_SERVICE_NAME) and
+//   KEK_NOT_FOUND aren't audited either, as on Linux and Windows.
+// - Differences from Linux. 1001 (KEK created off the policy's first choice)
+//   and 2004 (POLICY_INVALID) never occur: there is one provider, the Secure
+//   Enclave, and no policy file. For the same reason the unwrap-success
+//   record (1003) is always written -- Linux's `[audit] unwrap_success`
+//   switch has nowhere to live here. The macOS-only refinements of
+//   PROVIDER_ERROR (-96..-100) are audited as 2005, like PROVIDER_ERROR.
+//
+// Any process can write to the unified log, so these records are an audit
+// aid, not tamper-proof evidence -- as with syslog and the Event Log.
+
+/// The C function an audit event belongs to.
+enum AuditOp: String {
+    case createKek = "hkdfguard_create_kek"
+    case kekExists = "hkdfguard_kek_exists"
+    case kekFingerprint = "hkdfguard_kek_fingerprint"
+    case wrap = "hkdfguard_wrap_dek"
+    case generateAndWrap = "hkdfguard_generate_and_wrap_dek"
+    case unwrap = "hkdfguard_unwrap_dek"
+    case openFile = "hkdfguard_open_file"
+}
+
+/// Event IDs: the Windows build's, number for number, as on Linux.
+enum AuditEvent: Int {
+    case kekCreated = 1000
+    case kekCreatedFallback = 1001 // never on macOS: one provider
+    case dekWrapped = 1002
+    case dekUnwrapped = 1003
+    case accessDenied = 2000
+    case kekInvalid = 2002
+    case integrityFailure = 2003
+    case policyInvalid = 2004 // never on macOS: no policy file
+    case operationFailed = 2005
+    case plaintextKeyFile = 2006
+    case setupCallsExceeded = 2007
+}
+
+enum AuditSeverity {
+    case info, warning, error
+
+    var logType: OSLogType {
+        switch self {
+        case .info: return .default
+        case .warning: return .error
+        case .error: return .fault
+        }
+    }
+}
+
+private let auditLog = Logger(subsystem: "com.hkdfguard", category: "audit")
+
+/// When non-nil, every record is also appended here, prefixed with its
+/// severity (`[info] `, `[warning] `, `[error] `) -- for the tests, which
+/// filter by their own service names or paths (they run in parallel). Nil,
+/// and so free, in normal use.
+let auditCapture = OSAllocatedUnfairLock<[String]?>(initialState: nil)
+
+/// The provider, as Linux's `provider=` field names its own.
+private let auditProvider = "SECURE_ENCLAVE"
+
+private let auditExecutable: String = {
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+    let length = proc_pidpath(getpid(), &buffer, UInt32(buffer.count))
+    guard length > 0 else { return auditQuote(Array("(unknown)".utf8)) }
+    return auditQuote(buffer[0..<Int(length)].map { UInt8(bitPattern: $0) })
+}()
+
+/// A double-quoted field value, exactly as Linux quotes one: printable ASCII
+/// other than `"` and `\` is kept; everything else -- quotes, backslashes,
+/// control characters (so no value can forge a second record) and any
+/// non-ASCII byte -- is written as \xNN.
+func auditQuote(_ bytes: [UInt8]) -> String {
+    var out = "\""
+    for byte in bytes {
+        if (0x20..<0x7F).contains(byte) && byte != 0x22 && byte != 0x5C {
+            out.unicodeScalars.append(Unicode.Scalar(byte))
+        } else {
+            out += String(format: "\\x%02x", byte)
+        }
+    }
+    return out + "\""
+}
+
+private func auditHex<Bytes: Sequence>(_ bytes: Bytes) -> String where Bytes.Element == UInt8 {
+    bytes.map { String(format: "%02x", $0) }.joined()
+}
+
+private func auditKeychainName(_ mode: KeychainMode) -> String {
+    switch mode {
+    case .legacy: return "legacy"
+    case .dataProtection: return "data-protection"
+    }
+}
+
+/// One record: the event's own fields, who called, then the sentence.
+func auditEmit(_ severity: AuditSeverity, _ event: AuditEvent, fields: String, message: String) {
+    let line = "event=\(event.rawValue) \(fields) uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) exe=\(auditExecutable) msg=\(auditQuote(Array(message.utf8)))"
+    auditLog.log(level: severity.logType, "\(line, privacy: .public)")
+    auditCapture.withLock { $0?.append("[\(severity)] " + line) }
+}
+
+/// A KEK was created (not merely found).
+func auditKekCreated(service: String, mode: KeychainMode) {
+    auditEmit(
+        .info, .kekCreated,
+        fields: "op=\(AuditOp.createKek.rawValue) service=\(auditQuote(Array(service.utf8))) provider=\(auditProvider) keychain=\(auditKeychainName(mode))",
+        message: "KEK created on \(auditProvider)"
+    )
+}
+
+/// A DEK was wrapped (`op` is wrap or generateAndWrap) or unwrapped
+/// (`unwrap`). `payload` is the 146-byte payload produced or consumed:
+/// public bytes, the first 32 of which are the KEK fingerprint.
+func auditDekOperation(_ op: AuditOp, service: String, payload: UnsafeBufferPointer<UInt8>) {
+    let unwrap = op == .unwrap
+    let fingerprint = payload.count >= hkdfguardFingerprintLength
+        ? auditHex(payload[0..<hkdfguardFingerprintLength]) : "(unavailable)"
+    auditEmit(
+        .info, unwrap ? .dekUnwrapped : .dekWrapped,
+        fields: "op=\(op.rawValue) result=OK service=\(auditQuote(Array(service.utf8))) provider=\(auditProvider) kek_fingerprint=\(fingerprint) payload_sha256=\(auditHex(SHA256.hash(data: Data(payload))))",
+        message: unwrap ? "DEK unwrapped" : "DEK wrapped"
+    )
+}
+
+/// `op` failed with `code`, for `service`. Only the failures worth an
+/// administrator's attention are written -- Linux's and Windows' list.
+func auditOperationFailed(_ op: AuditOp, service: String, code: Int32) {
+    guard let status = HKDFGuardStatus(rawValue: code) else { return }
+    let event: AuditEvent
+    let severity: AuditSeverity
+    let meaning: String
+    switch status {
+    case .keychainAccessDenied:
+        (event, severity, meaning) = (.accessDenied, .warning, "the caller is not authorized to use this KEK")
+    case .kekCorrupted:
+        (event, severity, meaning) = (.kekInvalid, .error, "a KEK exists under this service name but is corrupt or not one this library would create; it was left untouched")
+    case .decryptionFailed, .fingerprintMismatch, .payloadMalformed, .unsupportedCiphersuite:
+        guard op == .unwrap else { return }
+        switch status {
+        case .decryptionFailed: meaning = "the payload failed authentication: tampered with, or presented for the wrong service"
+        case .fingerprintMismatch: meaning = "the payload was not wrapped under this service's current KEK"
+        case .unsupportedCiphersuite: meaning = "the payload's format version is not one this build understands (corrupted, tampered with, or from a newer version)"
+        default: meaning = "the payload is not a valid wrapped DEK (truncated, corrupted, or tampered with)"
+        }
+        (event, severity) = (.integrityFailure, .warning)
+    case .enclaveUnavailable, .encryptionFailed, .unexpectedOutputLength,
+         .accessControlCreationFailed, .keyGenerationFailed, .keychainWriteFailed, .kekVerificationFailed, .keychainReadFailed:
+        (event, severity, meaning) = (.operationFailed, .error, "the key provider or a cryptographic operation failed")
+    default:
+        return // caller mistakes, "not provisioned yet", and everything else
+    }
+    auditEmit(
+        severity, event,
+        fields: "op=\(op.rawValue) result=\(status.auditName)(\(code)) service=\(auditQuote(Array(service.utf8)))",
+        message: "\(op.rawValue) failed: \(meaning)"
+    )
+}
+
+/// hkdfguard_open_file refused `path` as FILE_PLAINTEXT_KEY: it looks like
+/// an unwrapped DEK. Names the file; none of its contents are logged.
+func auditPlaintextKeyFile(path: [UInt8]) {
+    auditEmit(
+        .error, .plaintextKeyFile,
+        fields: "op=\(AuditOp.openFile.rawValue) result=\(HKDFGuardStatus.fileUnprotectedKey.auditName)(\(HKDFGuardStatus.fileUnprotectedKey.rawValue)) path=\(auditQuote(path))",
+        message: "the file looks like an unwrapped DEK (32 raw bytes, or its base64 or hex), so it may be a plaintext key written to disk by mistake; none of its contents were returned. Treat that key as exposed: find out how the file was written, remove it, and re-mint the DEK"
+    )
+}
+
+/// More than this many setup calls in one process is the signature of a
+/// caller looping on them -- Linux's threshold.
+let auditSetupCallsWarnAt = 10
+
+/// Counts setup calls (hkdfguard_create_kek / hkdfguard_kek_exists) and
+/// reports, once per counter, when they pass `auditSetupCallsWarnAt`.
+struct SetupCallCounter {
+    private(set) var calls = 0
+    private(set) var warned = false
+
+    /// Records one call; true exactly once, on the call that passes the
+    /// threshold.
+    mutating func record() -> Bool {
+        calls += 1
+        guard !warned, calls > auditSetupCallsWarnAt else { return false }
+        warned = true
+        return true
+    }
+}
+
+private let setupCalls = OSAllocatedUnfairLock(initialState: SetupCallCounter())
+
+/// Called on every setup call that names a valid service.
+func auditNoteSetupCall() {
+    if setupCalls.withLock({ $0.record() }) {
+        auditSetupCallsExceeded()
+    }
+}
+
+func auditSetupCallsExceeded() {
+    let calls = auditSetupCallsWarnAt
+    auditEmit(
+        .warning, .setupCallsExceeded,
+        fields: "calls=\(calls)",
+        message: "more than \(calls) hkdfguard_create_kek / hkdfguard_kek_exists calls in this process; these are meant to run once per application startup -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
+    )
+}
+
+/// The normalized service name a C caller passed, or nil when it isn't a
+/// valid one (then there is nothing worth auditing: INVALID_SERVICE_NAME is
+/// a caller mistake).
+private func auditService(_ servicePtr: UnsafePointer<CChar>?) -> String? {
+    servicePtr.flatMap { normalizedService(from: $0) }
+}
+
+/// Audits a finished wrap, generate-and-wrap or unwrap: the success record
+/// with the payload's fingerprint and hash, or the failure record when the
+/// failure is one worth auditing.
+private func auditDekCall(_ op: AuditOp, _ servicePtr: UnsafePointer<CChar>?, status: Int32, payload: UnsafeBufferPointer<UInt8>?) {
+    guard let service = auditService(servicePtr) else { return }
+    if status == HKDFGuardStatus.success.rawValue {
+        if let payload { auditDekOperation(op, service: service, payload: payload) }
+    } else {
+        auditOperationFailed(op, service: service, code: status)
+    }
 }
 
 // MARK: - Process hardening (opt-in)
@@ -927,8 +1220,12 @@ public func hkdfguard_kek_exists(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
+    auditNoteSetupCall()
     let (status, exists) = kekExists(service: service)
     outExists.pointee = exists ? 1 : 0
+    if status != HKDFGuardStatus.success.rawValue {
+        auditOperationFailed(.kekExists, service: service, code: status)
+    }
     return status
 }
 
@@ -956,6 +1253,7 @@ public func hkdfguard_kek_fingerprint(
 
     let (status, maybeKey) = getKEK(service: service)
     guard let key = maybeKey else {
+        auditOperationFailed(.kekFingerprint, service: service, code: status)
         return status
     }
 
@@ -980,7 +1278,12 @@ public func hkdfguard_create_kek(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    return createKEK(service: service)
+    auditNoteSetupCall()
+    let status = createKEK(service: service)
+    if status != HKDFGuardStatus.success.rawValue {
+        auditOperationFailed(.createKek, service: service, code: status)
+    }
+    return status
 }
 
 @_cdecl("hkdfguard_wrap_dek")
@@ -991,7 +1294,15 @@ public func hkdfguard_wrap_dek(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    wrapDekChecked(servicePtr: servicePtr, dekPtr: dekPtr, dekLen: dekLen, outPtr: outPtr, outLen: outLen)
+    let status = wrapDekChecked(servicePtr: servicePtr, dekPtr: dekPtr, dekLen: dekLen, outPtr: outPtr, outLen: outLen)
+    auditDekCall(.wrap, servicePtr, status: status, payload: writtenPayload(status, outPtr, outLen))
+    return status
+}
+
+/// The payload a successful wrap wrote to `out`, for its audit record.
+private func writtenPayload(_ status: Int32, _ outPtr: UnsafeMutablePointer<UInt8>?, _ outLen: UnsafeMutablePointer<Int32>?) -> UnsafeBufferPointer<UInt8>? {
+    guard status == HKDFGuardStatus.success.rawValue, let outPtr, let outLen else { return nil }
+    return UnsafeBufferPointer(start: outPtr, count: Int(outLen.pointee))
 }
 
 /// The argument checks shared by `hkdfguard_wrap_dek` and
@@ -1052,6 +1363,16 @@ public func hkdfguard_generate_and_wrap_dek(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
+    let status = generateAndWrapCore(servicePtr: servicePtr, outPtr: outPtr, outLen: outLen)
+    auditDekCall(.generateAndWrap, servicePtr, status: status, payload: writtenPayload(status, outPtr, outLen))
+    return status
+}
+
+private func generateAndWrapCore(
+    servicePtr: UnsafePointer<CChar>?,
+    outPtr: UnsafeMutablePointer<UInt8>?,
+    outLen: UnsafeMutablePointer<Int32>?
+) -> Int32 {
     // As on Linux: the DEK is generated first, then every argument is
     // checked exactly as hkdfguard_wrap_dek checks it.
     guard var dek = generateRandomDek() else {
@@ -1101,9 +1422,13 @@ public func hkdfguard_unwrap_dek(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    zeroingOutOnFailure(outPtr, outLen) {
+    let status = zeroingOutOnFailure(outPtr, outLen) {
         unwrapDekCore(servicePtr: servicePtr, wrappedPtr: wrappedPtr, wrappedLen: wrappedLen, outPtr: outPtr, outLen: outLen)
     }
+    let consumed = status == HKDFGuardStatus.success.rawValue
+        ? wrappedPtr.map { UnsafeBufferPointer(start: $0, count: Int(wrappedLen)) } : nil
+    auditDekCall(.unwrap, servicePtr, status: status, payload: consumed)
+    return status
 }
 
 private func unwrapDekCore(
@@ -1355,9 +1680,14 @@ public func hkdfguard_open_file(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    zeroingOutOnFailure(outPtr, outLen) {
+    let status = zeroingOutOnFailure(outPtr, outLen) {
         openFileCore(pathPtr: pathPtr, outPtr: outPtr, outLen: outLen)
     }
+    if status == HKDFGuardStatus.fileUnprotectedKey.rawValue, let pathPtr {
+        let length = strnlen(pathPtr, Int(PATH_MAX))
+        auditPlaintextKeyFile(path: pathPtr.withMemoryRebound(to: UInt8.self, capacity: length) { Array(UnsafeBufferPointer(start: $0, count: length)) })
+    }
+    return status
 }
 
 private func openFileCore(

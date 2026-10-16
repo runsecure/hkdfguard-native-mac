@@ -719,6 +719,41 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(result.status == -8) // invalidServiceIdentifier
     }
 
+    // MARK: - Audit trail, end to end
+
+    @Test func auditTrailRecordsCreationWrapUnwrapAndTamperingWithMatchingHashes() throws {
+        HkdfGuardAuditTests.startCapturing()
+        let service = "com.hkdfguard.tests.audit.e2e"
+        let quoted = "service=\"\(service)\""
+        Self.deleteKEK(service: service)
+        defer { Self.deleteKEK(service: service) }
+
+        #expect(Self.createKEK(service: service) == 0)
+        #expect(Self.createKEK(service: service) == 0) // found, not created
+        let created = HkdfGuardAuditTests.records(containing: quoted).filter { $0.contains("event=1000 ") }
+        #expect(created.count == 1, "exactly one creation record: \(created)")
+        #expect(created.first?.hasPrefix("[info] event=1000 op=hkdfguard_create_kek \(quoted) provider=SECURE_ENCLAVE keychain=") == true, "\(created)")
+
+        let wrapped = Self.wrap(Self.randomDEK(), service: service)
+        #expect(wrapped.status == 0)
+        let hash = SHA256.hash(data: Data(wrapped.wrapped)).map { String(format: "%02x", $0) }.joined()
+        let fingerprint = wrapped.wrapped.prefix(32).map { String(format: "%02x", $0) }.joined()
+
+        #expect(Self.unwrap(wrapped.wrapped, service: service).status == 0)
+        var tampered = wrapped.wrapped
+        tampered[tampered.count - 1] ^= 0x01
+        #expect(Self.unwrap(tampered, service: service).status == -11)
+
+        let byHash = HkdfGuardAuditTests.records(containing: "payload_sha256=\(hash)")
+        #expect(byHash.contains { $0.contains("event=1002 op=hkdfguard_wrap_dek result=OK \(quoted)") }, "\(byHash)")
+        #expect(byHash.contains { $0.contains("event=1003 op=hkdfguard_unwrap_dek result=OK \(quoted)") }, "\(byHash)")
+        #expect(byHash.allSatisfy { $0.contains("kek_fingerprint=\(fingerprint) ") }, "the payload's own fingerprint: \(byHash)")
+
+        let integrity = HkdfGuardAuditTests.records(containing: quoted).filter { $0.contains("event=2003 ") }
+        #expect(integrity.count == 1, "\(integrity)")
+        #expect(integrity.first?.hasPrefix("[warning] event=2003 op=hkdfguard_unwrap_dek result=PAYLOAD_AUTH_FAILED(-11) \(quoted)") == true, "\(integrity)")
+    }
+
     // MARK: - Size probes and argument order (as on Linux)
 
     @Test func sizeProbesWithANullOutReportTheSizeWithoutTouchingTheKeychain() {
@@ -1254,8 +1289,17 @@ struct HkdfGuardCrossPlatformABITests {
         return source[start.upperBound..<end.lowerBound]
     }
 
+    @Test(.enabled(if: linuxPresent, linuxMissing))
+    func everyStatusCaseHasItsSharedNameAndNumber() throws {
+        let linux = Self.defines(in: try Self.read(Self.linuxHeader))
+        for status in HKDFGuardStatus.allCases {
+            let name = "HKDFGUARD_" + status.sharedName
+            #expect(linux[name] == Int(status.rawValue), "\(status) is \(status.rawValue) named \(name); Linux says \(linux[name].map(String.init) ?? "no such code")")
+        }
+    }
+
     @Test(arguments: [
-        ("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift", "private enum HKDFGuardStatus: Int32 {"),
+        ("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift", "enum HKDFGuardStatus: Int32, CaseIterable {"),
         ("hkdfguard-cli/Sources/hkdfguard/main.swift", "enum HKDFGuardStatus: Int32 {"),
     ])
     func swiftStatusEnumsMatchTheHeader(file: String, marker: String) throws {
@@ -1269,5 +1313,116 @@ struct HkdfGuardCrossPlatformABITests {
         for (label, value) in cases {
             #expect(header[label] == value, "\(file): case labelled \(label) is \(value), the header says \(header[label].map(String.init) ?? "it isn't defined")")
         }
+    }
+}
+
+
+/// The audit trail's records, checked as Linux's src/audit.rs tests check
+/// its: event IDs, severities, fields, and what is never recorded. Records
+/// are captured in memory (`auditCapture`) and filtered by each test's own
+/// service names or paths, since tests run in parallel.
+@Suite
+struct HkdfGuardAuditTests {
+    static func startCapturing() {
+        auditCapture.withLock { if $0 == nil { $0 = [] } }
+    }
+
+    static func records(containing needle: String) -> [String] {
+        auditCapture.withLock { ($0 ?? []).filter { $0.contains(needle) } }
+    }
+
+    static func last(_ needle: String) -> String {
+        records(containing: needle).last ?? "(no record containing \(needle))"
+    }
+
+    init() { Self.startCapturing() }
+
+    @Test func recordsNameTheServiceAndTheCaller() {
+        auditOperationFailed(.createKek, service: "audit.test.caller", code: -19)
+        let record = Self.last("\"audit.test.caller\"")
+        #expect(record.hasPrefix("[error] event=2002 op=hkdfguard_create_kek result=KEK_INVALID(-19) service=\"audit.test.caller\" "), "\(record)")
+        #expect(record.contains(" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) exe=\"/"), "\(record)")
+        #expect(record.contains(" msg=\"hkdfguard_create_kek failed: "), "\(record)")
+    }
+
+    @Test func eachCodeGetsTheWindowsEventIdAndSeverity() {
+        let cases: [(code: Int32, event: Int, severity: String)] = [
+            (-18, 2000, "warning"),   // KEK_ACCESS_DENIED
+            (-19, 2002, "error"),     // KEK_INVALID
+            (-3, 2005, "error"),      // PROVIDER_UNAVAILABLE
+            (-5, 2005, "error"),      // CRYPTO_ERROR
+            (-6, 2005, "error"),      // INTERNAL_ERROR
+            (-96, 2005, "error"), (-97, 2005, "error"), (-98, 2005, "error"), (-99, 2005, "error"), (-100, 2005, "error"),
+        ]
+        for (code, event, severity) in cases {
+            let service = "audit.test.ids\(-code)"
+            auditOperationFailed(.kekExists, service: service, code: code)
+            let record = Self.last("\"\(service)\"")
+            #expect(record.hasPrefix("[\(severity)] event=\(event) "), "code \(code): \(record)")
+        }
+    }
+
+    @Test func callerMistakesAndNotFoundAreNotAudited() {
+        for code: Int32 in [-1, -2, -8, -17] {
+            auditOperationFailed(.wrap, service: "audit.test.quiet", code: code)
+        }
+        #expect(Self.records(containing: "audit.test.quiet").isEmpty)
+    }
+
+    @Test func payloadCodesAreAuditedOnUnwrapOnly() {
+        auditOperationFailed(.wrap, service: "audit.test.wraponly", code: -10)
+        #expect(Self.records(containing: "audit.test.wraponly").isEmpty)
+        for code: Int32 in [-11, -16, -10, -12] {
+            auditOperationFailed(.unwrap, service: "audit.test.integrity", code: code)
+        }
+        let records = Self.records(containing: "audit.test.integrity")
+        #expect(records.count == 4)
+        #expect(records.allSatisfy { $0.hasPrefix("[warning] event=2003 op=hkdfguard_unwrap_dek ") }, "\(records)")
+    }
+
+    @Test func quotingKeepsEveryValueOnOneLine() {
+        #expect(auditQuote(Array("plain/path.key".utf8)) == "\"plain/path.key\"")
+        #expect(auditQuote(Array("a\"b\\c".utf8)) == "\"a\\x22b\\x5cc\"")
+        #expect(auditQuote(Array("line\nbreak".utf8)) == "\"line\\x0abreak\"", "no forged second record")
+        #expect(auditQuote([0x63, 0x61, 0x66, 0xC3, 0xA9, 0xFF]) == "\"caf\\xc3\\xa9\\xff\"")
+    }
+
+    @Test func aPlaintextKeyFileIsAuditedByPath() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard-audit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("plain.key")
+        try Data(repeating: 0x41, count: 32).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+
+        var out = [UInt8](repeating: 0, count: 146)
+        var outLen: Int32 = 146
+        let rc = out.withUnsafeMutableBufferPointer { hkdfguard_open_file(pathPtr: file.path, outPtr: $0.baseAddress, outLen: &outLen) }
+        #expect(rc == -37)
+        let record = Self.last(file.lastPathComponent)
+        #expect(record.hasPrefix("[error] event=2006 op=hkdfguard_open_file result=FILE_PLAINTEXT_KEY(-37) path=\"\(file.path)\" "), "\(record)")
+    }
+
+    @Test func otherOpenFileFailuresAreNotAudited() {
+        var out = [UInt8](repeating: 0, count: 146)
+        var outLen: Int32 = 146
+        let missing = "/nonexistent/hkdfguard-audit-quiet/absent.key"
+        _ = out.withUnsafeMutableBufferPointer { hkdfguard_open_file(pathPtr: missing, outPtr: $0.baseAddress, outLen: &outLen) }
+        #expect(Self.records(containing: "hkdfguard-audit-quiet").isEmpty)
+    }
+
+    @Test func setupCallsWarnExactlyOnceAfterTen() {
+        var counter = SetupCallCounter()
+        let fired = (1...25).map { _ in counter.record() }
+        #expect(fired.filter { $0 }.count == 1)
+        #expect(fired.firstIndex(of: true) == 10, "on the 11th call")
+    }
+
+    @Test func theSetupCallRecordIsAWarningWith2007() {
+        let before = Self.records(containing: "event=2007 ").count
+        auditSetupCallsExceeded()
+        let records = Self.records(containing: "event=2007 ")
+        #expect(records.count == before + 1)
+        #expect(records.last?.hasPrefix("[warning] event=2007 calls=10 ") == true, "\(records)")
     }
 }
