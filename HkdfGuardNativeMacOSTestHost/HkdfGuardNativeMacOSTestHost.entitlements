@@ -11,7 +11,7 @@
 
 	 Listed FIRST (here, only): the library stores KEK items under the first
 	 group in this array. The Debug/DebugHosted builds of the bundled CLI
-	 (hkdfguard-v1-initialize.tests.entitlements) declare the same group, so
+	 (hkdfguard.tests.entitlements) declare the same group, so
 	 KEKs they provision are readable by tests hosted in this app with no
 	 interactive prompt. $(AppIdentifierPrefix) is the Team ID, substituted
 	 at signing time.

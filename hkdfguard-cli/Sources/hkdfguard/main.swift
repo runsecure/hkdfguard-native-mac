@@ -26,25 +26,23 @@
 // any other-language caller uses -- this tool takes no shortcut through
 // the library's internal Swift types (it doesn't even `import` the
 // library's own Swift module; see Package.swift). Modeled on this project's
-// Linux equivalent
-// (hkdfguard-native-linux/src/bin/hkdfguard-v1-initialize.rs),
-// with two deliberate differences: the Linux tool's `--dek <base64>`
-// argument is not offered here at all (see "DEK sources" below for why),
-// and the output file is written with POSIX 0600 permissions (see
-// writeWrappedKeyFile).
+// Linux equivalent (hkdfguard-native-linux/src/bin/hkdfguard.rs): the same
+// `provision`/`wrap` commands and flags, DEK from stdin or a file only,
+// 0600 output (see writeWrappedKeyFile), and process hardening at startup.
+// `retire`, `status`, and `wrap --fingerprint` are macOS additions.
 //
 // The KEK's `service` identity is exactly the caller-supplied
 // `--service-name`; there is no further structure to it.
 //
 // Usage:
-//   hkdfguard-v1-initialize provision --service-name|-sn <name>
+//   hkdfguard provision --service-name|-sn <name>
 //
-//   hkdfguard-v1-initialize retire --service-name|-sn <name> \
+//   hkdfguard retire --service-name|-sn <name> \
 //       ( --fingerprint|-fp <64 hex chars> | --corrupt )
 //
-//   hkdfguard-v1-initialize status --service-name|-sn <name>
+//   hkdfguard status --service-name|-sn <name>
 //
-//   hkdfguard-v1-initialize wrap \
+//   hkdfguard wrap \
 //       --key-file-path|-kf <key-file-path> \
 //       --service-name|-sn <name> \
 //       ( --dek-stdin | --dek-file <path> ) \
@@ -66,8 +64,14 @@
 //
 // For `wrap`, exactly one DEK source is required:
 //   --dek-stdin        base64 DEK read from standard input (e.g. piped from
-//                      the pipeline or a secret store; trailing newline ok).
-//   --dek-file <path>  base64 DEK read from a file.
+//                      the pipeline or a secret store). At most 64 bytes;
+//                      one trailing newline (or CRLF) is ignored, nothing
+//                      else -- the Linux tool's rule, for both sources.
+//   --dek-file <path>  base64 DEK read from a file. It must be a regular
+//                      file (not a symlink, FIFO, or device), owned by root
+//                      or by this process's user, granting no access to
+//                      group or others (mode 0400/0600) -- the Linux tool's
+//                      rule (see openDekFile).
 //
 // There is deliberately no way to pass the DEK itself as a command-line
 // argument: an argv value is visible to every other process on the host
@@ -135,6 +139,26 @@ func hkdfguard_kek_fingerprint(
 // data-protection) -- decided by the library from this executable's own
 // code-signing entitlements. Printed by both commands because a service's
 // provisioner and its consumers must agree on it; see the header.
+// Opt-in process hardening: core dumps off, debugger attachment denied. The
+// tool calls it before reading anything, as the Linux tool does.
+//
+// How strict it is about the executable's own code signature depends on
+// the build. A distribution build -- build-dist.sh compiles with
+// HKDFGUARD_STRICT_HARDENING, for the bare CLI always and for the app's
+// CLI when exported for developer-id -- is signed with the Hardened Runtime
+// and no get-task-allow, so it passes
+// HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE: a shipped CLI whose
+// signature somehow lost that protection refuses to handle a DEK. Every
+// other build (`swift build`, the tests, a local Xcode build) is advisory:
+// its development signature is only logged.
+@_silgen_name("hkdfguard_harden_process")
+func hkdfguard_harden_process() -> Int32
+
+@_silgen_name("hkdfguard_harden_process_with_flags")
+func hkdfguard_harden_process_with_flags(_ flags: UInt32) -> Int32
+
+let hardenRequireProtectedSignature: UInt32 = 0x1 // HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE
+
 @_silgen_name("hkdfguard_keychain_mode")
 func hkdfguard_keychain_mode(_ outMode: UnsafeMutablePointer<Int32>?) -> Int32
 
@@ -154,46 +178,67 @@ func keychainModeName() -> String {
 // declaration above; the raw integer values are the actual contract, this
 // enum just makes them readable here.
 enum HKDFGuardStatus: Int32 {
-    case success = 0
-    case invalidInputLength = -1
-    case outputBufferTooSmall = -2
-    case keyUnavailable = -3 // reserved; no longer returned by the library -- see -10 and lower
-    case publicKeyUnavailable = -4 // reserved; never returned by the library
-    case encryptionFailed = -5
-    case decryptionFailed = -6
-    case unexpectedOutputLength = -7
-    case invalidServiceIdentifier = -8
-    case enclaveUnavailable = -9
-    case kekNotFound = -10
-    case kekCorrupted = -11
-    case accessControlCreationFailed = -12
-    case keyGenerationFailed = -13
-    case keychainWriteFailed = -14
-    case kekVerificationFailed = -15
-    case fingerprintMismatch = -16
-    case keychainAccessDenied = -17
-    case keychainReadFailed = -18
+    // The shared HkdfGuard status table (hkdfguard-native-linux's
+    // include/hkdfguard.h is the source of record); the comment on each case
+    // is its HKDFGUARD_* name.
+    case success = 0                       // OK
+    case invalidInputLength = -1           // ERR_INVALID_ARGUMENT
+    case outputBufferTooSmall = -2         // ERR_BUFFER_TOO_SMALL
+    case enclaveUnavailable = -3           // ERR_PROVIDER_UNAVAILABLE
+    case encryptionFailed = -5             // ERR_CRYPTO_ERROR
+    case unexpectedOutputLength = -6       // ERR_INTERNAL_ERROR
+    case invalidServiceIdentifier = -8     // ERR_INVALID_SERVICE_NAME
+    case payloadMalformed = -10            // ERR_PAYLOAD_MALFORMED
+    case decryptionFailed = -11            // ERR_PAYLOAD_AUTH_FAILED
+    case unsupportedCiphersuite = -12      // ERR_PAYLOAD_UNSUPPORTED
+    case fingerprintMismatch = -16         // ERR_KEK_FINGERPRINT_MISMATCH
+    case kekNotFound = -17                 // ERR_KEK_NOT_FOUND
+    case keychainAccessDenied = -18        // ERR_KEK_ACCESS_DENIED
+    case kekCorrupted = -19                // ERR_KEK_INVALID
+    case processHardeningFailed = -20      // ERR_PROCESS_HARDENING_FAILED
+    case fileNotFound = -32                // ERR_FILE_NOT_FOUND
+    case fileAccessDenied = -33            // ERR_FILE_ACCESS_DENIED
+    case fileIO = -34                      // ERR_FILE_IO
+    case fileTooShort = -35                // ERR_FILE_TOO_SHORT
+    case fileTooLong = -36                 // ERR_FILE_TOO_LONG
+    case fileUnprotectedKey = -37          // ERR_FILE_PLAINTEXT_KEY
+    case fileMalformed = -38               // ERR_FILE_MALFORMED
+    case fileInsecure = -39                // ERR_FILE_UNTRUSTED
+    case accessControlCreationFailed = -96 // ERR_MAC_ACCESS_CONTROL_CREATION_FAILED
+    case keyGenerationFailed = -97         // ERR_MAC_KEY_GENERATION_FAILED
+    case keychainWriteFailed = -98         // ERR_MAC_KEYCHAIN_WRITE_FAILED
+    case kekVerificationFailed = -99       // ERR_MAC_KEK_VERIFICATION_FAILED
+    case keychainReadFailed = -100         // ERR_MAC_KEYCHAIN_READ_FAILED
 
     var description: String {
         switch self {
         case .success: return "success"
         case .invalidInputLength: return "invalid argument (bad service name or DEK length)"
         case .outputBufferTooSmall: return "output buffer too small"
-        case .keyUnavailable: return "the Secure Enclave key could not be obtained"
-        case .publicKeyUnavailable: return "the KEK's public key is unavailable (reserved code; not returned by this library version)"
-        case .encryptionFailed: return "a cryptographic operation failed"
-        case .decryptionFailed: return "decryption failed"
-        case .unexpectedOutputLength: return "the library produced an unexpected output length"
-        case .invalidServiceIdentifier: return "the service name is missing, empty, longer than 128 characters, or contains a character other than an ASCII letter, digit, or '.'"
         case .enclaveUnavailable: return "the Secure Enclave is not available on this machine"
+        case .encryptionFailed: return "a cryptographic operation failed"
+        case .unexpectedOutputLength: return "internal error: the library produced an unexpected output length"
+        case .invalidServiceIdentifier: return "the service name is missing, empty, longer than 128 characters, or contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains \"..\""
+        case .payloadMalformed: return "the wrapped payload is malformed"
+        case .decryptionFailed: return "decryption failed"
+        case .unsupportedCiphersuite: return "the wrapped payload uses a ciphersuite this build does not support"
+        case .fingerprintMismatch: return "the wrapped payload's embedded KEK fingerprint does not match the current key"
         case .kekNotFound: return "no key exists yet for this service -- call hkdfguard_create_kek first"
+        case .keychainAccessDenied: return "the keychain denied access (locked, no UI session, access prompt declined, or missing entitlement) -- a key for this service may already exist"
         case .kekCorrupted: return "a keychain item exists for this service but could not be reconstructed into a usable key"
+        case .processHardeningFailed: return "the process could not be hardened (core dumps or debugger attachment could not be disabled, a debugger is already attached, or a distribution build's code signature lets other processes debug it)"
+        case .fileNotFound: return "the key file does not exist"
+        case .fileAccessDenied: return "this process may not read the key file"
+        case .fileIO: return "the key file is not a regular file, or reading it failed"
+        case .fileTooShort: return "the key file is shorter than a wrapped DEK"
+        case .fileTooLong: return "the key file is longer than a wrapped DEK"
+        case .fileUnprotectedKey: return "the key file appears to hold an UNWRAPPED DEK -- treat it as exposed"
+        case .fileMalformed: return "the key file is not a well-formed wrapped DEK"
+        case .fileInsecure: return "the key file is owned by another user, writable by group or others, or hard-linked"
         case .accessControlCreationFailed: return "failed to set up access control for a new key"
         case .keyGenerationFailed: return "the Secure Enclave refused to generate a new key"
         case .keychainWriteFailed: return "failed to persist the newly generated key to the keychain"
         case .kekVerificationFailed: return "the newly created key could not be verified after being stored"
-        case .fingerprintMismatch: return "the wrapped payload's embedded KEK fingerprint does not match the current key"
-        case .keychainAccessDenied: return "the keychain denied access (locked, no UI session, access prompt declined, or missing entitlement) -- a key for this service may already exist"
         case .keychainReadFailed: return "reading the keychain failed"
         }
     }
@@ -208,7 +253,7 @@ func describeStatus(_ code: Int32) -> String {
 
 // MARK: - Argument parsing
 
-let programName = "hkdfguard-v1-initialize"
+let programName = "hkdfguard"
 let dekLen = 32
 // Generous starting capacity for the wrapped payload -- retried once at
 // the library-reported size on outputBufferTooSmall, so this only needs to
@@ -287,7 +332,7 @@ func printUsage() {
                       that deletes keys. Everything wrapped under that KEK becomes
                       permanently unrecoverable: migrate to a new service name first.
                       With --corrupt instead, deletes the item only if the library
-                      reports it as corrupt (-11) and the Secure Enclave is proven
+                      reports it as corrupt (-19) and the Secure Enclave is proven
                       usable in this session, so a healthy KEK that merely could not
                       be loaded right now is never mistaken for a corrupt one.
           status      report the keychain mode, whether a KEK exists for <name>, and
@@ -296,7 +341,8 @@ func printUsage() {
         wrap options (exactly one DEK source is required):
           --key-file-path|-kf <path>  where to write the wrapped payload
           --dek-stdin         read the base64 DEK from standard input
-          --dek-file <path>   read the base64 DEK from a file
+          --dek-file <path>   read the base64 DEK from a file (a regular file, not a
+                      symlink, owned by you or root, mode 0400 or 0600)
           --fingerprint|-fp <hex>  refuse to write unless the KEK actually used has this
                       fingerprint (64 hex characters, as printed by provision)
           --force|-f          securely overwrite an existing <path>
@@ -535,8 +581,8 @@ let maxServiceNameLength = 128
 
 // Enforces the exact same rule the library itself applies to `service` (see
 // `validServiceName` in HkdfGuardNativeMacOS.swift): 1-128 ASCII
-// alphanumeric characters or '.', matching this project's Linux/Windows
-// tools.
+// alphanumeric characters or '.', not starting with '.', and with no two
+// consecutive dots -- the Linux tool's rule and messages.
 func validateServiceCharset(_ service: String) throws {
     guard service.utf8.count <= maxServiceNameLength else {
         throw CLIError("service name \"\(service)\" must be at most \(maxServiceNameLength) characters, got \(service.utf8.count)")
@@ -549,6 +595,12 @@ func validateServiceCharset(_ service: String) throws {
     }
     guard isValid else {
         throw CLIError("service name \"\(service)\" must contain only alphanumeric characters or '.'")
+    }
+    if service.hasPrefix(".") {
+        throw CLIError("service name \"\(service)\" must not start with '.'")
+    }
+    if service.contains("..") {
+        throw CLIError("service name \"\(service)\" must not contain consecutive dots")
     }
 }
 
@@ -713,8 +765,8 @@ func secureEnclaveIsUsableNow() -> Bool {
 }
 
 // Deletes `service`'s KEK item only if the library reports it as corrupt
-// (kekCorrupted, -11) -- present but not reconstructable -- and only after
-// proving the enclave works in this session, so the -11 reflects the item
+// (kekCorrupted, -19) -- present but not reconstructable -- and only after
+// proving the enclave works in this session, so the -19 reflects the item
 // itself. A valid KEK, a missing one, or one the keychain won't let this
 // process read is never deleted here.
 func retireCorruptKEK(service: String) throws {
@@ -898,59 +950,164 @@ func callWithWrappedBuffer(
 // below) is the only copy of the plaintext DEK that ever exists --
 // converting to `[UInt8]` first would leave a second, unzeroed copy sitting
 // in memory for the rest of the process's life.
-func wrapDek(service: String, dek: Data) throws -> [UInt8] {
+func wrapDek(service: String, dek: UnsafeRawBufferPointer) throws -> [UInt8] {
     try callWithWrappedBuffer("hkdfguard_wrap_dek", service: service) { outPtr, outLen in
         service.withCString { servicePtr in
-            dek.withUnsafeBytes { dekBuf in
-                hkdfguard_wrap_dek(
-                    servicePtr,
-                    dekBuf.bindMemory(to: UInt8.self).baseAddress,
-                    Int32(dek.count),
-                    outPtr,
-                    outLen
-                )
-            }
+            hkdfguard_wrap_dek(
+                servicePtr,
+                dek.bindMemory(to: UInt8.self).baseAddress,
+                Int32(dek.count),
+                outPtr,
+                outLen
+            )
         }
     }
 }
 
 // MARK: - Reading the pipeline's DEK
 
-// Upper bound on the DEK input, in bytes. Base64 of a 32-byte DEK is 44
-// characters; this leaves generous room for surrounding whitespace while
-// refusing anything that is clearly not a DEK (a file passed by mistake, an
-// unbounded pipe) before it is ever buffered in full.
-let maxDekInputLength = 1024
+// Upper bound on the DEK input, in bytes -- the Linux tool's
+// MAX_DEK_INPUT_LEN. Base64 of a 32-byte DEK is 44 characters; this leaves
+// room for a trailing newline (or CRLF) and little more, so a wrong file or
+// an unbounded pipe fails fast instead of being buffered.
+let maxDekInputLength = 64
 
-// ASCII whitespace that may surround the base64 text (trailing newline from
-// `echo`, CRLF from a Windows-edited file, ...). Interior whitespace is not
-// stripped: the base64 decoder rejects it, as before.
-func isDekInputWhitespace(_ byte: UInt8) -> Bool {
-    byte == 0x20 || (0x09...0x0D).contains(byte)
+// Mode bits that must be clear on a --dek-file: no access at all for group
+// or others.
+let forbidGroupOtherAccess: mode_t = 0o077
+
+// Opens a --dek-file with the same hardening as the Linux tool's
+// read_dek_file: O_NOFOLLOW so a symlink fails the open outright, O_NONBLOCK
+// so a FIFO fails the regular-file check below instead of blocking the open,
+// and ownership/permission checks made against the *opened descriptor*
+// rather than the path, so nothing can be swapped between the check and the
+// read. The file must be a regular file owned by root or this process's
+// effective user, granting no access to group or others (0400/0600).
+func openDekFile(_ path: String) throws -> Int32 {
+    let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+    guard fd >= 0 else {
+        let err = errno
+        if err == ELOOP {
+            throw CLIError("--dek-file \(path) is a symlink; refusing to follow it")
+        }
+        throw CLIError("--dek-file: failed to read \(path): \(String(cString: strerror(err)))")
+    }
+    var ok = false
+    defer { if !ok { close(fd) } }
+
+    var st = stat()
+    guard fstat(fd, &st) == 0 else {
+        throw CLIError("--dek-file: failed to stat \(path): \(String(cString: strerror(errno)))")
+    }
+    guard st.st_mode & S_IFMT == S_IFREG else {
+        // A FIFO would block the read indefinitely; a directory or device
+        // makes no sense as a key source.
+        throw CLIError("--dek-file \(path) is not a regular file")
+    }
+    let euid = geteuid()
+    guard st.st_uid == 0 || st.st_uid == euid else {
+        throw CLIError("--dek-file \(path) is owned by uid \(st.st_uid), which is neither root nor this process's user")
+    }
+    let offending = st.st_mode & forbidGroupOtherAccess
+    guard offending == 0 else {
+        throw CLIError("--dek-file \(path) permissions are too broad (mode \(String(st.st_mode & 0o7777, radix: 8)); bits \(String(offending, radix: 8)) must be clear)")
+    }
+    ok = true
+    return fd
+}
+
+// The value of each standard-base64 character (RFC 4648 section 4), or nil.
+func base64Value(_ c: UInt8) -> UInt8? {
+    switch c {
+    case 0x41...0x5A: return c - 0x41      // A-Z
+    case 0x61...0x7A: return c - 0x61 + 26 // a-z
+    case 0x30...0x39: return c - 0x30 + 52 // 0-9
+    case 0x2B: return 62                   // +
+    case 0x2F: return 63                   // /
+    default: return nil
+    }
+}
+
+// How many bytes `text` decodes to as strict, padded standard base64, or nil
+// if it is not that: the length is a multiple of 4, '=' appears only as the
+// last one or two characters, and the bits padding leaves unused are zero.
+// The rules of the Linux tool's decoder (the base64 crate's STANDARD
+// engine) -- stricter than Foundation's Data(base64Encoded:), which accepts
+// padding mid-text and runs of '='.
+func strictBase64DecodedLength(_ text: UnsafeRawBufferPointer) -> Int? {
+    guard !text.isEmpty, text.count % 4 == 0 else { return nil }
+    var padding = 0
+    if text[text.count - 1] == 0x3D { padding += 1 }
+    if text[text.count - 2] == 0x3D { padding += 1 }
+    let dataEnd = text.count - padding
+    for i in 0..<dataEnd where base64Value(text[i]) == nil {
+        return nil
+    }
+    // The last data character's bits that padding leaves unused must be 0.
+    if padding > 0, let last = base64Value(text[dataEnd - 1]) {
+        let unusedBits: UInt8 = padding == 2 ? 0b1111 : 0b11
+        guard last & unusedBits == 0 else { return nil }
+    }
+    return text.count / 4 * 3 - padding
+}
+
+// Decodes text already accepted by strictBase64DecodedLength into `out`,
+// which must be exactly that many bytes. Writes only into `out`.
+func strictBase64Decode(_ text: UnsafeRawBufferPointer, into out: UnsafeMutableRawBufferPointer) {
+    var o = 0
+    var i = 0
+    while i < text.count {
+        var quad: UInt32 = 0
+        var chars = 0
+        for j in 0..<4 {
+            if let v = base64Value(text[i + j]) {
+                quad |= UInt32(v) << (18 - 6 * j)
+                chars += 1
+            }
+        }
+        for k in 0..<(chars - 1) where o < out.count {
+            out[o] = UInt8(truncatingIfNeeded: quad >> (16 - 8 * k))
+            o += 1
+        }
+        i += 4
+    }
 }
 
 // Reads the base64 DEK for `source`, decodes it, and hands the decoded bytes
 // to `body` -- the only window in which the plaintext DEK exists here.
 //
-// Every copy this function makes is zeroed before it returns, on every path:
+// Every copy of the DEK this function makes -- the base64 text it reads and
+// the bytes that decodes to -- lives in ONE allocation, as in the Linux
+// tool's DekScratch:
 //
-// - The raw input is read with read(2) into ONE buffer, allocated up front
-//   at a fixed size and never grown. A growable buffer (Data from
-//   readDataToEndOfFile, Data(contentsOf:)) reallocates as it fills and
-//   leaves the abandoned, unzeroed copies of the input in freed memory;
-//   this one has no earlier copies to abandon.
-// - The base64 text is never turned into a String. Swift Strings cannot be
-//   zeroed in place, and the previous implementation made two (decoded and
-//   trimmed) and could only drop references to them. Trimming here is an
-//   index range over the raw bytes, and decoding reads them in place.
-// - The decoded DEK is zeroed as soon as `body` returns.
-func withSuppliedDek<T>(_ source: DekSource, _ body: (Data) throws -> T) throws -> T {
-    let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: maxDekInputLength + 1, alignment: 1)
-    defer {
-        buffer.initializeMemory(as: UInt8.self, repeating: 0)
-        buffer.deallocate()
+// - Allocated up front at a fixed size and never grown. A growable buffer
+//   (Data from readDataToEndOfFile, Data(contentsOf:)) reallocates as it
+//   fills and leaves abandoned, unzeroed copies of the input in freed memory.
+// - Locked into RAM with mlock(2), so it is never written to swap. If the
+//   lock is refused, a warning is printed and the DEK is still handled
+//   (macOS encrypts swap regardless), as on Linux.
+// - Never turned into a String or Data: Swift Strings and Foundation's
+//   base64 decoder make copies this function couldn't zero. Trimming is an
+//   index range over the raw bytes, and decoding writes straight into the
+//   locked allocation.
+// - Zeroed (memset_s) on every path before it is unlocked and freed.
+func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) throws -> T) throws -> T {
+    let inputCapacity = maxDekInputLength + 1
+    let pageSize = Int(getpagesize())
+    let byteCount = (inputCapacity + dekLen + pageSize - 1) / pageSize * pageSize
+    let scratch = UnsafeMutableRawBufferPointer.allocate(byteCount: byteCount, alignment: pageSize)
+    scratch.initializeMemory(as: UInt8.self, repeating: 0)
+    let locked = mlock(scratch.baseAddress!, byteCount) == 0
+    if !locked {
+        FileHandle.standardError.write("warning: could not lock the DEK's buffer into memory (mlock: \(String(cString: strerror(errno)))); it could be written to swap\n".data(using: .utf8)!)
     }
-    buffer.initializeMemory(as: UInt8.self, repeating: 0)
+    defer {
+        _ = memset_s(scratch.baseAddress!, byteCount, 0, byteCount)
+        if locked { munlock(scratch.baseAddress!, byteCount) }
+        scratch.deallocate()
+    }
+    let input = UnsafeMutableRawBufferPointer(rebasing: scratch[0..<inputCapacity])
+    let decoded = UnsafeMutableRawBufferPointer(rebasing: scratch[inputCapacity..<(inputCapacity + dekLen)])
 
     let flag = source.flag
     let fd: Int32
@@ -960,10 +1117,7 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (Data) throws -> T) throws 
         fd = STDIN_FILENO
         what = "standard input"
     case .file(let path):
-        fd = open(path, O_RDONLY | O_CLOEXEC)
-        guard fd >= 0 else {
-            throw CLIError("\(flag): failed to read \(path): \(String(cString: strerror(errno)))")
-        }
+        fd = try openDekFile(path)
         what = path
     }
     defer {
@@ -973,8 +1127,8 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (Data) throws -> T) throws 
     // Reads until EOF, or until one byte past the limit -- enough to know
     // the input is too large without reading the rest of it.
     var total = 0
-    while total < buffer.count {
-        let n = read(fd, buffer.baseAddress! + total, buffer.count - total)
+    while total < input.count {
+        let n = read(fd, input.baseAddress! + total, input.count - total)
         if n < 0 {
             if errno == EINTR { continue }
             throw CLIError("\(flag): failed to read \(what): \(String(cString: strerror(errno)))")
@@ -983,14 +1137,20 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (Data) throws -> T) throws 
         total += n
     }
     guard total <= maxDekInputLength else {
-        throw CLIError("\(flag): \(what) is larger than \(maxDekInputLength) bytes, which cannot be a base64 DEK")
+        throw CLIError("\(flag): \(what) is longer than \(maxDekInputLength) bytes; expected base64 of a \(dekLen)-byte DEK")
     }
 
-    let bytes = UnsafeRawBufferPointer(rebasing: buffer[0..<total])
-    var start = 0
+    // Exactly one trailing newline (optionally CRLF) is tolerated, so a file
+    // written by `printf '%s\n'` or an editor still works -- nothing else,
+    // as in the Linux tool: leading or other trailing whitespace is part of
+    // the input and fails to decode.
+    let bytes = UnsafeRawBufferPointer(rebasing: input[0..<total])
+    let start = 0
     var end = total
-    while start < end && isDekInputWhitespace(bytes[start]) { start += 1 }
-    while end > start && isDekInputWhitespace(bytes[end - 1]) { end -= 1 }
+    if end > start && bytes[end - 1] == 0x0A {
+        end -= 1
+        if end > start && bytes[end - 1] == 0x0D { end -= 1 }
+    }
     guard start < end else {
         if case .stdin = source {
             throw CLIError("\(flag): no data on standard input")
@@ -998,25 +1158,15 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (Data) throws -> T) throws 
         throw CLIError("\(flag): \(what) is empty")
     }
 
-    // A no-copy view of the trimmed bytes, for the decoder to read in place.
-    // `.none`: the buffer is owned, zeroed, and freed by the defer above.
-    let base64View = Data(
-        bytesNoCopy: UnsafeMutableRawPointer(mutating: bytes.baseAddress! + start),
-        count: end - start,
-        deallocator: .none
-    )
-    guard var dek = Data(base64Encoded: base64View) else {
+    let text = UnsafeRawBufferPointer(rebasing: bytes[start..<end])
+    guard let decodedLength = strictBase64DecodedLength(text) else {
         throw CLIError("\(flag): the DEK is not valid base64")
     }
-    defer {
-        _ = dek.withUnsafeMutableBytes { raw in
-            raw.initializeMemory(as: UInt8.self, repeating: 0)
-        }
+    guard decodedLength == dekLen else {
+        throw CLIError("\(flag): the DEK must decode to exactly \(dekLen) bytes, got \(decodedLength)")
     }
-    guard dek.count == dekLen else {
-        throw CLIError("\(flag): the DEK must decode to exactly \(dekLen) bytes, got \(dek.count)")
-    }
-    return try body(dek)
+    strictBase64Decode(text, into: decoded)
+    return try body(UnsafeRawBufferPointer(decoded))
 }
 
 // MARK: - Writing the wrapped key file
@@ -1454,6 +1604,21 @@ func runOrExit(_ body: () throws -> Void) -> Never {
         FileHandle.standardError.write("error: \(error)\n".data(using: .utf8)!)
         exit(1)
     }
+}
+
+// Before anything is read: this process holds a plaintext DEK, so it must
+// not be dumpable or debuggable by other processes of the same user. Refuse
+// to run rather than handle a DEK unprotected -- the Linux tool's rule.
+#if HKDFGUARD_STRICT_HARDENING
+let hardenStatus = hkdfguard_harden_process_with_flags(hardenRequireProtectedSignature)
+let hardenHint = " -- this distribution build must be signed with the Hardened Runtime and without get-task-allow"
+#else
+let hardenStatus = hkdfguard_harden_process()
+let hardenHint = ""
+#endif
+guard hardenStatus == HKDFGuardStatus.success.rawValue else {
+    FileHandle.standardError.write("error: \(describeStatus(hardenStatus))\(hardenHint); refusing to handle key material\n".data(using: .utf8)!)
+    exit(1)
 }
 
 do {

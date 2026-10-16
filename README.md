@@ -1,15 +1,20 @@
 # hkdfguard-native-macos
 
-Core key and key-material protection for macOS, for interop across the
-HkdfGuard libraries. Sibling of `hkdfguard-native-linux` and the Windows
-native library; the three share one payload format and one CLI contract.
+Core key and key-material protection for macOS. Sibling of
+`hkdfguard-native-linux` and the Windows native library: the three share
+the C ABI, the status codes, the service-name rules, and the CLI contract,
+so one consumer and one pipeline work on every platform. They do **not**
+share payload bytes, and nothing requires them to: a KEK is bound to the
+Secure Enclave of the machine that created it and never leaves it, so a
+wrapped key file is only ever read on the machine that wrote it. The macOS
+payload is HPKE (RFC 9180), described below.
 
 `HkdfGuardNativeMacOS` wraps and unwraps 32-byte Data Encryption
 Keys (DEKs) under a per-service Key Encryption Key (KEK) that lives in the
 device's Secure Enclave, exposed as a plain C ABI so it can be called from
 Swift, Objective-C, C/C++, or any language that can load a Mach-O dylib
 (Python `ctypes`, Go `cgo`, .NET P/Invoke, Java JNA, …). A companion
-command-line tool, `hkdfguard-v1-initialize`, provisions KEKs and wraps DEKs
+command-line tool, `hkdfguard`, provisions KEKs and wraps DEKs
 for pipelines.
 
 ## What it does
@@ -22,54 +27,126 @@ enclave's opaque, device-bound reference to that key.
 
 Provisioning is explicit. `hkdfguard_create_kek` is the only function that
 creates a KEK; every wrap/unwrap function requires one to already exist and
-fails with `kekNotFound` (-10) otherwise. Nothing is ever created "on first
+fails with `kekNotFound` (-17) otherwise. Nothing is ever created "on first
 use".
 
-To wrap a DEK:
+Wrapping is **HPKE** (RFC 9180, base mode) with the ciphersuite
+DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM, as implemented by
+CryptoKit:
 
-1. Generate a fresh ephemeral P-256 key pair (discarded after the call).
-2. ECDH between the ephemeral private key and the service's KEK public key.
-3. Derive an AES-256 key via HKDF-SHA512, salted with the ephemeral public
-   key and bound to the scheme label, both public keys, and the service.
-4. AES-256-GCM-encrypt the DEK under a random nonce, with the service name
-   and the KEK fingerprint as additional authenticated data.
+1. HPKE generates a fresh ephemeral P-256 key pair and encapsulates a shared
+   secret to the service's KEK public key (discarding the ephemeral private
+   key after the call).
+2. The HPKE key schedule derives the AEAD key and nonce from that secret and
+   an `info` string of the scheme label and the service name
+   (`com.hkdfguard.hpke.v1` ‖ `0x00` ‖ service).
+3. AES-256-GCM seals the DEK, with the payload header — KEK fingerprint ‖
+   suite id — as additional authenticated data.
 
-Unwrapping reverses this, with the enclave performing its side of the ECDH.
-Because each wrap uses a fresh ephemeral key *and* a fresh nonce, the
-derived key is single-use — two wraps of the same DEK never produce the
-same bytes — and a payload wrapped under one service can never be opened
-under another.
+Unwrapping reverses this, with the Secure Enclave performing its side of the
+key agreement. Each wrap uses a fresh ephemeral key, so the derived key is
+single-use — two wraps of the same DEK never produce the same bytes — and a
+payload wrapped for one service can never be opened under another. The
+library holds no KDF or nonce handling of its own; the construction is the
+RFC's as implemented by CryptoKit. (RFC 9180's Appendix A publishes vectors
+for DHKEM(P-256) with AES-128-GCM and for AES-256-GCM with P-521, but not
+for this exact P-256 + AES-256-GCM suite; the suite's security rests on the
+RFC's analysis and Apple's implementation, not on a vector check here.)
 
 ## Wrapped payload format
 
-Always exactly **156 bytes**:
+Always exactly **146 bytes**:
 
 ```
-[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key ]
-[ 64-byte ephemeral P-256 public key, raw x || y             ]
-[ 12-byte AES-GCM nonce || 32-byte ciphertext || 16-byte tag ]
+[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key          ]
+[  1-byte ciphersuite id — 0x01                                       ]
+[ 65-byte HPKE encapsulated key — X9.63 P-256 point, 0x04 || x || y   ]
+[ 32-byte AES-256-GCM ciphertext || 16-byte tag                       ]
 ```
 
 The fingerprint identifies *which* KEK a payload was wrapped under. On
-unwrap it is compared to the current KEK's public key **before** any ECDH
-or decryption is attempted, so "wrong or rotated KEK" is reported as
-`fingerprintMismatch` (-16) rather than as a generic decryption failure.
-It is also folded into the AES-GCM authenticated data, so tampering with it
-fails the tag check as well.
+unwrap it is compared to the current KEK's public key **before** any key
+agreement or decryption is attempted, so "wrong or rotated KEK" is reported
+as `fingerprintMismatch` (-16) rather than as a generic decryption failure.
+It is also in the AEAD's additional authenticated data (the whole header,
+fingerprint ‖ suite id, is), so tampering with it — or with the suite
+byte — fails the tag check as well. Pipelines and consumers pin a KEK by comparing
+these 32 bytes with the fingerprint recorded at provisioning.
+
+The **suite id** names the HPKE ciphersuite the rest of the payload was
+sealed with. This build implements exactly one, `0x01`; any other value is
+`unsupportedCiphersuite` (-12), reported before the keychain is consulted.
+The byte exists so a future suite — a post-quantum hybrid KEM, once the
+Secure Enclave can hold its key — is a parse-time dispatch, not a new file
+format: the key schedule, AEAD, `info`, AAD, and parser stay as they are
+and only the KEM changes.
+
+### Sender authentication — the trust boundary
+
+Base-mode HPKE, like any public-key encryption, authenticates nothing about
+*who* wrapped a payload: anyone holding a KEK's public key can produce one
+that unwraps. **This is a deliberate decision, not a gap.** The deployment
+model is that the pipeline hands the plaintext DEK to the CLI *on the
+machine*, which wraps it as the same user who will later unwrap it. In that
+model a sender key would live on the same machine as the same user, so
+HPKE's Auth mode (sender-authenticated encryption, which CryptoKit supports
+with the Secure Enclave recipient key) would add a check the file's owner
+could always pass themselves. It is therefore not used.
+
+What this design defends against, and what it leaves to the account:
+
+- A key file can be **read** by anyone, safely: it is ciphertext under a
+  key that never leaves this Mac's Secure Enclave.
+- A key file can be **swapped or forged** only by someone who can write it
+  as its owner (or root). `hkdfguard_open_file` refuses files owned by
+  anyone else, writable by anyone else, or hard-linked (`-39`); the AEAD
+  rejects any alteration of a genuine file; `wrap --fingerprint` and the
+  fingerprint check at unwrap reject a payload for the wrong KEK.
+- Whoever **is** the owning user — or has code running as them — can wrap a
+  DEK of their choosing, or put back an older genuine file. That is the
+  user account's boundary, the same one the login keychain already draws,
+  and it is where the protection stops.
+
+Were the deployment model ever to change so the pipeline wrapped off the
+machine with a key of its own, Auth mode plus a pinned sender key is the
+mechanism, and the suite byte leaves room for it; nothing in the current
+format precludes it.
 
 There is no in-band format version. **A change of payload format is
 signalled by adopting a new service name** (and therefore a new KEK).
 
+### Payload formats are per-platform
+
+The macOS, Linux, and Windows libraries share one C ABI: the function names
+and signatures, the status codes, the `HKDFGUARD_*` flags, and what every
+call does. The wrapped payload is not shared. Each platform has its own
+format and size: here, the 146-byte HPKE layout above; on Linux, ECDH
+against a per-payload hashed point, HKDF-SHA512, and AES-256-GCM, with a
+version byte, 132–276 bytes. That's why `HKDFGUARD_WRAPPED_MAX_LEN` has the
+same name everywhere but a per-platform value (146 here). A payload is only
+opened on the Mac whose Secure Enclave KEK wrapped it, so the formats never
+need to interoperate:
+
+- Treat a payload as opaque bytes. Size buffers with
+  `HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
+- Moving a service to another platform means re-wrapping its DEKs there,
+  under that host's KEK. A payload never moves between platforms.
+- The platforms also differ in **who can create a payload**. Here, as
+  described above, anyone holding the KEK's public key can, and the
+  boundary is the key file's ownership. Linux deliberately uses a scheme
+  where only the KEK holder can (see its README).
+
 ## Service names
 
-1–128 bytes, each an ASCII letter, digit, or `.` — typically reverse-DNS.
+1–128 bytes, each an ASCII letter, digit, or `.`, not starting with `.` and
+with no two consecutive dots (`..`) — typically reverse-DNS.
 Matched **case-insensitively**: every entry point validates the name as
 ASCII first and then lowercases it, and that lowercased form is what is
 stored, looked up, and bound into the AES-GCM AAD and HKDF info. Validation
 comes first on purpose: Unicode case-folding can map non-ASCII input onto
 ASCII (KELVIN SIGN → `k`), so lowercasing first would let such names
 through. Anything else (empty, over-length, any non-ASCII byte, `-`, `_`,
-…) is `invalidServiceIdentifier` (-8). The rule is enforced on bytes,
+a leading `.`, `..`, …) is `invalidServiceIdentifier` (-8). The rule is enforced on bytes,
 identically in the library, the CLI, and the Linux and Windows tools.
 
 ## C ABI
@@ -77,50 +154,238 @@ identically in the library, the CLI, and the Linux and Windows tools.
 Declared in
 [`hkdfguard.h`](HkdfGuardNativeMacOS/hkdfguard.h)
 (plain C; `extern "C"`-guarded; nullability-annotated). All pointers are
-required — a NULL is reported, never dereferenced.
+required — a NULL is reported, never dereferenced — except `out` in a size
+probe (`out = NULL`, `*out_len = 0`), as on Linux. `hkdfguard_keychain_mode`
+and `hkdfguard_kek_fingerprint` are macOS-only; everything else is the C ABI
+shared with Linux and Windows.
 
 ```c
-int32_t hkdfguard_keychain_mode(int32_t* out_mode);          // 0 legacy, 1 data-protection
+int32_t hkdfguard_keychain_mode(int32_t* out_mode);          // macOS-only: 0 legacy, 1 data-protection
 int32_t hkdfguard_kek_exists(const char* service, int32_t* out_exists);
-int32_t hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int32_t* out_len); // 32 bytes, public
+int32_t hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int32_t* out_len); // macOS-only: 32 bytes, public
 int32_t hkdfguard_create_kek(const char* service);            // the only function that creates a KEK
 int32_t hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int32_t dek_len,
                            uint8_t* out, int32_t* out_len);
 int32_t hkdfguard_unwrap_dek(const char* service, const uint8_t* wrapped, int32_t wrapped_len,
                              uint8_t* out, int32_t* out_len);
 int32_t hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int32_t* out_len);
+int32_t hkdfguard_open_file(const char* path, uint8_t* out, int32_t* out_len); // reads a 146-byte payload file
+int hkdfguard_harden_process(void);                           // opt-in; see below
+int hkdfguard_harden_process_with_flags(unsigned int flags);
 ```
 
 `*out_len` is the buffer capacity on entry and, on return, either the bytes
-written or — on `outputBufferTooSmall` — the required size (156 for wrap,
+written or — on `outputBufferTooSmall` — the required size (146 for wrap,
 32 for unwrap). Both wrap and unwrap check the capacity, and unwrap checks
-`wrapped_len == 156`, **before** touching the keychain or the enclave, so a
+`wrapped_len == 146`, **before** touching the keychain or the enclave, so a
 sizing call costs nothing and a DEK is never decrypted for a caller who
-cannot receive it.
+cannot receive it. If `hkdfguard_unwrap_dek` or `hkdfguard_open_file` fails
+for any reason, every byte of the `out` capacity declared on entry is zeroed,
+so no partial or stale key material is left behind (as on Linux).
+
+### Hardening the host process (opt-in)
+
+Keys and DEKs pass through your process's memory. `hkdfguard_harden_process`
+makes that memory harder to recover, as on Linux. It is process-wide and
+can't be undone (debuggers and crash reporters stop working for your
+process), so it is opt-in: call it once, early in startup.
+
+1. **Core dumps off:** `RLIMIT_CORE` set to 0, hard limit included.
+2. **Debugger attachment denied:** `ptrace(PT_DENY_ATTACH)`. If a debugger
+   is *already* attached -- running under Xcode's debugger, say -- it
+   returns `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED` (-20) instead, because
+   the kernel would otherwise terminate the process.
+3. **Code signature checked.** On macOS, what really stops another process
+   of the same user from reading yours (through its task port) is the
+   *host executable's* signature: the Hardened Runtime (`codesign --options
+   runtime`) without `com.apple.security.get-task-allow` (which Xcode adds
+   to Debug builds), `cs.allow-dyld-environment-variables`, or
+   `cs.disable-library-validation`. A library can check that but not change
+   it, so by default a weak signature is only **logged** (os_log, subsystem
+   `com.hkdfguard`, category `hardening`) and the call still succeeds. That
+   keeps the library usable from python, dotnet, Go, and Xcode Debug builds
+   during development.
+
+To make a weak signature a startup failure -- a release build of a signed
+app -- pass `HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE`:
+
+```swift
+#if DEBUG
+let rc = hkdfguard_harden_process()
+#else
+let rc = hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)
+#endif
+guard rc == 0 else { fatalError("could not harden the process: \(rc)") }
+```
+
+Steps 1 and 2 are applied even when strict mode fails. The flag is part of
+the shared C ABI: Linux accepts it and changes nothing (`PR_SET_DUMPABLE`
+already gives that guarantee there), so a cross-platform binding can pass
+it everywhere. Unknown flag bits return -1 before anything changes.
+
+The `hkdfguard` CLI calls `hkdfguard_harden_process()` at startup and
+refuses to run if it fails, like the Linux tool.
+
+### Audit trail
+
+The library writes one record per security-relevant event to the macOS
+unified log, whatever the host does about logging: subsystem
+`com.hkdfguard`, category `audit`. These are the Linux build's syslog records
+and the Windows build's Event Log events, with the same IDs, meanings and
+fields, so one set of alerts covers all three. To read them:
+
+```sh
+/usr/bin/log show --last 1h --info \
+    --predicate 'subsystem == "com.hkdfguard" AND category == "audit"'
+```
+
+(Use the full path: in zsh, `log` is a shell builtin that shadows the tool.)
+Console.app shows the same records live.
+
+| ID | Level | When |
+|---|---|---|
+| 1000 | default | A KEK was created (not merely found). |
+| 1002 | default | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
+| 1003 | default | A DEK was unwrapped. |
+| 2000 | error | `KEK_ACCESS_DENIED`. |
+| 2002 | fault | `KEK_INVALID`. |
+| 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
+| 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
+| 2007 | error | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. Logged once per process. |
+
+The unified log has no "warning" level, so Linux's info / warning / error
+are `default` / `error` / `fault` here. `default` is the level the log keeps
+on disk by default. Linux's 1001 (a KEK created on a fallback provider) and
+2004 (`POLICY_INVALID`) never occur on macOS: there is one provider, the
+Secure Enclave, and no policy file.
+
+Each record is `key=value` fields followed by a sentence:
+
+```text
+event=1002 op=hkdfguard_wrap_dek result=OK service="com.example.ingest" provider=SECURE_ENCLAVE
+  kek_fingerprint=d7a1... payload_sha256=7fbd... uid=501 euid=501 pid=4242 exe="/usr/local/bin/ingest" msg="DEK wrapped"
+```
+
+The fields identify the caller (`uid`, `euid`, `pid`, `exe`) and the service
+by name, and every field is logged public, so nothing appears as
+`<private>`. Wrap and unwrap records also carry the KEK's fingerprint and a
+SHA-256 of the 146-byte payload. Both are public, and the same payload hashes
+the same in its wrap record and in every unwrap record, which ties each
+unwrap back to the wrap that made it (`shasum -a 256 <file>` hashes a key
+file for comparison). The creation record (1000) also names the keychain
+mode.
+
+The records never contain DEKs, KEKs, shared secrets, derived keys or
+plaintext. Caller mistakes (`INVALID_ARGUMENT`, `BUFFER_TOO_SMALL`,
+`INVALID_SERVICE_NAME`) and `KEK_NOT_FOUND` aren't recorded. Unlike Linux,
+the unwrap-success record (1003) can't be turned off: Linux does that in its
+policy file, and this library takes no configuration. Any process can write
+to the unified log, so these records are an audit aid, not tamper-proof
+evidence.
+
+### Reading a wrapped key file: `hkdfguard_open_file`
+
+Reads the 146-byte payload that the CLI's `wrap` writes, validates it, and
+copies it to `out`, ready for `hkdfguard_unwrap_dek`. It never touches the
+keychain or the Secure Enclave and never unwraps, so the plaintext DEK does
+not pass through it:
+
+```c
+uint8_t wrapped[HKDFGUARD_WRAPPED_MAX_LEN];
+int32_t wrapped_len = sizeof wrapped;
+int32_t status = hkdfguard_open_file("/etc/example/ingest.key", wrapped, &wrapped_len);
+if (status == 0)
+    status = hkdfguard_unwrap_dek("com.example.ingest", wrapped, wrapped_len, dek, &dek_len);
+```
+
+`*out_len` is the capacity on entry (at least 146). It is set to 146 — the
+bytes read — on success, and to 146 on `outputBufferTooSmall` (checked
+before the file is opened). Every other failure leaves it as the caller set
+it, as on Linux and as wrap and unwrap do. The file's bytes
+reach `out` only on success; on any failure the whole declared capacity of
+`out` is zeroed, as on Linux.
+
+- **Safe opening.** The path must name a regular file. A symbolic link as
+  its last component is refused, not followed (`O_NOFOLLOW`); symlinks in
+  directory components resolve as usual, so `/etc/...` works. A FIFO,
+  socket, directory, or device is refused without blocking. Every check is
+  made on the opened descriptor (`fstat`), so it describes the file that is
+  actually read. At most 147 bytes are read, and a file larger than a
+  payload is rejected from its size before any read.
+- **Ownership.** The file must be owned by the process's effective user
+  **or by root**, writable by no one but its owner, and have a single hard
+  link, or it is `fileInsecure` (-39). The CLI's `wrap` output (0600, one
+  link) always passes. Root is accepted so an administrator or MDM can
+  deploy key files that a service account reads; root can already alter
+  anything on the machine, so this adds no new party who could tamper with
+  the file. A file owned by any *other* user is refused, because that user
+  could swap in a different payload or hard-link an older one into place,
+  and that would otherwise be a silent rollback rather than a loud error.
+  Group- or world-*readable* is allowed, since the payload is ciphertext. A
+  root-owned file must still be readable by the reading account: `0644`, or
+  `0640` with a group the account belongs to. Otherwise it is
+  `fileAccessDenied` (-33).
+- **Pass a trusted, absolute path.** The function opens what it is told.
+  Don't hand it paths from untrusted input (its status codes say whether a
+  file exists, is readable, and its size class — a small oracle if a
+  privileged process is pointed at arbitrary files), and don't use relative
+  paths, which resolve against a working directory the caller may not
+  control. Keep the file in a directory only its owner can write.
+- **Length.** Anything other than exactly 146 bytes is `fileTooShort`
+  (-35) or `fileTooLong` (-36).
+- **Unprotected key.** A file holding a bare 32-byte DEK instead of a
+  payload — raw bytes, or base64 (padded or not, standard or URL alphabet)
+  or hex text, with optional surrounding whitespace — is reported as
+  `fileUnprotectedKey` (-37), not merely as too short. The key was stored
+  unprotected: treat it as exposed and rotate it, rather than wrapping it
+  now. Its bytes never reach the caller's buffer, and the library zeroes
+  its own read buffer on every return.
+- **Malformed.** A 146-byte file whose KEK fingerprint is all zeros, or
+  whose encapsulated key is not a valid P-256 point, is `fileMalformed`
+  (-38); one whose suite byte is not `0x01` is `unsupportedCiphersuite`
+  (-12). These are structural checks only: whether the payload is genuine,
+  unaltered, and for this service is decided by `hkdfguard_unwrap_dek`
+  (`-16`, `-11`). Reading the file proves nothing about it — pin the KEK by
+  comparing bytes 0–31 with the recorded fingerprint before unwrapping, as
+  with any payload.
 
 ### Status codes
 
-| Value | Meaning |
-|------:|---------|
-| `0`   | success |
-| `-1`  | `invalidInputLength` — `dek_len != 32`, `wrapped_len != 156`, or a NULL buffer/length pointer |
-| `-2`  | `outputBufferTooSmall` — `*out_len` set to the required size |
-| `-3`  | `keyUnavailable` — reserved, no longer returned |
-| `-4`  | `publicKeyUnavailable` — reserved, never returned |
-| `-5`  | `encryptionFailed` |
-| `-6`  | `decryptionFailed` — AES-GCM authentication failed (altered payload, or wrapped for a different service under the same KEK) |
-| `-7`  | `unexpectedOutputLength` |
-| `-8`  | `invalidServiceIdentifier` |
-| `-9`  | `enclaveUnavailable` — no Secure Enclave on this machine |
-| `-10` | `kekNotFound` — no KEK for this service in this process's keychain mode; call `hkdfguard_create_kek` |
-| `-11` | `kekCorrupted` — an item exists but can't be reconstructed into a key; never auto-replaced |
-| `-12` | `accessControlCreationFailed` |
-| `-13` | `keyGenerationFailed` — the enclave refused to generate a key |
-| `-14` | `keychainWriteFailed` |
-| `-15` | `kekVerificationFailed` — stored, but couldn't be reloaded immediately after |
-| `-16` | `fingerprintMismatch` — payload was wrapped under a different KEK |
-| `-17` | `keychainAccessDenied` — locked keychain / no UI session / ACL denial / declined prompt / missing entitlement. **A key likely exists**; don't create or delete anything |
-| `-18` | `keychainReadFailed` |
+The numbering is the shared HkdfGuard status table, the same on every
+platform; `hkdfguard.h` defines each as an `HKDFGUARD_*` constant. The source
+of record is `hkdfguard-native-linux/include/hkdfguard.h`. Codes not listed
+here are defined there but never returned on macOS.
+
+| Value | Constant (`HKDFGUARD_…`) | Swift case | Meaning on macOS |
+|------:|---------|---------|---------|
+| `0`   | `OK` | `success` | success |
+| `-1`  | `ERR_INVALID_ARGUMENT` | `invalidInputLength` | `dek_len != 32`, a NULL buffer/length pointer, or a NULL or empty `path` |
+| `-2`  | `ERR_BUFFER_TOO_SMALL` | `outputBufferTooSmall` | `*out_len` set to the required size |
+| `-3`  | `ERR_PROVIDER_UNAVAILABLE` | `enclaveUnavailable` | no Secure Enclave on this machine |
+| `-5`  | `ERR_CRYPTO_ERROR` | `encryptionFailed` | the RNG or HPKE sealing failed |
+| `-6`  | `ERR_INTERNAL_ERROR` | `unexpectedOutputLength` | the library produced output of an impossible length (a bug) |
+| `-8`  | `ERR_INVALID_SERVICE_NAME` | `invalidServiceIdentifier` | see `service` above |
+| `-10` | `ERR_PAYLOAD_MALFORMED` | `payloadMalformed` | `wrapped_len != 146` |
+| `-11` | `ERR_PAYLOAD_AUTH_FAILED` | `decryptionFailed` | the HPKE open failed: altered payload or encapsulated key, or wrapped for a different service under the same KEK |
+| `-12` | `ERR_PAYLOAD_UNSUPPORTED` | `unsupportedCiphersuite` | the payload's suite byte is not one this build implements; a newer or different build wrote it. Not tampering |
+| `-16` | `ERR_KEK_FINGERPRINT_MISMATCH` | `fingerprintMismatch` | payload was wrapped under a different KEK |
+| `-17` | `ERR_KEK_NOT_FOUND` | `kekNotFound` | no KEK for this service in this process's keychain mode; call `hkdfguard_create_kek` |
+| `-18` | `ERR_KEK_ACCESS_DENIED` | `keychainAccessDenied` | locked keychain / no UI session / ACL denial / declined prompt / missing entitlement. **A key likely exists**; don't create or delete anything |
+| `-19` | `ERR_KEK_INVALID` | `kekCorrupted` | an item exists but can't be reconstructed into a key; never auto-replaced |
+| `-32` | `ERR_FILE_NOT_FOUND` | `fileNotFound` | no file at the path, or a path component is not a directory (`hkdfguard_open_file` only, as are `-33` to `-39`) |
+| `-33` | `ERR_FILE_ACCESS_DENIED` | `fileAccessDenied` | this process may not read the file or a directory on its path |
+| `-34` | `ERR_FILE_IO` | `fileIO` | a symbolic link (refused, never followed), directory, FIFO, socket, or device; or `open`/`fstat`/`read` failed |
+| `-35` | `ERR_FILE_TOO_SHORT` | `fileTooShort` | fewer than 146 bytes, and not a plaintext DEK |
+| `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 146 bytes |
+| `-37` | `ERR_FILE_PLAINTEXT_KEY` | `fileUnprotectedKey` | the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
+| `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 146 bytes, but the fingerprint is all zeros or the encapsulated key is not a P-256 point |
+| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | owned by someone other than this user or root, writable by group or others, or more than one hard link |
+| `-96` | `ERR_MAC_ACCESS_CONTROL_CREATION_FAILED` | `accessControlCreationFailed` | refines `ERR_PROVIDER_ERROR` (-4) |
+| `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
+| `-98` | `ERR_MAC_KEYCHAIN_WRITE_FAILED` | `keychainWriteFailed` | refines -4 |
+| `-99` | `ERR_MAC_KEK_VERIFICATION_FAILED` | `kekVerificationFailed` | stored, but couldn't be reloaded immediately after; refines -4 |
+| `-100` | `ERR_MAC_KEYCHAIN_READ_FAILED` | `keychainReadFailed` | refines -4 |
 
 ## Keychain modes (hybrid)
 
@@ -131,7 +396,7 @@ configuration:
 | Mode | When | Where the item lives | Cross-process access |
 |---|---|---|---|
 | **data-protection** (1) | the process has a `keychain-access-groups` entitlement — on macOS that means a Team-signed **app bundle with an embedded provisioning profile** | the data-protection keychain, under the first listed access group | decided by securityd from the caller's signed identity: no prompts, no ACLs; any Team-signed bundle listing the same group shares it |
-| **legacy** (0) | no such entitlement — a bare executable (the CLI as a plain Mach-O, a .NET/Python/Go host that `dlopen`s the dylib, the `xctest` agent) | the login keychain | login-keychain lock plus a per-item ACL keyed to the creating binary; other identities get an interactive prompt, or, headless, `-17` |
+| **legacy** (0) | no such entitlement — a bare executable (the CLI as a plain Mach-O, a .NET/Python/Go host that `dlopen`s the dylib, the `xctest` agent) | the login keychain | login-keychain lock plus a per-item ACL keyed to the creating binary; other identities get an interactive prompt, or, headless, `-18` |
 
 The two keychains are disjoint: **the process that provisions a service's
 KEK and every process that unwraps under it must run in the same mode**, or
@@ -167,7 +432,7 @@ using the key never triggers a Touch ID/password prompt. Consequences:
   KEK provisioned by one account is invisible to every other account —
   administrator or not. `provision`, `wrap`, and the application that
   unwraps must all run as the same user, in the same keychain mode. A
-  different user gets `kekNotFound` (`-10`), and running `provision` there
+  different user gets `kekNotFound` (`-17`), and running `provision` there
   would silently create a second, unrelated KEK under the same name. `sudo`
   does not bridge users; it runs in a different keychain context. No
   administrator rights are needed for any of these operations.
@@ -193,7 +458,7 @@ A legacy-mode KEK item can come back if a backup of the login keychain
 taken before retirement is restored onto the same Mac; account for backups
 if the goal is a true crypto-shred.
 
-## Command-line tool: `hkdfguard-v1-initialize`
+## Command-line tool: `hkdfguard`
 
 Provisions, wraps, and retires KEKs for pipelines. Provisioning and
 wrapping go through the C ABI above only; `retire` additionally deletes the
@@ -201,16 +466,16 @@ keychain item itself, since the library deliberately exports no delete.
 Four commands:
 
 ```
-hkdfguard-v1-initialize provision --service-name|-sn <name>
+hkdfguard provision --service-name|-sn <name>
 
-hkdfguard-v1-initialize status --service-name|-sn <name>
+hkdfguard status --service-name|-sn <name>
 
-hkdfguard-v1-initialize wrap --key-file-path|-kf <path> \
+hkdfguard wrap --key-file-path|-kf <path> \
                              --service-name|-sn <name> \
                              ( --dek-stdin | --dek-file <path> ) \
                              [--fingerprint|-fp <64 hex chars>] [--force|-f]
 
-hkdfguard-v1-initialize retire --service-name|-sn <name> \
+hkdfguard retire --service-name|-sn <name> \
                                ( --fingerprint|-fp <64 hex chars> | --corrupt )
 ```
 
@@ -225,10 +490,10 @@ hkdfguard-v1-initialize retire --service-name|-sn <name> \
   never creates or deletes anything, so it is the safe way to check a
   service's KEK against its recorded fingerprint, or which keychain mode a
   build of the CLI runs in. Exits `0` when the keychain gave a definite
-  answer and `1` when it could not (`-17`, `-18`, no enclave).
+  answer and `1` when it could not (`-18`, `-100`, no enclave).
 - **`retire`** deletes the KEK for `<name>`, but only if its current
   fingerprint equals `<hex>` exactly; a mismatch, a KEK that can't be read
-  (`-17`, `-11`, `-18`), or no KEK at all deletes nothing. The only command
+  (`-18`, `-19`, `-100`), or no KEK at all deletes nothing. The only command
   that deletes keys, and the only supported way to remove a
   data-protection-mode KEK, which Keychain Access and `security` cannot see.
   It must run in the same keychain mode as the KEK (the bundled CLI for
@@ -248,31 +513,42 @@ hkdfguard-v1-initialize retire --service-name|-sn <name> \
   no fingerprint check of its own, so run `status` first. See "If a KEK is
   compromised" above for when to retire at all.
 - **`retire --corrupt`** removes an item the library reports as
-  `kekCorrupted` (`-11`) — present but not reconstructable into a key, so
+  `kekCorrupted` (`-19`) — present but not reconstructable into a key, so
   it has no fingerprint to confirm. It deletes only when the status is
-  exactly `-11`, and only after proving the Secure Enclave works in this
+  exactly `-19`, and only after proving the Secure Enclave works in this
   session: it creates a throwaway, never-stored enclave key under the same
   access policy, reconstructs it from its data representation as the
   library does, and uses it once. Otherwise a healthy KEK that merely
   failed to load (locked session, SSH without a GUI login) could look
   corrupt and be deleted. A valid KEK, a missing one, or one the keychain
-  won't let it read (`-17`, `-18`) is never deleted. Like `retire`, it
+  won't let it read (`-18`, `-100`) is never deleted. Like `retire`, it
   acts on exactly one item, by persistent reference, after confirming that
   item's own blob is the unreconstructable one. Afterwards the service can
   be provisioned again. `--fingerprint` and `--corrupt` are mutually
   exclusive.
 - **`wrap`** wraps the pipeline's existing 32-byte DEK — base64, read from
   **stdin** (`--dek-stdin`) or a **file** (`--dek-file`), exactly one of the
-  two — under the already-provisioned KEK and writes the 156-byte payload to
+  two — under the already-provisioned KEK and writes the 146-byte payload to
   `<path>`. It never creates a KEK (an unprovisioned service is an error
   naming the `provision` command) and never generates a DEK. There is
   deliberately no `--dek <base64>` argument: an argv value is visible to
   every process via `ps` and lands in shell history. `--dek` and
   `--generate` are refused with an explanation.
-  - *Input handling.* The DEK text is read into one fixed-size buffer of at
-    most 1024 bytes (surrounding whitespace, including CRLF, is allowed;
-    anything larger is refused before it is read in full), decoded in
-    place, and zeroed on every exit path; it is never held as a string.
+  - *`--dek-file` rules (same as the Linux tool).* The file must be a
+    regular file -- a symbolic link is refused, never followed, and a FIFO
+    or device is refused without blocking -- owned by root or by the user
+    running the CLI, and grant no access to group or others (mode `0400` or
+    `0600`). Every check is made on the opened descriptor, so it describes
+    the file that is read.
+  - *Input handling (same as the Linux tool).* At most 64 bytes are
+    accepted -- base64 of a 32-byte DEK is 44 characters -- and anything
+    longer is refused before it is read in full. One trailing newline (or
+    CRLF) is ignored and nothing else: leading spaces, trailing spaces, or a
+    second newline make the input invalid base64. Decoding is strict,
+    padded standard base64. The text and the decoded DEK live in one
+    fixed-size buffer locked into memory with `mlock` (a warning is printed
+    if the lock is refused), are never held as a string, and are zeroed on
+    every exit path.
   - *Output file.* Created with POSIX `0600` permissions set at creation
     (owner read/write, nothing for anyone else), then the file and its
     directory entry are flushed to the storage device (`F_FULLFSYNC`)
@@ -315,17 +591,17 @@ keychain mode:
 
 | Build | Keychain mode | Use it to |
 |---|---|---|
-| `hkdfguard-v1-initialize` (plain executable) | legacy | provision and wrap for consumers that run in legacy mode — any `dlopen`/FFI host |
-| `hkdfguard-v1-initialize.app` (app bundle) | data-protection | provision, wrap, and retire for consumers that are Team-signed app bundles in the same `com.hkdfguard.keys` access group |
+| `hkdfguard` (plain executable) | legacy | provision and wrap for consumers that run in legacy mode — any `dlopen`/FFI host |
+| `hkdfguard.app` (app bundle) | data-protection | provision, wrap, and retire for consumers that are Team-signed app bundles in the same `com.hkdfguard.keys` access group |
 
-Run the bundled build by its executable inside the bundle; a symlink onto
-your `PATH` works:
+The installer package installs both (see
+[Installing on a machine](#installing-on-a-machine)). The legacy-mode CLI is
+on `PATH` as `/usr/local/bin/hkdfguard`; run the
+data-protection build by the executable inside its bundle:
 
 ```sh
-cp -R hkdfguard-v1-initialize.app /Applications/
-ln -s /Applications/hkdfguard-v1-initialize.app/Contents/MacOS/hkdfguard-v1-initialize \
-      /usr/local/bin/hkdfguard-v1-initialize-dp
-hkdfguard-v1-initialize-dp status -sn com.example.ingest   # prints "keychain: data-protection"
+"/Library/Application Support/HkdfGuard/v1/hkdfguard.app/Contents/MacOS/hkdfguard" \
+    status -sn com.example.ingest   # prints "keychain: data-protection"
 ```
 
 Its access group is prefixed with the signing Team ID
@@ -338,12 +614,12 @@ its own Team.
 Example pipeline use:
 
 ```sh
-hkdfguard-v1-initialize provision -sn com.example.ingest      # prints "fingerprint: <hex>" -- record it
-printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap -kf /etc/example/ingest.key -sn com.example.ingest \
+hkdfguard provision -sn com.example.ingest      # prints "fingerprint: <hex>" -- record it
+printf '%s' "$DEK_B64" | hkdfguard wrap -kf /etc/example/ingest.key -sn com.example.ingest \
     --dek-stdin -fp <recorded fingerprint>                     # refuses if the KEK is not that one
 
 # Later, after migrating everything to a new service name:
-hkdfguard-v1-initialize retire -sn com.example.ingest -fp <fingerprint printed by provision>
+hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 ```
 
 ## Project layout
@@ -351,23 +627,22 @@ hkdfguard-v1-initialize retire -sn com.example.ingest -fp <fingerprint printed b
 | Target / package | Product | Purpose |
 |---|---|---|
 | `HkdfGuardNativeMacOS` | `HkdfGuardNativeMacOS.framework` | Embed in a signed macOS app; carries the public header and an app-sandbox entitlement |
-| `HkdfGuardNativeMacOSDylib` | `libhkdfguard_v1.dylib` | Flat shared library for `dlopen`-based FFI from arbitrary, often unsandboxed, host processes |
+| `HkdfGuardNativeMacOSDylib` | `libhkdfguard.dylib` | Flat shared library for `dlopen`-based FFI from arbitrary, often unsandboxed, host processes |
 | `HkdfGuardNativeMacOSTests` | `.xctest` | Swift Testing suites for the C entry points and for the CLI as a real subprocess |
-| `hkdfguard-v1-initialize/` | `hkdfguard-v1-initialize` | SwiftPM package for the CLI; links the dylib through its C ABI only. Bare Mach-O → legacy keychain mode |
-| `hkdfguard-v1-initialize-app` | `hkdfguard-v1-initialize.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
+| `hkdfguard-cli/` | `hkdfguard` | SwiftPM package for the CLI; links the dylib through its C ABI only. Bare Mach-O → legacy keychain mode |
+| `hkdfguard-app` | `hkdfguard.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
 | `HkdfGuardNativeMacOSTestHost` | `HkdfGuardNativeMacOSTestHost.app` | Minimal entitled host app for the test bundle, so the suite can run in data-protection mode (see Tests) |
 
 All library targets build from the single `HkdfGuardNativeMacOS.swift`.
 Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). The
-dylib and both CLI builds target **macOS 13.0+**; the test bundle and test
-host target 14.0; the framework target uses the SDK's recommended
-deployment target.
+dylib, both CLI builds, the test bundle, and the test host target
+**macOS 14.0+** (HPKE in CryptoKit needs 14); the framework target uses the
+SDK's recommended deployment target.
 
-Supporting scripts: `build-dist.sh` (release artifacts, below),
-`install-user.sh` / `install-system.sh` (put a build at a fixed path on a
-Mac for other applications to load; see
-[Installing on a machine](#installing-on-a-machine)), and
-`setup-hosted-test-kek.sh` (a one-time, per-developer provisioning of a
+Supporting scripts: `build-dist.sh` (signed, notarized build artifacts,
+below), `build-pkg.sh` with `pkg/` (the installer package — the only way the
+library is installed; see [Installing on a machine](#installing-on-a-machine)),
+and `setup-hosted-test-kek.sh` (a one-time, per-developer provisioning of a
 data-protection KEK in the test-only access group, under
 `com.hkdfguard.fixture.hostedtests`; see Tests).
 
@@ -383,7 +658,7 @@ xcodebuild -project HkdfGuardNativeMacOS.xcodeproj \
   -target HkdfGuardNativeMacOSDylib -configuration Release build
 
 # CLI (links against build/Release by default; override with HKDFGUARD_DYLIB_DIR):
-swift build -c release --package-path hkdfguard-v1-initialize
+swift build -c release --package-path hkdfguard
 
 # Tests (real Secure Enclave required — see Tests):
 xcodebuild test -scheme HkdfGuardNativeMacOSTests
@@ -391,8 +666,10 @@ xcodebuild test -scheme HkdfGuardNativeMacOSTests
 
 ### Distribution: `build-dist.sh`
 
-Builds everything a downstream consumer needs into `dist/osx-arm64/`
-(dylib, header, CLI, `SHA256SUMS`), named for the .NET runtime identifier.
+Builds the signed artifacts the installer package is made from (see
+[`build-pkg.sh`](#the-installer-package-build-pkgsh)) into `dist/osx-arm64/`
+(dylib, header, CLI, `SHA256SUMS`) and `dist/osx-arm64-app/` (the
+data-protection CLI app).
 **arm64 (Apple silicon) is the only supported architecture**: there is no
 Intel build, and the script refuses to run on an Intel Mac. It builds the
 dylib and the CLI, rewrites the CLI's rpath to `@executable_path` so it finds the
@@ -445,7 +722,7 @@ disables `DYLD_*` environment overrides (which can otherwise redirect which
 dylib a process loads) and enforces library validation, so the CLI only
 loads dylibs signed by the same Team or by Apple.
 
-It also builds the bundled CLI into `dist/osx-arm64-app/hkdfguard-v1-initialize.app`
+It also builds the bundled CLI into `dist/osx-arm64-app/hkdfguard.app`
 — an arm64 bundle with the dylib embedded. Xcode
 archives and exports it, because only an export embeds the provisioning
 profile that the `keychain-access-groups` entitlement requires. Before
@@ -504,216 +781,216 @@ HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary \
 The script checks for the Developer ID certificate before building
 anything, so a missing one fails in seconds. The Developer ID provisioning
 profile is created by `xcodebuild` during export (automatic signing,
-`-allowProvisioningUpdates`); this path has not yet been run end to end,
-since it needs the certificate above.
+`-allowProvisioningUpdates`).
 
 ## Publishing a release
 
-Distribution is a tagged GitHub Release carrying the `dist/` output as
-assets — not a package published to PyPI/npm/Maven/NuGet. That keeps a
-single, manually-signed artifact as the only thing every consumer trusts,
-which matches how this project is built (no CI; a person runs
-`build-dist.sh` and signs locally).
+The only distribution is a signed, notarized **installer package** attached
+to a tagged GitHub Release. There are no zips, no NuGet package, and no
+install scripts: a Mac gets the library by installing the package, and
+nothing else puts it in place. That keeps one manually signed artifact —
+built by a person on one Mac, with no CI — as the only thing every machine
+trusts.
 
 ```sh
-VERSION=v1.2.0
+VERSION=v0.9.0   # must equal MARKETING_VERSION in the Xcode project
 
 HKDFGUARD_RELEASE=1 \
 HKDFGUARD_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
 HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary \
 ./build-dist.sh
 
-(cd dist/osx-arm64 && zip -r "../hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip" .)
-# ditto, not zip, for the app bundle: it preserves the bundle's signature.
-ditto -c -k --keepParent dist/osx-arm64-app/hkdfguard-v1-initialize.app \
-  "dist/hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip"
+HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary ./build-pkg.sh
+PKG="hkdfguard-native-macos-v1-${VERSION#v}-osx-arm64.pkg"
 
-# Checksums of the release assets themselves, published in the release
-# notes -- outside the assets, so replacing an asset cannot also replace
-# the value it is checked against.
-(cd dist && shasum -a 256 \
-  "hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip" \
-  "hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip" > RELEASE-SHA256SUMS)
+# The checksum goes in the release notes -- outside the asset, so replacing
+# the package cannot also replace the value it is checked against.
 {
-  echo "See README for the C ABI and per-language consumption notes."
+  echo "Install with: sudo installer -pkg $PKG -target /"
   echo
-  echo "SHA-256 of each asset (verify with \`shasum -a 256 -c\`):"
+  echo "SHA-256 (verify with \`shasum -a 256 -c\`):"
   echo '```'
-  cat dist/RELEASE-SHA256SUMS
+  cat "dist/$PKG.sha256"
   echo '```'
 } > dist/release-notes.md
 
 git tag -s "$VERSION" -m "$VERSION"   # signed tag; -a if you have no signing key
 git push origin "$VERSION"
 
-gh release create "$VERSION" \
-  dist/hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip \
-  "dist/hkdfguard-v1-initialize-$VERSION-osx-arm64.app.zip" \
+gh release create "$VERSION" "dist/$PKG" \
   --title "$VERSION" \
   --notes-file dist/release-notes.md
 ```
 
-Publish only a `HKDFGUARD_RELEASE=1` build. A development-signed or
-unnotarized build runs only on your own Macs; elsewhere Gatekeeper blocks
-the dylib, the CLI, and the bundle.
+`build-pkg.sh` refuses anything but a `HKDFGUARD_RELEASE=1` build. Beyond
+the checksum, every machine checks the package's own Developer ID Installer
+signature and stapled notarization ticket when it installs. Confirm the tag
+before pushing it or running `gh release create` — a release, unlike a
+local build, is visible and hard to fully retract once someone has pulled
+it.
 
-Each zip also contains its own `SHA256SUMS` (written by `build-dist.sh`).
-That file detects corruption only: anyone able to replace a zip can replace
-the `SHA256SUMS` inside it too. Integrity comes from the checksums in the
-release notes, which live outside the assets. Consumers should check a
-downloaded zip against those first, then its contents against the inner
-`SHA256SUMS`. The app bundle is additionally covered by its own Developer ID
-signature and notarization (`spctl --assess`). Confirm the tag before pushing it or
-running `gh release create` — a release, unlike a local build, is visible
-and hard to fully retract once someone has pulled it.
+### The installer package: `build-pkg.sh`
+
+Builds `dist/hkdfguard-native-macos-v1-<version>-osx-arm64.pkg` and its
+`.sha256` from `build-dist.sh`'s output. The version is the app's
+`CFBundleShortVersionString`, i.e. `MARKETING_VERSION` in the Xcode project —
+the one place it is set.
+
+Signing a package needs a **Developer ID Installer** certificate, separate
+from the Developer ID Application certificate that signs the code: Xcode →
+Settings → Accounts → your team → Manage Certificates → **+** → Developer ID
+Installer (Account Holder role). Check with `security find-identity -v`
+(without `-p codesigning`, which hides installer identities). Notarization
+uses the same `notarytool` profile as `build-dist.sh`.
+
+Before anything reaches `dist/`, the script checks:
+
+- **its input**: the dylib, CLI, and app Developer ID signed by the
+  project's Team, arm64, matching `SHA256SUMS`; the bare dylib and CLI
+  notarized (checked against Apple's ticket service, like `build-dist.sh`);
+  the app stapled;
+- **the package**: signed with Developer ID Installer by that Team,
+  timestamped, notarized, stapled, and accepted by Gatekeeper
+  (`spctl --assess --type install`);
+- **its contents**: exactly the expected files, byte-for-byte identical to
+  `dist/`, the app's signature intact, every entry `root:wheel` and writable
+  only by its owner, the CLI `0755`, the `postinstall` script present, and
+  the arm64 restriction in the distribution.
+
+The app bundle is marked non-relocatable. Without that, Installer looks for
+another copy of the same bundle ID anywhere on disk — the one in `dist/`, a
+download folder — and "upgrades" that copy in place instead of installing
+to the target path.
+
+| Variable | Meaning |
+|---|---|
+| `HKDFGUARD_NOTARY_PROFILE` | required: the `notarytool` keychain profile |
+| `HKDFGUARD_PKG_VERSION` | optional: must equal the built app's version if given |
+| `HKDFGUARD_INSTALLER_IDENTITY` | optional: defaults to the "Developer ID Installer" identity for the project's Team |
+| `HKDFGUARD_TEAM_ID` | optional: defaults to the project's `DEVELOPMENT_TEAM` |
+| `HKDFGUARD_PKG_UNSIGNED` | `1` for a local layout test only: no signing or notarization, output named `-UNSIGNED`; Gatekeeper and MDM tools refuse it |
 
 ## Installing on a machine
 
-Applications should load the dylib from a fixed, absolute path rather than
-from their working directory or a search path, so nothing earlier on that
-path can substitute a different library. Two scripts put a build at one of
-two such paths:
-
-| Script | Installs to | Owned by | Use it for |
-|---|---|---|---|
-| `install-user.sh` | `~/.hkdfguard/v1/` | the current user | a developer's own Mac |
-| `sudo ./install-system.sh` | `/Library/Application Support/HkdfGuard/v1/` | root | shared, build, and team machines; MDM rollout |
-
-Either one installs the four files of the `osx-arm64` build directly into
-`v1/`:
+The installer package is the **only** supported way to install the library.
+It installs, all `root:wheel`, into
+`/Library/Application Support/HkdfGuard/v1/`:
 
 ```
-v1/libhkdfguard_v1.dylib
-v1/hkdfguard.h
-v1/hkdfguard-v1-initialize
-v1/SHA256SUMS
+libhkdfguard.dylib          0644   the library
+hkdfguard.h                    0644   its C header
+hkdfguard        0755   the CLI, legacy keychain mode
+hkdfguard.app           the CLI, data-protection keychain mode
+SHA256SUMS                     0644   checksums of the first three
+uninstall.sh                   0755   removes all of it
 ```
 
-Both refuse to run on an Intel Mac. They check the hardware (`sysctl
-hw.optional.arm64`), not the shell, so a script run under Rosetta still
-installs. Consumers must run on a native arm64 runtime: an x64 .NET,
+and a root-owned symlink `/usr/local/bin/hkdfguard` → the
+legacy-mode CLI. It installs only on **Apple silicon** running **macOS 14 or
+later**, only to a system volume (never a user's home folder), with no
+customization. Consumers must run on a native arm64 runtime: an x64 .NET,
 Python, or Java runtime under Rosetta cannot load the arm64 dylib.
 
-### Pushing a build
+### Installing
 
-From a local build, after `./build-dist.sh`:
-
-```sh
-./install-user.sh                 # installs dist/osx-arm64
-sudo ./install-system.sh
-```
-
-From a published release, verify the zip against the release notes first
-(see [Publishing a release](#publishing-a-release)), then point `--from` at
-the extracted folder:
+Check the package against the release notes, then install it:
 
 ```sh
-VERSION=v1.2.0
-ZIP="hkdfguard-native-macos-v1-$VERSION-osx-arm64.zip"
-gh release download "$VERSION" --pattern "$ZIP"
-shasum -a 256 "$ZIP"              # must match the value in the release notes
-mkdir hkdfguard-$VERSION && ditto -x -k "$ZIP" hkdfguard-$VERSION
-
-sudo ./install-system.sh --from hkdfguard-$VERSION
+VERSION=v0.9.0
+PKG="hkdfguard-native-macos-v1-${VERSION#v}-osx-arm64.pkg"
+gh release download "$VERSION" --pattern "$PKG"
+shasum -a 256 "$PKG"                      # must match the release notes
+pkgutil --check-signature "$PKG"          # Developer ID Installer: <Name> (<TEAMID>); notarized
+sudo installer -pkg "$PKG" -target /
+pkgutil --pkg-info com.hkdfguard.native.v1   # the receipt, with the installed version
 ```
 
-`--from` accepts either a `build-dist.sh`-style folder holding `osx-arm64/`
-or the extracted `osx-arm64` release folder itself.
+Double-clicking the package in Finder works too. For a fleet, upload the
+package to your MDM (Jamf, Intune, Kandji, …) and scope the policy to Apple
+silicon Macs; MDM tools verify the Developer ID Installer signature
+themselves. Installing a newer package over an older one upgrades `v1/` in
+place. Installer does not refuse an *older* package over a newer one — it
+replaces `v1/` as a whole, so the result is a consistent downgrade, not a
+mix — so have the MDM policy or the operator compare
+`pkgutil --pkg-info com.hkdfguard.native.v1` first.
 
-For a fleet, have your MDM (Jamf, Intune, Kandji, ...) run
-`install-system.sh --from <folder>` as root, with the release zip
-extracted into `<folder>`, and scope the policy to Apple silicon Macs.
+### The `PATH` symlink
 
-`install-system.sh` only installs binaries signed by the Team pinned in
-the script (`PINNED_TEAM_ID`, which must match `DEVELOPMENT_TEAM` in the
-Xcode project); a build signed by anyone else is refused. The pin lives in
-the script rather than in the payload, so tampering with the files being
-installed cannot change it. `--team-id <TEAMID>` overrides it, for a build
-signed by a different team such as a fork.
+The package's `postinstall` script creates
+`/usr/local/bin/hkdfguard`, rather than shipping it in the
+payload: a payload containing `/usr/local/bin` would let Installer reset the
+owner and mode of a folder that already exists (Homebrew on Intel Macs owns
+it). The script creates `/usr/local` and `/usr/local/bin` only if missing
+(`root:wheel 0755`), never changes an existing folder, never overwrites a
+real file at that path, and never fails the install. It creates the symlink
+**only when `/usr/local/bin` is a real folder owned by root and writable by
+root alone**: anyone else who could write that folder could repoint the
+symlink at their own program, which an operator would then run while
+provisioning keys. Otherwise it logs a warning to `/var/log/install.log`
+and links nothing; call the CLI by its full path in that case. The
+data-protection build is never on `PATH`; call it by its full path (see the
+CLI section above).
 
-To remove an install: `./install-user.sh --uninstall` or
-`sudo ./install-system.sh --uninstall`.
+### Uninstalling
 
-### What the scripts check
+```sh
+sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
+```
 
-Before anything at the destination changes, each script copies the files
-into a staging folder next to `v1/` and verifies **the staged copy** — so a
-file in the `--from` folder cannot be swapped between the check and the
-install:
+Removes `v1/`, the `PATH` symlink (only if it still points at this CLI), and
+the package receipt. **KEKs are not touched**: they live in each user's
+keychain, not in the install folder. Retire any that should go *before*
+uninstalling, while the CLI still exists (see `retire` above).
 
-- `SHA256SUMS` lists exactly the three payload files, and they match it.
-- The dylib and CLI are thin arm64 binaries.
-- Both signatures verify (`codesign --verify --strict`) and carry a Team
-  ID (not ad-hoc). `install-system.sh` requires that Team ID to be the
-  pinned one (or `--team-id`); `install-user.sh` requires both to share
-  one Team ID, and match `--team-id` when given.
+### Why this location
 
-Only then is the old `v1/` swapped out for the new one; a failed run leaves
-an existing install untouched. Extended attributes, including quarantine,
-are not copied, as with a `.pkg` installer: the checks above stand in for
-Gatekeeper's.
-
-Each script also refuses to install through a symlink, or under a folder
-that the wrong owner or another user could write:
-
-- `install-user.sh` refuses to run as root, takes the home folder from the
-  directory service (`dscl`) rather than `$HOME`, and requires the home
-  folder, `~/.hkdfguard`, and `v1/` to be owned by the user and not group-
-  or world-writable. Files are mode 644, the CLI and folders 755.
-- `install-system.sh` requires root, runs with a fixed `PATH`, and requires
-  `/`, `/Library`, `/Library/Application Support`, `HkdfGuard/`, and
-  everything it installs to be root-owned and writable only by root (files
-  `root:wheel` 644, the CLI and folders 755). It warns when the binaries are
-  not Developer ID signed.
-
-`/Library/Application Support` is used rather than `/usr/local/lib`
-because Homebrew on Intel Macs makes `/usr/local`'s subfolders writable by
-a user; `/usr/lib` is protected by SIP; and `/Users/Shared` or `/tmp` are
-writable by everyone.
-
-A per-user install is only as trusted as that user's account: anything
-running as the user can replace it. It is meant for development. Use the
-system install anywhere the library protects production data.
+Every folder from `/` down to `/Library/Application Support` is owned by
+root and writable only by root, so no other user can substitute a library or
+a folder above it. It is outside SIP, so a package can write it, and it is
+Apple's documented place for machine-wide support files.
+`/usr/local/lib` is avoided because Homebrew on Intel Macs makes
+`/usr/local`'s subfolders writable by a user; `/usr/lib` is protected by
+SIP; `/Users/Shared` and `/tmp` are writable by everyone.
 
 ### Loading the installed library
 
-Consumers should look in the system location first and fall back to the
-per-user one, so an administrator's install cannot be overridden by a
-per-user copy:
+There is exactly one place to load the library from:
 
-1. `/Library/Application Support/HkdfGuard/v1/libhkdfguard_v1.dylib`
-2. `<home>/.hkdfguard/v1/libhkdfguard_v1.dylib`, with `<home>` looked up
-   from the user database (`getpwuid(getuid())`), not `$HOME`
+```
+/Library/Application Support/HkdfGuard/v1/libhkdfguard.dylib
+```
 
-Load the chosen file by its absolute path. Do not take extra search folders
-from an environment variable or config file. A hardened consumer also
-re-checks what the scripts enforce before loading: resolve the path with
-`realpath` and confirm it is still one of the two above, then check that
-every folder from the install root down and the dylib itself are owned by
-root (system) or the current user (per-user) and not group- or
-world-writable.
+Load it by that absolute path. Do not search other folders, and do not take
+a path or search folder from an environment variable or config file. A
+hardened consumer also re-checks what the package guarantees before loading:
+resolve the path with `realpath` and confirm it is still exactly the path
+above, then check that every folder from `/` down and the dylib itself are
+owned by root and not group- or world-writable. It can also verify the
+dylib's code signature against the expected Team ID
+(`SecStaticCodeCreateWithPath` + `SecStaticCodeCheckValidity`): a `dotnet`,
+`python`, or `java` host has no library validation of its own.
 
 For C#, route the `DllImport` name to that path with a resolver, so the
-existing `[DllImport("hkdfguard_v1")]` declarations stay unchanged:
+existing `[DllImport("hkdfguard")]` declarations stay unchanged:
 
 ```csharp
 NativeLibrary.SetDllImportResolver(typeof(HkdfGuardInterop).Assembly, (name, assembly, searchPath) =>
-    name == "hkdfguard_v1"
-        ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath()) // system, then per-user; checks above
+    name == "hkdfguard"
+        ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath()) // the fixed path; checks above
         : IntPtr.Zero);
 ```
 
 Other languages load the same absolute path in place of the
-`./libhkdfguard_v1.dylib` used in the examples below.
+`./libhkdfguard.dylib` used in the examples below.
 
 ## Consuming this library
 
-Every consumer needs three files from a release's zip:
-`libhkdfguard_v1.dylib`, `hkdfguard.h` (for the
-exact signatures — see [C ABI](#c-abi)), and, if provisioning from that
-process, `hkdfguard-v1-initialize`. Before loading anything, check the
-zip's SHA-256 against the value in the release notes, then the files inside
-against the zip's own `SHA256SUMS` (see "Publishing a release").
+Every consumer uses the files the installer package puts in
+`/Library/Application Support/HkdfGuard/v1/`: `libhkdfguard.dylib`,
+loaded by that absolute path (see
+[Loading the installed library](#loading-the-installed-library));
+`hkdfguard.h`, for the exact signatures (see [C ABI](#c-abi)); and, for
+provisioning, the `hkdfguard` CLI.
 
 A `dlopen`/FFI host in any of these languages runs in **legacy keychain
 mode** (see [Keychain modes](#keychain-modes-hybrid)) unless the host
@@ -723,22 +1000,40 @@ process is itself a Team-signed app bundle carrying the
 keychain, gated by the login session being unlocked, not by an access group
 shared with a signed app bundle.
 
-**Legacy mode trusts the runtime, not your code.** The login keychain's ACL
-identifies the *executable* that asks for the item. For an interpreted or
-managed consumer that executable is the interpreter or runtime (`python3`,
-`node`, `java`, `dotnet`), so the operator's "Always Allow" is granted to
-that runtime as a whole. From then on, **any** script or program run by
-that runtime, as that user, can unwrap every DEK under that service with no
-prompt. For production, package the consumer as a Team-signed app bundle
-entitled for the shared access group so it runs in data-protection mode,
-where access is granted to your signed identity alone.
+**Legacy mode is the production mode for these consumers**, and its
+boundary is the user account plus the login keychain's per-item ACL. That
+ACL identifies the *main executable* that asks for the item, so what the
+operator's one-time "Always Allow" is granted to depends on how the
+consumer is launched:
+
+- Run as `dotnet MyApp.dll`, `python3 app.py`, `java -jar …`, the
+  executable is the shared runtime. The approval then covers **every**
+  program that runtime runs as that user, with no further prompt.
+- Run as **its own executable** — a .NET apphost (`./MyApp`, the default
+  `UseAppHost=true` build, or a self-contained single-file publish), a
+  PyInstaller/Nuitka binary, a Go binary — the approval covers that program
+  alone.
+
+So ship the consumer as its own executable and **sign it with your
+Developer ID** (a .NET apphost needs the `com.apple.security.cs.allow-jit`
+entitlement if you also enable the hardened runtime). A Developer ID
+signature is identified by its Team, so rebuilds and certificate renewals
+keep the approval; an ad-hoc signature is identified by the binary's hash,
+so every rebuild re-prompts — the same rule the CLI section gives for the
+CLI. The first unwrap on a machine is interactive (the "Always Allow"
+prompt) and needs the login keychain unlocked; run headless consumers as a
+LaunchAgent in a logged-in session (see "Access policy and headless use").
+
+Data-protection mode remains available for a consumer that *is* a
+Team-signed app bundle: there, access follows the signed identity with no
+prompt at all. It is not required.
 
 **Python** (`ctypes`, standard library):
 
 ```python
 import ctypes
 
-lib = ctypes.CDLL("./libhkdfguard_v1.dylib")
+lib = ctypes.CDLL("./libhkdfguard.dylib")
 lib.hkdfguard_create_kek.argtypes = [ctypes.c_char_p]
 lib.hkdfguard_create_kek.restype = ctypes.c_int32
 
@@ -749,7 +1044,7 @@ status = lib.hkdfguard_create_kek(b"com.example.ingest")
 
 ```js
 const koffi = require("koffi");
-const lib = koffi.load("./libhkdfguard_v1.dylib");
+const lib = koffi.load("./libhkdfguard.dylib");
 const hkdfguard_create_kek = lib.func("int32_t hkdfguard_create_kek(const char *service)");
 
 const status = hkdfguard_create_kek("com.example.ingest");
@@ -759,7 +1054,7 @@ const status = hkdfguard_create_kek("com.example.ingest");
 
 ```java
 public interface HkdfGuard extends Library {
-    HkdfGuard INSTANCE = Native.load("./libhkdfguard_v1.dylib", HkdfGuard.class);
+    HkdfGuard INSTANCE = Native.load("./libhkdfguard.dylib", HkdfGuard.class);
     int hkdfguard_create_kek(String service);
 }
 
@@ -770,7 +1065,7 @@ int status = HkdfGuard.INSTANCE.hkdfguard_create_kek("com.example.ingest");
 
 ```go
 /*
-#cgo LDFLAGS: -L${SRCDIR} -lhkdfguard_v1
+#cgo LDFLAGS: -L${SRCDIR} -lhkdfguard
 #include "hkdfguard.h"
 */
 import "C"
@@ -785,20 +1080,19 @@ non-`cgo` bindings above.)
 **C#** (P/Invoke):
 
 ```csharp
-[DllImport("hkdfguard_v1", CallingConvention = CallingConvention.Cdecl)]
+[DllImport("hkdfguard", CallingConvention = CallingConvention.Cdecl)]
 static extern int hkdfguard_create_kek(string service);
 
 int status = hkdfguard_create_kek("com.example.ingest");
 ```
 
-`hkdfguard_v1` is the platform-neutral library name: .NET resolves it to
-`libhkdfguard_v1.dylib` here by adding the platform's `lib` prefix and
+`hkdfguard` is the platform-neutral library name: .NET resolves it to
+`libhkdfguard.dylib` here by adding the platform's `lib` prefix and
 extension, so the same `DllImport` works wherever the library follows the
-standard naming.
-
-The `dist/osx-arm64` folder name is already a .NET runtime identifier, so a
-C# consumer can drop it straight into a NuGet package's
-`runtimes/{rid}/native/` layout instead of loading the zip by hand.
+standard naming -- including Linux, where the same name resolves to
+`libhkdfguard.so`. (Both libraries dropped an earlier `_v1` suffix from the
+name; the ABI's major version is carried by the install folder
+`HkdfGuard/v1/` here and by the `libhkdfguard.so.1` SONAME on Linux.)
 
 ## Signing and entitlements
 
@@ -833,17 +1127,27 @@ C# consumer can drop it straight into a NuGet package's
 
 ## Tests
 
-Two Swift Testing suites, both `.serialized`:
+Three Swift Testing suites:
 
-- **`HkdfGuardNativeMacOSWrapUnwrapTests`** exercises every C entry
-  point in-process: provisioning, idempotence and the first-use race,
+- **`HkdfGuardNativeMacOSWrapUnwrapTests`** (`.serialized`) exercises
+  every C entry point in-process: provisioning, idempotence and the first-use race,
   service-name rules (ASCII bytes, case-insensitivity, length), round trips,
   payload length, nonce/ephemeral uniqueness, per-service isolation,
   fingerprint and ciphertext tamper detection, buffer sizing before any
   enclave work, NULL-pointer handling, corrupt-item reporting, and the
   keychain-mode decision (including that data-protection mode from an
-  unentitled process is reported as `-17`, never as "no key").
-- **`HkdfGuardCommandLineToolTests`** builds and runs the real CLI as a
+  unentitled process is reported as `-18`, never as "no key"), and a
+  wrap → write file → `hkdfguard_open_file` → unwrap round trip.
+- **`HkdfGuardOpenFileTests`** covers `hkdfguard_open_file` without the
+  enclave: exact-length success, too short/too long, plaintext DEKs in
+  every accepted encoding (`-37`, never copied out) versus short text that
+  is not a key, malformed payloads (off-curve encapsulated key, zero
+  fingerprint), unknown suite bytes (-12), missing and unreadable files, symlink/directory/FIFO
+  refusal, ownership rules (group/world-writable and multiply-linked files
+  refused; 0600/0644/0400 and root-owned files accepted), buffer sizing
+  before the file is
+  opened, and NULL pointers.
+- **`HkdfGuardCommandLineToolTests`** (`.serialized`) builds and runs the real CLI as a
   subprocess: `provision`/`wrap`/`status`/`retire` semantics, DEK sources
   and their bounds (whitespace, oversized, non-ASCII, missing file),
   rejected arguments, `wrap --fingerprint` (match, mismatch leaves an
@@ -853,8 +1157,8 @@ Two Swift Testing suites, both `.serialized`:
   hosted — the bundled CLI's data-protection provision/wrap/retire with
   this host unwrapping.
 
-The library suite needs a real Secure Enclave and is skipped as a whole on
-CI/VM runners; in the CLI suite only the tests that reach the enclave are
+The wrap/unwrap suite needs a real Secure Enclave and is skipped as a whole on
+CI/VM runners; `HkdfGuardOpenFileTests` runs everywhere; in the CLI suite only the tests that reach the enclave are
 skipped there, so its argument-handling tests still run. Every test that
 provisions a key deletes its keychain item afterward — in whichever keychain
 the host process's mode uses — so a run leaves the keychain clean. No test
@@ -883,7 +1187,7 @@ the `DebugHosted` configuration, which sets `TEST_HOST` to
 `HkdfGuardNativeMacOSTestHost.app` — a Team-signed app entitled for the
 **test-only** `com.hkdfguard.tests.keys` access group — so the whole suite
 runs in data-protection mode, and additionally builds the bundled CLI
-(`hkdfguard-v1-initialize.app`, same test group). That enables the test
+(`hkdfguard.app`, same test group). That enables the test
 that matters most: the bundled CLI provisions a KEK and wraps a DEK, and
 this differently-signed host unwraps it through the library **with no
 interactive prompt** — the production topology, with access granted by
@@ -934,8 +1238,8 @@ provisioning and the unhosted scheme is unaffected.
 
 ## Differences from the Linux tool
 
-Deliberate divergences from `hkdfguard-v1-initialize.rs`: separate
-`provision`, `wrap`, and `retire` commands; the key file path is
-`--key-file-path`, not positional; no `--dek <base64>` argument (stdin or
-file only); output file permissions `0600`; `wrap` prints the KEK
-fingerprint it used and accepts `--fingerprint` to pin it.
+Shared with the Linux tool (`hkdfguard-native-linux/src/bin/hkdfguard.rs`):
+the `provision` and `wrap` commands, `--key-file-path`, DEK input from stdin
+or a file only, `0600` output, and process hardening at startup. Mac-only:
+the `retire` and `status` commands, and `wrap` printing the KEK fingerprint
+it used and accepting `--fingerprint` to pin it.

@@ -1,0 +1,73 @@
+#!/bin/sh
+# postinstall for com.hkdfguard.native.v1. Runs as root after the payload is
+# in place. Its only job is the PATH symlink:
+#
+#   /usr/local/bin/hkdfguard
+#       -> /Library/Application Support/HkdfGuard/v1/hkdfguard
+#
+# Made here rather than shipped in the payload: a payload containing
+# /usr/local/bin would let Installer reset the owner and mode of a folder
+# that already exists (Homebrew on Intel Macs owns it). This creates only
+# what is missing, root:wheel 0755, and never changes an existing folder.
+#
+# The symlink is created only when /usr/local/bin is a real folder owned by
+# root and writable by root alone. Anyone else who could write that folder
+# could repoint the symlink at their own program -- which an operator would
+# then run while provisioning keys -- and could swap the folder for a
+# symlink between this script's checks and its `ln`, steering root into
+# creating or replacing a file elsewhere. In that case nothing is linked
+# and the install log says to call the CLI by its full path.
+#
+# Never fails the install: the library is already in place, and a missing
+# convenience symlink is reported in the install log (/var/log/install.log)
+# rather than rolled back.
+set -u
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# $3 is the target volume ("/" for a normal install).
+volume="${3:-/}"
+volume="${volume%/}"
+
+cli="/Library/Application Support/HkdfGuard/v1/hkdfguard"
+bin_dir="$volume/usr/local/bin"
+link="$bin_dir/hkdfguard"
+
+log() { echo "hkdfguard postinstall: $*"; }
+
+if [ ! -x "$volume$cli" ]; then
+    log "$volume$cli is missing; no PATH symlink"
+    exit 0
+fi
+
+for dir in "$volume/usr/local" "$bin_dir"; do
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        mkdir -m 0755 "$dir" && chown root:wheel "$dir" \
+            || { log "could not create $dir; no PATH symlink"; exit 0; }
+    fi
+    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+        log "$dir is not a plain folder; no PATH symlink"
+        exit 0
+    fi
+done
+
+owner="$(stat -f '%u' "$bin_dir")"
+mode="$(stat -f '%Lp' "$bin_dir")"
+if [ "$owner" != 0 ] || [ $(( 0$mode & 022 )) -ne 0 ]; then
+    log "warning: $bin_dir is not owned by root and writable by root alone (uid $owner, mode $mode);"
+    log "         anyone who can write it could replace a symlink there with their own program."
+    log "         No PATH symlink created. Call $cli by its full path when provisioning keys."
+    exit 0
+fi
+
+# Replace our own (or any) symlink; never clobber a real file someone put there.
+if [ -e "$link" ] && [ ! -L "$link" ]; then
+    log "$link exists and is not a symlink; left untouched, no PATH symlink"
+    exit 0
+fi
+if ln -sfh "$cli" "$link" && chown -h root:wheel "$link"; then
+    log "linked $link -> $cli"
+else
+    log "could not create $link"
+fi
+exit 0

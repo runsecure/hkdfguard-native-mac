@@ -7,6 +7,7 @@ import Testing
 import Foundation
 import CryptoKit
 import Security
+import os
 @testable import HkdfGuardNativeMacOS
 
 /// Exercises the public C-ABI entry points exposed by
@@ -19,12 +20,15 @@ import Security
 /// These status codes are the module's private `HKDFGuardStatus` raw
 /// values, mirrored here since that enum isn't visible outside the module:
 ///   0 = success, -1 = invalidInputLength, -2 = outputBufferTooSmall,
-///   -3 = keyUnavailable (reserved, no longer returned), -6 = decryptionFailed,
-///   -8 = invalidServiceIdentifier, -9 = enclaveUnavailable,
-///   -10 = kekNotFound, -11 = kekCorrupted, -12 = accessControlCreationFailed,
-///   -13 = keyGenerationFailed, -14 = keychainWriteFailed,
-///   -15 = kekVerificationFailed, -16 = fingerprintMismatch,
-///   -17 = keychainAccessDenied, -18 = keychainReadFailed.
+///   -3 = enclaveUnavailable, -6 = unexpectedOutputLength,
+///   -8 = invalidServiceIdentifier, -10 = payloadMalformed,
+///   -11 = decryptionFailed, -12 = unsupportedCiphersuite,
+///   -16 = fingerprintMismatch, -17 = kekNotFound,
+///   -18 = keychainAccessDenied, -19 = kekCorrupted,
+///   -96 = accessControlCreationFailed, -97 = keyGenerationFailed,
+///   -98 = keychainWriteFailed, -99 = kekVerificationFailed,
+///   -100 = keychainReadFailed
+///   (the shared HkdfGuard status table; see hkdfguard.h).
 ///
 /// Important behavior change worth calling out here, not just in the
 /// individual tests below: `hkdfguard_wrap_dek`/`hkdfguard_unwrap_dek`/
@@ -73,11 +77,20 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     // MARK: - Helpers
 
     private static let dekLength = 32
-    private static let wrappedLength = 156 // 32-byte KEK fingerprint + 64-byte ephemeral pubkey + 12-byte nonce + 32-byte ciphertext + 16-byte tag
+    private static let wrappedLength = 146 // 32-byte KEK fingerprint + 1-byte suite id + 65-byte HPKE encapsulated key + 32-byte ciphertext + 16-byte tag
     private static let maxServiceNameLength = 128
 
     private static func randomDEK() -> [UInt8] {
         (0..<dekLength).map { _ in UInt8.random(in: .min ... .max) }
+    }
+
+    /// A payload-length blob of zeros with the one byte that is checked
+    /// before the keychain -- the suite id at offset 32 -- set to the
+    /// supported value, so a test gets to the keychain lookup it is about.
+    private static func zeroPayloadWithValidSuite() -> [UInt8] {
+        var blob = [UInt8](repeating: 0, count: wrappedLength)
+        blob[32] = 0x01
+        return blob
     }
 
     /// Deletes the keychain item backing a service's Secure Enclave key,
@@ -230,7 +243,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     }
 
     @Test func concurrentFirstUseOfCreateKekConvergesOnOneKEK() {
-        // Regression test: createKEK() used to report keyUnavailable (-3)
+        // Regression test: createKEK() used to report a failure
         // non-deterministically when multiple callers raced to create the
         // very first keychain item for a service at the same time
         // (SecItemAdd's unique index on service+account lets only one
@@ -262,23 +275,40 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         let service = "com.hkdfguard.tests.kek.create.concurrent.\(UUID().uuidString.filter { $0 != "-" })"
         defer { Self.deleteKEK(service: service) }
 
-        let lock = NSLock()
-        var statuses: [Int32] = []
+        // Sendable shared state, since the creators below run in @Sendable
+        // closures on GCD.
+        let statuses = OSAllocatedUnfairLock<[Int32]>(initialState: [])
 
         // 3 concurrent creators is enough to exercise the unique-index
         // race (needs >=2); observed directly that pushing much more
         // simultaneous load at the real Secure Enclave/securityd IPC
         // layer causes severe contention on this hardware, so this stays
         // deliberately modest rather than maximizing concurrency.
-        DispatchQueue.concurrentPerform(iterations: 3) { _ in
-            let status = Self.createKEK(service: service)
-            lock.lock()
-            statuses.append(status)
-            lock.unlock()
+        //
+        // The creators run on GCD's global pool and this thread waits with
+        // a deadline rather than joining them: the SEP/securityd IPC has
+        // been seen to stall outright under concurrent first use, and a
+        // thread blocked inside it cannot be cancelled -- `.timeLimit`
+        // alone would record the failure but leave the whole run hung. On
+        // a stall this records an issue and returns; the stuck threads are
+        // abandoned (they hold no test state) and don't block the run.
+        // A normal run completes in well under a second.
+        let creators = DispatchGroup()
+        for _ in 0..<3 {
+            DispatchQueue.global(qos: .userInitiated).async(group: creators) {
+                let status = Self.createKEK(service: service)
+                statuses.withLock { $0.append(status) }
+            }
+        }
+        guard creators.wait(timeout: .now() + 60) == .success else {
+            let finished = statuses.withLock { $0.count }
+            Issue.record("Secure Enclave/securityd stalled: only \(finished) of 3 concurrent hkdfguard_create_kek calls returned within 60 s")
+            return
         }
 
-        #expect(statuses.count == 3)
-        #expect(statuses.allSatisfy { $0 == 0 })
+        let collected = statuses.withLock { $0 }
+        #expect(collected.count == 3)
+        #expect(collected.allSatisfy { $0 == 0 })
     }
 
     @Test func kekExistsRejectsInvalidServiceIdentifier() {
@@ -320,6 +350,32 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // hyphen (still a very ordinary character in a reverse-DNS-style
         // identifier) must not slip through.
         #expect(Self.createKEK(service: "com.hkdfguard.tests-invalid-charset") == -8) // invalidServiceIdentifier
+    }
+
+    @Test func serviceNameRejectsLeadingAndConsecutiveDots() {
+        // The shared rule (hkdfguard-native-linux's cstr_to_service): a name
+        // may not start with '.' or contain "..", so it can never be ".",
+        // "..", or a hidden dot-name, or have an empty label. Same list as
+        // the Linux CLI's validate_service_charset test. Rejected before any
+        // keychain work, so nothing needs cleaning up.
+        for name in [".", "..", "...", ".hidden", "..parent", "com..example", "com.example..", "a...b"] {
+            #expect(Self.createKEK(service: name) == -8, "\(name) must be rejected")
+            #expect(Self.kekExists(service: name).status == -8, "\(name)")
+            #expect(Self.wrap(Self.randomDEK(), service: name).status == -8, "\(name)")
+            #expect(Self.generateAndWrap(service: name).status == -8, "\(name)")
+            #expect(Self.unwrap([UInt8](repeating: 0, count: Self.wrappedLength), service: name).status == -8, "\(name)")
+        }
+    }
+
+    @Test func serviceNameAcceptsSingleInteriorAndTrailingDots() {
+        // Only a leading dot and ".." are forbidden: single dots between
+        // labels, and a trailing dot, are valid -- as on Linux. kekExists
+        // never creates anything, so a valid name answers 0 with "no KEK".
+        for name in ["a", "com.example", "a.b.c", "com.example."] {
+            let result = Self.kekExists(service: name)
+            #expect(result.status == 0, "\(name) must be accepted")
+            #expect(result.exists == false, "\(name)")
+        }
     }
 
     @Test func serviceNameIsCaseInsensitive() {
@@ -431,7 +487,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // Drives the internal functions in data-protection mode from this
         // unentitled process. securityd answers errSecMissingEntitlement
         // (-34018); the library must report that as keychainAccessDenied
-        // (-17) on every path -- never as "no key" (which would invite
+        // (-18) on every path -- never as "no key" (which would invite
         // creating one) and never as a generic failure -- and must create
         // nothing. This is also the proof that kSecUseDataProtectionKeychain
         // actually reaches the keychain calls: in legacy mode the same
@@ -444,13 +500,13 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // helpers (which go through the C ABI, in the process's real mode)
         // would otherwise shadow the library's internal functions.
         let exists = HkdfGuardNativeMacOS.kekExists(service: service, mode: dp)
-        #expect(exists.status == -17)
+        #expect(exists.status == -18)
         #expect(exists.exists == false)
 
-        #expect(HkdfGuardNativeMacOS.createKEK(service: service, mode: dp) == -17)
+        #expect(HkdfGuardNativeMacOS.createKEK(service: service, mode: dp) == -18)
 
         let got = HkdfGuardNativeMacOS.getKEK(service: service, mode: dp)
-        #expect(got.status == -17)
+        #expect(got.status == -18)
         #expect(got.key == nil)
 
         // Nothing leaked into the legacy keychain either.
@@ -460,10 +516,10 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     @Test func corruptKeychainItemIsReportedAsKekCorruptedNotNotFound() {
         // An item exists under this service, but its data is not a Secure
         // Enclave key representation. Every entry point must report
-        // kekCorrupted (-11): not "no key" (which would invite creating a
+        // kekCorrupted (-19): not "no key" (which would invite creating a
         // replacement on top of it), not success, and nothing may "heal"
         // it by replacing it. This is the case the keychain-lookup mapping
-        // has to keep distinct from keychainAccessDenied (-17), which is
+        // has to keep distinct from keychainAccessDenied (-18), which is
         // not reproducible in-process without locking the login keychain.
         let service = "com.hkdfguard.tests.kek.corrupt.item"
         defer { Self.deleteKEK(service: service) }
@@ -476,15 +532,15 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess)
 
         let exists = Self.kekExists(service: service)
-        #expect(exists.status == -11) // kekCorrupted
+        #expect(exists.status == -19) // kekCorrupted
         #expect(exists.exists == false)
-        #expect(Self.createKEK(service: service) == -11)
-        #expect(Self.wrap(Self.randomDEK(), service: service).status == -11)
-        #expect(Self.unwrap([UInt8](repeating: 0, count: Self.wrappedLength), service: service).status == -11)
+        #expect(Self.createKEK(service: service) == -19)
+        #expect(Self.wrap(Self.randomDEK(), service: service).status == -19)
+        #expect(Self.unwrap(Self.zeroPayloadWithValidSuite(), service: service).status == -19)
 
         // Still corrupt, still present: createKEK above must not have
         // replaced it.
-        #expect(Self.kekExists(service: service).status == -11)
+        #expect(Self.kekExists(service: service).status == -19)
     }
 
     // MARK: - wrap/unwrap require an already-created KEK
@@ -498,7 +554,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // No defer/cleanup needed: hkdfguard_wrap_dek must not create
         // anything here — that's exactly what's under test.
         let result = Self.wrap(Self.randomDEK(), service: service)
-        #expect(result.status == -10) // kekNotFound
+        #expect(result.status == -17) // kekNotFound
     }
 
     @Test func unwrapFailsWithKekNotFoundWhenNoKekWasCreated() {
@@ -506,14 +562,11 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // No defer/cleanup needed: hkdfguard_unwrap_dek must not create
         // anything here either.
         //
-        // The KEK lookup now happens before the fingerprint/ephemeral-key/
-        // SealedBox are even parsed, so content doesn't matter here —
-        // only that the blob is longer than the fixed 96-byte
-        // fingerprint+ephemeral-key prefix, matching any real wrapped
-        // payload's minimum shape.
-        let arbitraryBlob = [UInt8](repeating: 0, count: Self.wrappedLength)
+        // Only the length and the suite byte are checked before the KEK
+        // lookup, so the rest of the content doesn't matter here.
+        let arbitraryBlob = Self.zeroPayloadWithValidSuite()
         let result = Self.unwrap(arbitraryBlob, service: service)
-        #expect(result.status == -10) // kekNotFound
+        #expect(result.status == -17) // kekNotFound
     }
 
     // MARK: - Round trip
@@ -528,6 +581,39 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(wrapResult.status == 0)
 
         let unwrapResult = Self.unwrap(wrapResult.wrapped, service: service)
+        #expect(unwrapResult.status == 0)
+        #expect(unwrapResult.plaintext == dek)
+    }
+
+    /// The real use of `hkdfguard_open_file`: a payload written to disk
+    /// (as the CLI's `wrap` does), read back, and unwrapped. Its other
+    /// behavior needs no enclave and is covered by `HkdfGuardOpenFileTests`.
+    @Test func wrapWriteOpenFileThenUnwrapRecoversOriginalDEK() throws {
+        let service = "com.hkdfguard.tests.roundtrip.file"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createKEK(service: service) == 0)
+        let dek = Self.randomDEK()
+
+        let wrapResult = Self.wrap(dek, service: service)
+        #expect(wrapResult.status == 0)
+
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hkdfguard.roundtrip.\(UUID().uuidString).key")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(wrapResult.wrapped).write(to: file)
+
+        var read = [UInt8](repeating: 0, count: Self.wrappedLength)
+        var readLen = Int32(Self.wrappedLength)
+        let openStatus = file.path.withCString { pathCStr in
+            read.withUnsafeMutableBufferPointer { readBuf in
+                hkdfguard_open_file(pathPtr: pathCStr, outPtr: readBuf.baseAddress!, outLen: &readLen)
+            }
+        }
+        #expect(openStatus == 0)
+        #expect(readLen == Int32(Self.wrappedLength))
+        #expect(read == wrapResult.wrapped)
+
+        let unwrapResult = Self.unwrap(read, service: service)
         #expect(unwrapResult.status == 0)
         #expect(unwrapResult.plaintext == dek)
     }
@@ -555,7 +641,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
             return (status, out, len)
         }
 
-        #expect(fingerprint(32).status == -10, "no KEK yet must be kekNotFound")
+        #expect(fingerprint(32).status == -17, "no KEK yet must be kekNotFound")
 
         #expect(Self.createKEK(service: service) == 0)
         let tooSmall = fingerprint(31)
@@ -633,6 +719,148 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(result.status == -8) // invalidServiceIdentifier
     }
 
+    // MARK: - Audit trail, end to end
+
+    @Test func auditTrailRecordsCreationWrapUnwrapAndTamperingWithMatchingHashes() throws {
+        HkdfGuardAuditTests.startCapturing()
+        let service = "com.hkdfguard.tests.audit.e2e"
+        let quoted = "service=\"\(service)\""
+        Self.deleteKEK(service: service)
+        defer { Self.deleteKEK(service: service) }
+
+        #expect(Self.createKEK(service: service) == 0)
+        #expect(Self.createKEK(service: service) == 0) // found, not created
+        let created = HkdfGuardAuditTests.records(containing: quoted).filter { $0.contains("event=1000 ") }
+        #expect(created.count == 1, "exactly one creation record: \(created)")
+        #expect(created.first?.hasPrefix("[info] event=1000 op=hkdfguard_create_kek \(quoted) provider=SECURE_ENCLAVE keychain=") == true, "\(created)")
+
+        let wrapped = Self.wrap(Self.randomDEK(), service: service)
+        #expect(wrapped.status == 0)
+        let hash = SHA256.hash(data: Data(wrapped.wrapped)).map { String(format: "%02x", $0) }.joined()
+        let fingerprint = wrapped.wrapped.prefix(32).map { String(format: "%02x", $0) }.joined()
+
+        #expect(Self.unwrap(wrapped.wrapped, service: service).status == 0)
+        var tampered = wrapped.wrapped
+        tampered[tampered.count - 1] ^= 0x01
+        #expect(Self.unwrap(tampered, service: service).status == -11)
+
+        let byHash = HkdfGuardAuditTests.records(containing: "payload_sha256=\(hash)")
+        #expect(byHash.contains { $0.contains("event=1002 op=hkdfguard_wrap_dek result=OK \(quoted)") }, "\(byHash)")
+        #expect(byHash.contains { $0.contains("event=1003 op=hkdfguard_unwrap_dek result=OK \(quoted)") }, "\(byHash)")
+        #expect(byHash.allSatisfy { $0.contains("kek_fingerprint=\(fingerprint) ") }, "the payload's own fingerprint: \(byHash)")
+
+        let integrity = HkdfGuardAuditTests.records(containing: quoted).filter { $0.contains("event=2003 ") }
+        #expect(integrity.count == 1, "\(integrity)")
+        #expect(integrity.first?.hasPrefix("[warning] event=2003 op=hkdfguard_unwrap_dek result=PAYLOAD_AUTH_FAILED(-11) \(quoted)") == true, "\(integrity)")
+    }
+
+    // MARK: - Size probes and argument order (as on Linux)
+
+    @Test func sizeProbesWithANullOutReportTheSizeWithoutTouchingTheKeychain() {
+        // `out = NULL, *out_len = 0`: -2 with the size to allocate. The
+        // service has no KEK, so reaching the keychain would be -17 instead.
+        let service = "com.hkdfguard.tests.size.probe"
+        let dek = Self.randomDEK()
+        let blob = [UInt8](repeating: 0, count: Self.wrappedLength)
+        var len: Int32 = 0
+
+        #expect(dek.withUnsafeBufferPointer { d in service.withCString { hkdfguard_wrap_dek(servicePtr: $0, dekPtr: d.baseAddress, dekLen: 32, outPtr: nil, outLen: &len) } } == -2)
+        #expect(len == Int32(Self.wrappedLength))
+
+        len = 0
+        #expect(service.withCString { hkdfguard_generate_and_wrap_dek(servicePtr: $0, outPtr: nil, outLen: &len) } == -2)
+        #expect(len == Int32(Self.wrappedLength))
+
+        len = 0
+        #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: Int32(b.count), outPtr: nil, outLen: &len) } } == -2)
+        #expect(len == 32)
+        #expect(!Self.kekExists(service: service).exists)
+    }
+
+    @Test func nullOutWithAPositiveCapacityOrANegativeCapacityIsInvalidArgument() {
+        let service = "com.hkdfguard.tests.null.out"
+        let dek = Self.randomDEK()
+        let blob = [UInt8](repeating: 0, count: Self.wrappedLength)
+        var out = [UInt8](repeating: 0, count: 256)
+
+        for capacity: Int32 in [10, 200] {
+            var len = capacity
+            #expect(dek.withUnsafeBufferPointer { d in service.withCString { hkdfguard_wrap_dek(servicePtr: $0, dekPtr: d.baseAddress, dekLen: 32, outPtr: nil, outLen: &len) } } == -1, "wrap, capacity \(capacity)")
+            len = capacity
+            #expect(service.withCString { hkdfguard_generate_and_wrap_dek(servicePtr: $0, outPtr: nil, outLen: &len) } == -1, "generate, capacity \(capacity)")
+        }
+        var len: Int32 = 64
+        #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: Int32(b.count), outPtr: nil, outLen: &len) } } == -1)
+
+        out.withUnsafeMutableBufferPointer { o in
+            var negative: Int32 = -1
+            #expect(dek.withUnsafeBufferPointer { d in service.withCString { hkdfguard_wrap_dek(servicePtr: $0, dekPtr: d.baseAddress, dekLen: 32, outPtr: o.baseAddress, outLen: &negative) } } == -1)
+            negative = -1
+            #expect(service.withCString { hkdfguard_generate_and_wrap_dek(servicePtr: $0, outPtr: o.baseAddress, outLen: &negative) } == -1)
+            negative = -1
+            #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: Int32(b.count), outPtr: o.baseAddress, outLen: &negative) } } == -1)
+            var capacity: Int32 = 64
+            #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: -1, outPtr: o.baseAddress, outLen: &capacity) } } == -1, "negative wrapped_len")
+        }
+    }
+
+    @Test func unwrapChecksTheServiceBeforeTheBufferAndThePayload() {
+        // Linux's order: an invalid service (-8) is reported ahead of a
+        // too-small buffer (-2) and a malformed payload length (-10).
+        let short = [UInt8](repeating: 0, count: 10)
+        #expect(Self.unwrapIntoMarkedBuffer(short, service: "bad-service", allocated: 64, declared: 64).status == -8)
+        #expect(Self.unwrapIntoMarkedBuffer(short, service: "bad-service", allocated: 64, declared: 8).status == -8)
+        #expect(Self.unwrapIntoMarkedBuffer(short, service: "com.hkdfguard.tests.order", allocated: 64, declared: 8).status == -2)
+    }
+
+    // MARK: - Zeroing `out` on failure (as on Linux)
+
+    /// Calls hkdfguard_unwrap_dek with an `out` of `allocated` bytes filled
+    /// with 0xAA, declaring only `declared` of them, and returns the status
+    /// and the buffer afterwards.
+    static func unwrapIntoMarkedBuffer(
+        _ blob: [UInt8], service: String, allocated: Int, declared: Int32
+    ) -> (status: Int32, out: [UInt8]) {
+        var out = [UInt8](repeating: 0xAA, count: allocated)
+        var outLen = declared
+        let status = blob.withUnsafeBufferPointer { blobBuf in
+            out.withUnsafeMutableBufferPointer { outBuf in
+                service.withCString {
+                    hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: blobBuf.baseAddress, wrappedLen: Int32(blob.count), outPtr: outBuf.baseAddress, outLen: &outLen)
+                }
+            }
+        }
+        return (status, out)
+    }
+
+    @Test func unwrapZeroesTheDeclaredOutCapacityOnEveryFailure() {
+        // Each failure is reported before any keychain work, so nothing
+        // needs cleaning up: a malformed length (-10), an invalid service
+        // (-8), and an unsupported suite byte (-12).
+        var badSuite = [UInt8](repeating: 0, count: Self.wrappedLength)
+        badSuite[32] = 0xEE
+        let failures: [(blob: [UInt8], service: String, status: Int32)] = [
+            ([UInt8](repeating: 0, count: 10), "com.hkdfguard.tests.zero.out", -10),
+            ([UInt8](repeating: 0, count: Self.wrappedLength), "bad-service", -8),
+            (badSuite, "com.hkdfguard.tests.zero.out", -12),
+        ]
+        for failure in failures {
+            let result = Self.unwrapIntoMarkedBuffer(failure.blob, service: failure.service, allocated: 64, declared: 48)
+            #expect(result.status == failure.status)
+            #expect(result.out[0..<48].allSatisfy { $0 == 0 }, "status \(failure.status): declared capacity must be zeroed")
+            #expect(result.out[48...].allSatisfy { $0 == 0xAA }, "status \(failure.status): nothing past the declared capacity may be touched")
+        }
+    }
+
+    @Test func unwrapZeroesATooSmallOutBufferToo() {
+        let result = Self.unwrapIntoMarkedBuffer(
+            [UInt8](repeating: 0, count: Self.wrappedLength), service: "com.hkdfguard.tests.zero.small", allocated: 32, declared: 16
+        )
+        #expect(result.status == -2)
+        #expect(result.out[0..<16].allSatisfy { $0 == 0 })
+        #expect(result.out[16...].allSatisfy { $0 == 0xAA })
+    }
+
     // MARK: - Input validation
 
     @Test func wrapRejectsIncorrectDEKLength() {
@@ -650,18 +878,18 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // provisioning, so nothing is ever created.
         let tooShort = [UInt8](repeating: 0, count: 32)
         let result = Self.unwrap(tooShort, service: "com.hkdfguard.tests.short.blob")
-        #expect(result.status == -1) // invalidInputLength
+        #expect(result.status == -10) // payloadMalformed
     }
 
     @Test func unwrapRejectsAnyLengthOtherThanTheExactWrappedLength() {
         // Every payload this library produces is exactly wrappedLength
         // bytes, so one byte more or less is rejected up front -- before
         // the service is even looked at (no KEK exists for this service,
-        // yet the answer is -1, not -10).
+        // yet the answer is payloadMalformed -10, not kekNotFound -17).
         for length in [Self.wrappedLength - 1, Self.wrappedLength + 1, Self.wrappedLength * 2] {
             let blob = [UInt8](repeating: 0, count: length)
             let result = Self.unwrap(blob, service: "com.hkdfguard.tests.inexact.length")
-            #expect(result.status == -1, "length \(length)")
+            #expect(result.status == -10, "length \(length)")
         }
     }
 
@@ -756,13 +984,55 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
 
         var wrapped = Self.wrap(Self.randomDEK(), service: service).wrapped
         // Flip a bit inside the AES-GCM ciphertext/tag region (well past
-        // the fingerprint + ephemeral-public-key prefix), leaving the
-        // fingerprint itself untouched so this exercises the AES-GCM tag
-        // check specifically, not the fingerprint check.
+        // the fingerprint + suite + encapsulated-key prefix), leaving the
+        // fingerprint itself untouched so this exercises the AEAD tag check
+        // specifically, not the fingerprint check.
         wrapped[wrapped.count - 1] ^= 0xFF
 
         let result = Self.unwrap(wrapped, service: service)
-        #expect(result.status == -6) // decryptionFailed — the GCM tag check must catch this
+        #expect(result.status == -11) // decryptionFailed — the GCM tag check must catch this
+    }
+
+    @Test func unwrapRejectsTamperedEncapsulatedKey() {
+        // A flipped bit in the HPKE encapsulated key: either no longer a
+        // point on the curve, or a different point -- both make the key
+        // schedule disagree with the sender's, so the AEAD open fails.
+        let service = "com.hkdfguard.tests.tamper.encapsulated"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createKEK(service: service) == 0)
+
+        var wrapped = Self.wrap(Self.randomDEK(), service: service).wrapped
+        wrapped[40] ^= 0x01
+
+        #expect(Self.unwrap(wrapped, service: service).status == -11)
+    }
+
+    @Test func unwrapRejectsACompressedOrMisprefixedEncapsulatedKey() {
+        // The encapsulated key must be an uncompressed X9.63 point (0x04).
+        // A 0x02/0x03 compressed prefix on a 65-byte field, or a 0x00, is a
+        // malformed point: rejected by CryptoKit's deserialization, never
+        // reinterpreted, never a crash.
+        let service = "com.hkdfguard.tests.enc.prefix"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createKEK(service: service) == 0)
+
+        let wrapped = Self.wrap(Self.randomDEK(), service: service).wrapped
+        #expect(wrapped[33] == 0x04, "encapsulated key must be an uncompressed X9.63 point")
+        for prefix: UInt8 in [0x02, 0x03, 0x00] {
+            var tampered = wrapped
+            tampered[33] = prefix
+            #expect(Self.unwrap(tampered, service: service).status == -11, "prefix \(prefix)")
+        }
+    }
+
+    @Test func unwrapRejectsAnUnsupportedSuiteByteBeforeTouchingTheKeychain() {
+        // Byte 32 names the ciphersuite. No KEK exists for this service, yet
+        // the answer is -28, not -10: the suite is checked first.
+        let service = "com.hkdfguard.tests.unsupported.suite"
+        var blob = [UInt8](repeating: 0x5A, count: Self.wrappedLength)
+        blob[32] = 0x02
+        #expect(Self.unwrap(blob, service: service).status == -12)
+        #expect(Self.kekExists(service: service).exists == false, "nothing may have been created")
     }
 
     @Test func unwrapRejectsTamperedFingerprint() {
@@ -846,5 +1116,313 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         let result = Self.generateAndWrap(service: service, bufferCapacity: 10)
         #expect(result.status == -2) // outputBufferTooSmall
         #expect(result.requiredLen == Int32(Self.wrappedLength))
+    }
+}
+
+/// `hkdfguard_harden_process(_with_flags)`. It changes process-wide,
+/// irreversible state (core limit, PT_DENY_ATTACH), and doing so inside the
+/// test process is deliberate: the test agent is exactly the kind of
+/// development host the advisory mode exists for -- `xctest` is ad-hoc
+/// signed with get-task-allow and no Hardened Runtime, and the hosted test
+/// app is built without the Hardened Runtime -- so it can check both modes
+/// against a known-weak signature. Under Xcode's debugger the process is
+/// traced, and hardening must then refuse rather than let the kernel kill it.
+@Suite(.serialized)
+struct HkdfGuardHardenProcessTests {
+    static let requireProtectedSignature: UInt32 = 0x1 // HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE
+
+    static func isBeingTraced() -> Bool {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        #expect(sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0)
+        return info.kp_proc.p_flag & P_TRACED != 0
+    }
+
+    @Test func unknownFlagBitsAreRejectedAsInvalidArgument() {
+        #expect(hkdfguard_harden_process_with_flags(flags: ~Self.requireProtectedSignature) == -1)
+        #expect(hkdfguard_harden_process_with_flags(flags: 0x8000_0000) == -1)
+    }
+
+    @Test func theTestHostsSignatureIsReportedAsWeak() {
+        // Neither xctest nor the hosted test app is Hardened-Runtime signed
+        // without get-task-allow, so there is always a reason to report.
+        #expect(!codeSignatureWeaknesses().isEmpty)
+    }
+
+    @Test func advisoryModeHardensAndOnlyStrictModeFailsOnAWeakSignature() {
+        guard !Self.isBeingTraced() else {
+            // Under a debugger: refused (-20), never PT_DENY_ATTACH, which
+            // would terminate this process.
+            #expect(hkdfguard_harden_process() == -20)
+            return
+        }
+
+        #expect(hkdfguard_harden_process() == 0, "advisory: a weak signature is only logged")
+        #expect(hkdfguard_harden_process() == 0, "must be idempotent")
+        #expect(hkdfguard_harden_process_with_flags(flags: 0) == 0)
+
+        var limit = rlimit(rlim_cur: 1, rlim_max: 1)
+        #expect(getrlimit(RLIMIT_CORE, &limit) == 0)
+        #expect(limit.rlim_cur == 0 && limit.rlim_max == 0, "core dumps must be disabled, hard limit included")
+
+        #expect(
+            hkdfguard_harden_process_with_flags(flags: Self.requireProtectedSignature) == -20,
+            "strict: this test host's weak signature must be a failure"
+        )
+        // Strict mode's failure must not undo or skip what it could apply.
+        #expect(getrlimit(RLIMIT_CORE, &limit) == 0)
+        #expect(limit.rlim_cur == 0 && limit.rlim_max == 0)
+    }
+}
+
+/// Drift guard: the shared C ABI must not drift between this library and
+/// hkdfguard-native-linux, the source of record. Checks the two headers
+/// against each other, and the Swift status enums -- hand-maintained copies
+/// of the table, which is how the codes drifted before -- against the
+/// header. Pure text checks: no keychain or Secure Enclave. Skipped when the
+/// Linux repository isn't checked out next to this one.
+@Suite
+struct HkdfGuardCrossPlatformABITests {
+    static let macRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // HkdfGuardNativeMacOSTests
+        .deletingLastPathComponent() // hkdfguard-native-mac
+    static let macHeader = macRoot.appendingPathComponent("HkdfGuardNativeMacOS/hkdfguard.h")
+    static let linuxHeader = macRoot
+        .deletingLastPathComponent()
+        .appendingPathComponent("hkdfguard-native-linux/include/hkdfguard.h")
+    static let linuxPresent = FileManager.default.fileExists(atPath: linuxHeader.path)
+    static let linuxMissing = Comment(rawValue: "hkdfguard-native-linux is not checked out next to this repository")
+
+    /// The functions only this platform exports, as both headers document.
+    static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_kek_fingerprint"]
+
+    static func read(_ url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// `#define HKDFGUARD_NAME value` -> value, for integer values like `0`,
+    /// `(-17)`, `32`, or `0x1u`.
+    static func defines(in text: String) -> [String: Int] {
+        var result: [String: Int] = [:]
+        let pattern = /(?m)^#define\s+(HKDFGUARD_[A-Z0-9_]+)\s+\(?(-?)(0x[0-9A-Fa-f]+|[0-9]+)u?\)?/
+        for match in text.matches(of: pattern) {
+            let digits = String(match.3)
+            let magnitude = digits.hasPrefix("0x") ? Int(digits.dropFirst(2), radix: 16)! : Int(digits)!
+            result[String(match.1)] = match.2.isEmpty ? magnitude : -magnitude
+        }
+        return result
+    }
+
+    /// Names of the functions a header declares (`int`/`int32_t name(`).
+    static func functions(in text: String) -> Set<String> {
+        let pattern = /(?m)^\s*(?:int|int32_t)\s+(hkdfguard_[a-z_]+)\s*\(/
+        return Set(text.matches(of: pattern).map { String($0.1) })
+    }
+
+    /// The status codes: HKDFGUARD_OK and every HKDFGUARD_ERR_*.
+    static func statusCodes(_ all: [String: Int]) -> [String: Int] {
+        all.filter { $0.key == "HKDFGUARD_OK" || $0.key.hasPrefix("HKDFGUARD_ERR_") }
+    }
+
+    @Test(.enabled(if: linuxPresent, linuxMissing))
+    func statusCodesAndFlagsMatchLinuxExactly() throws {
+        let linux = Self.defines(in: try Self.read(Self.linuxHeader))
+        let mac = Self.defines(in: try Self.read(Self.macHeader))
+
+        let linuxShared = linux.filter { Self.isSharedConstant($0.key) }
+        let macShared = mac.filter { Self.isSharedConstant($0.key) }
+        #expect(!linuxShared.isEmpty, "parsed no constants from the Linux header")
+        for (name, value) in linuxShared.sorted(by: { $0.key < $1.key }) {
+            #expect(macShared[name] == value, "\(name): Linux \(value), macOS \(macShared[name].map(String.init) ?? "missing")")
+        }
+        for name in Set(macShared.keys).subtracting(linuxShared.keys).sorted() {
+            Issue.record("\(name) is defined only in the macOS header: add it to Linux's (the source of record) first")
+        }
+
+        // Same name everywhere, per-platform value.
+        #expect(linux["HKDFGUARD_WRAPPED_MAX_LEN"] != nil && mac["HKDFGUARD_WRAPPED_MAX_LEN"] != nil)
+    }
+
+    /// Constants whose value must be identical on every platform.
+    static func isSharedConstant(_ name: String) -> Bool {
+        name == "HKDFGUARD_OK" || name == "HKDFGUARD_DEK_LEN"
+            || name.hasPrefix("HKDFGUARD_ERR_") || name.hasPrefix("HKDFGUARD_HARDEN_")
+    }
+
+    @Test(.enabled(if: linuxPresent, linuxMissing))
+    func everySharedFunctionIsDeclaredAndOnlyTheDocumentedOnesAreMacOnly() throws {
+        let linux = Self.functions(in: try Self.read(Self.linuxHeader))
+        let mac = Self.functions(in: try Self.read(Self.macHeader))
+        #expect(linux.count >= 8, "parsed too few functions from the Linux header: \(linux.sorted())")
+
+        let missing = linux.subtracting(mac)
+        #expect(missing.isEmpty, "declared on Linux but not macOS: \(missing.sorted())")
+        let extra = mac.subtracting(linux)
+        #expect(extra == Self.macOnlyFunctions, "macOS-only functions are \(extra.sorted()); the headers document \(Self.macOnlyFunctions.sorted())")
+    }
+
+    /// Pairs each `case name = value` in `enumBody` with the HKDFGUARD_*
+    /// name it is labelled with -- in a `///` line above it (the library) or
+    /// a `// ERR_...` comment after it (the CLI).
+    static func labelledCases(in enumBody: Substring) -> [(label: String, value: Int)] {
+        var result: [(String, Int)] = []
+        var pendingLabel: String?
+        for line in enumBody.split(separator: "\n", omittingEmptySubsequences: false) {
+            // The label is the first line of a case's doc comment; later
+            // lines may mention other HKDFGUARD_* names.
+            if pendingLabel == nil, let doc = line.firstMatch(of: /^\s*\/\/\/\s*(HKDFGUARD_[A-Z0-9_]+)/) {
+                pendingLabel = String(doc.1)
+            }
+            guard let match = line.firstMatch(of: /^\s*case\s+\w+\s*=\s*(-?[0-9]+)(?:\s*\/\/\s*([A-Z0-9_]+))?/) else { continue }
+            let label = match.2.map { "HKDFGUARD_" + $0 } ?? pendingLabel
+            if let label { result.append((label, Int(match.1)!)) }
+            pendingLabel = nil
+        }
+        return result
+    }
+
+    static func enumBody(_ source: String, startingAt marker: String) -> Substring? {
+        guard let start = source.range(of: marker),
+              let end = source.range(of: "\n}\n", range: start.upperBound..<source.endIndex)
+        else { return nil }
+        return source[start.upperBound..<end.lowerBound]
+    }
+
+    @Test(.enabled(if: linuxPresent, linuxMissing))
+    func everyStatusCaseHasItsSharedNameAndNumber() throws {
+        let linux = Self.defines(in: try Self.read(Self.linuxHeader))
+        for status in HKDFGuardStatus.allCases {
+            let name = "HKDFGUARD_" + status.sharedName
+            #expect(linux[name] == Int(status.rawValue), "\(status) is \(status.rawValue) named \(name); Linux says \(linux[name].map(String.init) ?? "no such code")")
+        }
+    }
+
+    @Test(arguments: [
+        ("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift", "enum HKDFGuardStatus: Int32, CaseIterable {"),
+        ("hkdfguard-cli/Sources/hkdfguard/main.swift", "enum HKDFGuardStatus: Int32 {"),
+    ])
+    func swiftStatusEnumsMatchTheHeader(file: String, marker: String) throws {
+        let header = Self.defines(in: try Self.read(Self.macHeader))
+        let source = try Self.read(Self.macRoot.appendingPathComponent(file))
+        let body = try #require(Self.enumBody(source, startingAt: marker), "no \(marker) in \(file)")
+
+        let cases = Self.labelledCases(in: body)
+        let caseCount = body.matches(of: /(?m)^\s*case\s+\w+\s*=/).count
+        #expect(cases.count == caseCount, "\(file): \(caseCount - cases.count) status case(s) carry no HKDFGUARD_* label")
+        for (label, value) in cases {
+            #expect(header[label] == value, "\(file): case labelled \(label) is \(value), the header says \(header[label].map(String.init) ?? "it isn't defined")")
+        }
+    }
+}
+
+
+/// The audit trail's records, checked as Linux's src/audit.rs tests check
+/// its: event IDs, severities, fields, and what is never recorded. Records
+/// are captured in memory (`auditCapture`) and filtered by each test's own
+/// service names or paths, since tests run in parallel.
+@Suite
+struct HkdfGuardAuditTests {
+    static func startCapturing() {
+        auditCapture.withLock { if $0 == nil { $0 = [] } }
+    }
+
+    static func records(containing needle: String) -> [String] {
+        auditCapture.withLock { ($0 ?? []).filter { $0.contains(needle) } }
+    }
+
+    static func last(_ needle: String) -> String {
+        records(containing: needle).last ?? "(no record containing \(needle))"
+    }
+
+    init() { Self.startCapturing() }
+
+    @Test func recordsNameTheServiceAndTheCaller() {
+        auditOperationFailed(.createKek, service: "audit.test.caller", code: -19)
+        let record = Self.last("\"audit.test.caller\"")
+        #expect(record.hasPrefix("[error] event=2002 op=hkdfguard_create_kek result=KEK_INVALID(-19) service=\"audit.test.caller\" "), "\(record)")
+        #expect(record.contains(" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) exe=\"/"), "\(record)")
+        #expect(record.contains(" msg=\"hkdfguard_create_kek failed: "), "\(record)")
+    }
+
+    @Test func eachCodeGetsTheWindowsEventIdAndSeverity() {
+        let cases: [(code: Int32, event: Int, severity: String)] = [
+            (-18, 2000, "warning"),   // KEK_ACCESS_DENIED
+            (-19, 2002, "error"),     // KEK_INVALID
+            (-3, 2005, "error"),      // PROVIDER_UNAVAILABLE
+            (-5, 2005, "error"),      // CRYPTO_ERROR
+            (-6, 2005, "error"),      // INTERNAL_ERROR
+            (-96, 2005, "error"), (-97, 2005, "error"), (-98, 2005, "error"), (-99, 2005, "error"), (-100, 2005, "error"),
+        ]
+        for (code, event, severity) in cases {
+            let service = "audit.test.ids\(-code)"
+            auditOperationFailed(.kekExists, service: service, code: code)
+            let record = Self.last("\"\(service)\"")
+            #expect(record.hasPrefix("[\(severity)] event=\(event) "), "code \(code): \(record)")
+        }
+    }
+
+    @Test func callerMistakesAndNotFoundAreNotAudited() {
+        for code: Int32 in [-1, -2, -8, -17] {
+            auditOperationFailed(.wrap, service: "audit.test.quiet", code: code)
+        }
+        #expect(Self.records(containing: "audit.test.quiet").isEmpty)
+    }
+
+    @Test func payloadCodesAreAuditedOnUnwrapOnly() {
+        auditOperationFailed(.wrap, service: "audit.test.wraponly", code: -10)
+        #expect(Self.records(containing: "audit.test.wraponly").isEmpty)
+        for code: Int32 in [-11, -16, -10, -12] {
+            auditOperationFailed(.unwrap, service: "audit.test.integrity", code: code)
+        }
+        let records = Self.records(containing: "audit.test.integrity")
+        #expect(records.count == 4)
+        #expect(records.allSatisfy { $0.hasPrefix("[warning] event=2003 op=hkdfguard_unwrap_dek ") }, "\(records)")
+    }
+
+    @Test func quotingKeepsEveryValueOnOneLine() {
+        #expect(auditQuote(Array("plain/path.key".utf8)) == "\"plain/path.key\"")
+        #expect(auditQuote(Array("a\"b\\c".utf8)) == "\"a\\x22b\\x5cc\"")
+        #expect(auditQuote(Array("line\nbreak".utf8)) == "\"line\\x0abreak\"", "no forged second record")
+        #expect(auditQuote([0x63, 0x61, 0x66, 0xC3, 0xA9, 0xFF]) == "\"caf\\xc3\\xa9\\xff\"")
+    }
+
+    @Test func aPlaintextKeyFileIsAuditedByPath() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard-audit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("plain.key")
+        try Data(repeating: 0x41, count: 32).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+
+        var out = [UInt8](repeating: 0, count: 146)
+        var outLen: Int32 = 146
+        let rc = out.withUnsafeMutableBufferPointer { hkdfguard_open_file(pathPtr: file.path, outPtr: $0.baseAddress, outLen: &outLen) }
+        #expect(rc == -37)
+        let record = Self.last(file.lastPathComponent)
+        #expect(record.hasPrefix("[error] event=2006 op=hkdfguard_open_file result=FILE_PLAINTEXT_KEY(-37) path=\"\(file.path)\" "), "\(record)")
+    }
+
+    @Test func otherOpenFileFailuresAreNotAudited() {
+        var out = [UInt8](repeating: 0, count: 146)
+        var outLen: Int32 = 146
+        let missing = "/nonexistent/hkdfguard-audit-quiet/absent.key"
+        _ = out.withUnsafeMutableBufferPointer { hkdfguard_open_file(pathPtr: missing, outPtr: $0.baseAddress, outLen: &outLen) }
+        #expect(Self.records(containing: "hkdfguard-audit-quiet").isEmpty)
+    }
+
+    @Test func setupCallsWarnExactlyOnceAfterTen() {
+        var counter = SetupCallCounter()
+        let fired = (1...25).map { _ in counter.record() }
+        #expect(fired.filter { $0 }.count == 1)
+        #expect(fired.firstIndex(of: true) == 10, "on the 11th call")
+    }
+
+    @Test func theSetupCallRecordIsAWarningWith2007() {
+        let before = Self.records(containing: "event=2007 ").count
+        auditSetupCallsExceeded()
+        let records = Self.records(containing: "event=2007 ")
+        #expect(records.count == before + 1)
+        #expect(records.last?.hasPrefix("[warning] event=2007 calls=10 ") == true, "\(records)")
     }
 }
