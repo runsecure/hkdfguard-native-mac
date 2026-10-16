@@ -183,7 +183,10 @@ extern "C" {
 //
 // The payload format below is macOS's own. Like the Linux and Windows
 // libraries, this one shares the function names and signatures, status
-// codes, flags, and call semantics -- not the payload format, which is
+// codes, flags, and call semantics. Two functions here are macOS-only, with
+// no Linux or Windows counterpart, so a cross-platform caller must not rely
+// on them: hkdfguard_keychain_mode and hkdfguard_kek_fingerprint. Not shared
+// either: the payload format, which is
 // per-platform (Linux's is ECDH/HKDF-SHA512/AES-256-GCM with a version byte,
 // 132..276 bytes). HKDFGUARD_WRAPPED_MAX_LEN has the same name everywhere
 // and a per-platform value. A payload is only ever opened on the Mac whose
@@ -322,7 +325,7 @@ int hkdfguard_harden_process(void);
 // flag is never silently ignored); or HKDFGUARD_ERR_PROCESS_HARDENING_FAILED.
 int hkdfguard_harden_process_with_flags(unsigned int flags);
 
-// Writes 0 (legacy login keychain) or 1 (data-protection keychain) to
+// macOS-only. Writes 0 (legacy login keychain) or 1 (data-protection keychain) to
 // `*out_mode` -- see "Keychain mode" above.
 int32_t hkdfguard_keychain_mode(
     int32_t* HKDFGUARD_NONNULL out_mode);
@@ -341,7 +344,7 @@ int32_t hkdfguard_kek_exists(
     const char* HKDFGUARD_NONNULL service,
     int32_t* HKDFGUARD_NONNULL out_exists);
 
-// Writes the 32-byte fingerprint (SHA-256 of the KEK's raw public key) of
+// macOS-only. Writes the 32-byte fingerprint (SHA-256 of the KEK's raw public key) of
 // the KEK for `service` to `out` -- the same value embedded at the front of
 // every payload wrapped under it. Public-key material, not a secret. Lets an
 // operator record which KEK a service uses after provisioning, and confirm

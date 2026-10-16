@@ -140,12 +140,24 @@ func hkdfguard_kek_fingerprint(
 // code-signing entitlements. Printed by both commands because a service's
 // provisioner and its consumers must agree on it; see the header.
 // Opt-in process hardening: core dumps off, debugger attachment denied. The
-// tool calls it before reading anything, as the Linux tool does. Advisory
-// about the executable's own code signature (flags 0): a `swift build`
-// development binary isn't Hardened-Runtime signed, and the library only
-// logs that.
+// tool calls it before reading anything, as the Linux tool does.
+//
+// How strict it is about the executable's own code signature depends on
+// the build. A distribution build -- build-dist.sh compiles with
+// HKDFGUARD_STRICT_HARDENING, for the bare CLI always and for the app's
+// CLI when exported for developer-id -- is signed with the Hardened Runtime
+// and no get-task-allow, so it passes
+// HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE: a shipped CLI whose
+// signature somehow lost that protection refuses to handle a DEK. Every
+// other build (`swift build`, the tests, a local Xcode build) is advisory:
+// its development signature is only logged.
 @_silgen_name("hkdfguard_harden_process")
 func hkdfguard_harden_process() -> Int32
+
+@_silgen_name("hkdfguard_harden_process_with_flags")
+func hkdfguard_harden_process_with_flags(_ flags: UInt32) -> Int32
+
+let hardenRequireProtectedSignature: UInt32 = 0x1 // HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE
 
 @_silgen_name("hkdfguard_keychain_mode")
 func hkdfguard_keychain_mode(_ outMode: UnsafeMutablePointer<Int32>?) -> Int32
@@ -214,7 +226,7 @@ enum HKDFGuardStatus: Int32 {
         case .kekNotFound: return "no key exists yet for this service -- call hkdfguard_create_kek first"
         case .keychainAccessDenied: return "the keychain denied access (locked, no UI session, access prompt declined, or missing entitlement) -- a key for this service may already exist"
         case .kekCorrupted: return "a keychain item exists for this service but could not be reconstructed into a usable key"
-        case .processHardeningFailed: return "the process could not be hardened (core dumps or debugger attachment could not be disabled, or a debugger is already attached)"
+        case .processHardeningFailed: return "the process could not be hardened (core dumps or debugger attachment could not be disabled, a debugger is already attached, or a distribution build's code signature lets other processes debug it)"
         case .fileNotFound: return "the key file does not exist"
         case .fileAccessDenied: return "this process may not read the key file"
         case .fileIO: return "the key file is not a regular file, or reading it failed"
@@ -1597,9 +1609,15 @@ func runOrExit(_ body: () throws -> Void) -> Never {
 // Before anything is read: this process holds a plaintext DEK, so it must
 // not be dumpable or debuggable by other processes of the same user. Refuse
 // to run rather than handle a DEK unprotected -- the Linux tool's rule.
+#if HKDFGUARD_STRICT_HARDENING
+let hardenStatus = hkdfguard_harden_process_with_flags(hardenRequireProtectedSignature)
+let hardenHint = " -- this distribution build must be signed with the Hardened Runtime and without get-task-allow"
+#else
 let hardenStatus = hkdfguard_harden_process()
+let hardenHint = ""
+#endif
 guard hardenStatus == HKDFGuardStatus.success.rawValue else {
-    FileHandle.standardError.write("error: \(describeStatus(hardenStatus)); refusing to handle key material\n".data(using: .utf8)!)
+    FileHandle.standardError.write("error: \(describeStatus(hardenStatus))\(hardenHint); refusing to handle key material\n".data(using: .utf8)!)
     exit(1)
 }
 

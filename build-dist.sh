@@ -318,15 +318,21 @@ build_arch() {
     # A dedicated --scratch-path: SwiftPM caches the evaluated manifest (and
     # therefore the linker flags derived from HKDFGUARD_DYLIB_DIR) per
     # scratch directory, so a plain `swift build` can't bleed into this one.
+    # HKDFGUARD_STRICT_HARDENING: this CLI is signed below with the
+    # Hardened Runtime and no entitlements, so it can require that of itself
+    # (HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE). The --help smoke test
+    # after signing proves it does start.
     HKDFGUARD_DYLIB_DIR="$dylib_dir" swift build -c release \
         --arch "$arch" \
         --package-path "$CLI_PKG" \
-        --scratch-path "$scratch"
+        --scratch-path "$scratch" \
+        -Xswiftc -DHKDFGUARD_STRICT_HARDENING
     local cli_bin_dir
     cli_bin_dir="$(HKDFGUARD_DYLIB_DIR="$dylib_dir" swift build -c release \
         --arch "$arch" \
         --package-path "$CLI_PKG" \
         --scratch-path "$scratch" \
+        -Xswiftc -DHKDFGUARD_STRICT_HARDENING \
         --show-bin-path)"
     [ -f "$cli_bin_dir/hkdfguard" ] || fail "expected CLI at $cli_bin_dir/hkdfguard"
 
@@ -408,6 +414,15 @@ build_app() {
     echo
     echo "==================== osx-arm64-app ($APP_NAME, export: $APP_EXPORT) ===================="
 
+    # A developer-id export carries no get-task-allow, so its CLI can require
+    # a protected signature of itself (see main.swift); a debugging export
+    # is development-signed and stays advisory. The smoke test after
+    # stapling proves the strict build starts.
+    local strict_conditions=()
+    if [ "$APP_EXPORT" = "developer-id" ]; then
+        strict_conditions=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) HKDFGUARD_STRICT_HARDENING')
+    fi
+
     echo "==> Archiving $APP_SCHEME (Release, arm64, team $TEAM_ID)"
     xcodebuild archive \
         -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
@@ -418,7 +433,8 @@ build_app() {
         -allowProvisioningUpdates \
         ${XCODE_AUTH_ARGS[@]+"${XCODE_AUTH_ARGS[@]}"} \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
-        DEVELOPMENT_TEAM="$TEAM_ID"
+        DEVELOPMENT_TEAM="$TEAM_ID" \
+        ${strict_conditions[@]+"${strict_conditions[@]}"}
 
     echo "==> Exporting ($APP_EXPORT)"
     plutil -create xml1 "$options"

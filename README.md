@@ -154,12 +154,15 @@ identically in the library, the CLI, and the Linux and Windows tools.
 Declared in
 [`hkdfguard.h`](HkdfGuardNativeMacOS/hkdfguard.h)
 (plain C; `extern "C"`-guarded; nullability-annotated). All pointers are
-required — a NULL is reported, never dereferenced.
+required — a NULL is reported, never dereferenced — except `out` in a size
+probe (`out = NULL`, `*out_len = 0`), as on Linux. `hkdfguard_keychain_mode`
+and `hkdfguard_kek_fingerprint` are macOS-only; everything else is the C ABI
+shared with Linux and Windows.
 
 ```c
-int32_t hkdfguard_keychain_mode(int32_t* out_mode);          // 0 legacy, 1 data-protection
+int32_t hkdfguard_keychain_mode(int32_t* out_mode);          // macOS-only: 0 legacy, 1 data-protection
 int32_t hkdfguard_kek_exists(const char* service, int32_t* out_exists);
-int32_t hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int32_t* out_len); // 32 bytes, public
+int32_t hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int32_t* out_len); // macOS-only: 32 bytes, public
 int32_t hkdfguard_create_kek(const char* service);            // the only function that creates a KEK
 int32_t hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int32_t dek_len,
                            uint8_t* out, int32_t* out_len);

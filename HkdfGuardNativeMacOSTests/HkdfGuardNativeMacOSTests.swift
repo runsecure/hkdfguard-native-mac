@@ -1140,3 +1140,134 @@ struct HkdfGuardHardenProcessTests {
         #expect(limit.rlim_cur == 0 && limit.rlim_max == 0)
     }
 }
+
+/// Drift guard: the shared C ABI must not drift between this library and
+/// hkdfguard-native-linux, the source of record. Checks the two headers
+/// against each other, and the Swift status enums -- hand-maintained copies
+/// of the table, which is how the codes drifted before -- against the
+/// header. Pure text checks: no keychain or Secure Enclave. Skipped when the
+/// Linux repository isn't checked out next to this one.
+@Suite
+struct HkdfGuardCrossPlatformABITests {
+    static let macRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // HkdfGuardNativeMacOSTests
+        .deletingLastPathComponent() // hkdfguard-native-mac
+    static let macHeader = macRoot.appendingPathComponent("HkdfGuardNativeMacOS/hkdfguard.h")
+    static let linuxHeader = macRoot
+        .deletingLastPathComponent()
+        .appendingPathComponent("hkdfguard-native-linux/include/hkdfguard.h")
+    static let linuxPresent = FileManager.default.fileExists(atPath: linuxHeader.path)
+    static let linuxMissing = Comment(rawValue: "hkdfguard-native-linux is not checked out next to this repository")
+
+    /// The functions only this platform exports, as both headers document.
+    static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_kek_fingerprint"]
+
+    static func read(_ url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// `#define HKDFGUARD_NAME value` -> value, for integer values like `0`,
+    /// `(-17)`, `32`, or `0x1u`.
+    static func defines(in text: String) -> [String: Int] {
+        var result: [String: Int] = [:]
+        let pattern = /(?m)^#define\s+(HKDFGUARD_[A-Z0-9_]+)\s+\(?(-?)(0x[0-9A-Fa-f]+|[0-9]+)u?\)?/
+        for match in text.matches(of: pattern) {
+            let digits = String(match.3)
+            let magnitude = digits.hasPrefix("0x") ? Int(digits.dropFirst(2), radix: 16)! : Int(digits)!
+            result[String(match.1)] = match.2.isEmpty ? magnitude : -magnitude
+        }
+        return result
+    }
+
+    /// Names of the functions a header declares (`int`/`int32_t name(`).
+    static func functions(in text: String) -> Set<String> {
+        let pattern = /(?m)^\s*(?:int|int32_t)\s+(hkdfguard_[a-z_]+)\s*\(/
+        return Set(text.matches(of: pattern).map { String($0.1) })
+    }
+
+    /// The status codes: HKDFGUARD_OK and every HKDFGUARD_ERR_*.
+    static func statusCodes(_ all: [String: Int]) -> [String: Int] {
+        all.filter { $0.key == "HKDFGUARD_OK" || $0.key.hasPrefix("HKDFGUARD_ERR_") }
+    }
+
+    @Test(.enabled(if: linuxPresent, linuxMissing))
+    func statusCodesAndFlagsMatchLinuxExactly() throws {
+        let linux = Self.defines(in: try Self.read(Self.linuxHeader))
+        let mac = Self.defines(in: try Self.read(Self.macHeader))
+
+        let linuxShared = linux.filter { Self.isSharedConstant($0.key) }
+        let macShared = mac.filter { Self.isSharedConstant($0.key) }
+        #expect(!linuxShared.isEmpty, "parsed no constants from the Linux header")
+        for (name, value) in linuxShared.sorted(by: { $0.key < $1.key }) {
+            #expect(macShared[name] == value, "\(name): Linux \(value), macOS \(macShared[name].map(String.init) ?? "missing")")
+        }
+        for name in Set(macShared.keys).subtracting(linuxShared.keys).sorted() {
+            Issue.record("\(name) is defined only in the macOS header: add it to Linux's (the source of record) first")
+        }
+
+        // Same name everywhere, per-platform value.
+        #expect(linux["HKDFGUARD_WRAPPED_MAX_LEN"] != nil && mac["HKDFGUARD_WRAPPED_MAX_LEN"] != nil)
+    }
+
+    /// Constants whose value must be identical on every platform.
+    static func isSharedConstant(_ name: String) -> Bool {
+        name == "HKDFGUARD_OK" || name == "HKDFGUARD_DEK_LEN"
+            || name.hasPrefix("HKDFGUARD_ERR_") || name.hasPrefix("HKDFGUARD_HARDEN_")
+    }
+
+    @Test(.enabled(if: linuxPresent, linuxMissing))
+    func everySharedFunctionIsDeclaredAndOnlyTheDocumentedOnesAreMacOnly() throws {
+        let linux = Self.functions(in: try Self.read(Self.linuxHeader))
+        let mac = Self.functions(in: try Self.read(Self.macHeader))
+        #expect(linux.count >= 8, "parsed too few functions from the Linux header: \(linux.sorted())")
+
+        let missing = linux.subtracting(mac)
+        #expect(missing.isEmpty, "declared on Linux but not macOS: \(missing.sorted())")
+        let extra = mac.subtracting(linux)
+        #expect(extra == Self.macOnlyFunctions, "macOS-only functions are \(extra.sorted()); the headers document \(Self.macOnlyFunctions.sorted())")
+    }
+
+    /// Pairs each `case name = value` in `enumBody` with the HKDFGUARD_*
+    /// name it is labelled with -- in a `///` line above it (the library) or
+    /// a `// ERR_...` comment after it (the CLI).
+    static func labelledCases(in enumBody: Substring) -> [(label: String, value: Int)] {
+        var result: [(String, Int)] = []
+        var pendingLabel: String?
+        for line in enumBody.split(separator: "\n", omittingEmptySubsequences: false) {
+            // The label is the first line of a case's doc comment; later
+            // lines may mention other HKDFGUARD_* names.
+            if pendingLabel == nil, let doc = line.firstMatch(of: /^\s*\/\/\/\s*(HKDFGUARD_[A-Z0-9_]+)/) {
+                pendingLabel = String(doc.1)
+            }
+            guard let match = line.firstMatch(of: /^\s*case\s+\w+\s*=\s*(-?[0-9]+)(?:\s*\/\/\s*([A-Z0-9_]+))?/) else { continue }
+            let label = match.2.map { "HKDFGUARD_" + $0 } ?? pendingLabel
+            if let label { result.append((label, Int(match.1)!)) }
+            pendingLabel = nil
+        }
+        return result
+    }
+
+    static func enumBody(_ source: String, startingAt marker: String) -> Substring? {
+        guard let start = source.range(of: marker),
+              let end = source.range(of: "\n}\n", range: start.upperBound..<source.endIndex)
+        else { return nil }
+        return source[start.upperBound..<end.lowerBound]
+    }
+
+    @Test(arguments: [
+        ("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift", "private enum HKDFGuardStatus: Int32 {"),
+        ("hkdfguard-cli/Sources/hkdfguard/main.swift", "enum HKDFGuardStatus: Int32 {"),
+    ])
+    func swiftStatusEnumsMatchTheHeader(file: String, marker: String) throws {
+        let header = Self.defines(in: try Self.read(Self.macHeader))
+        let source = try Self.read(Self.macRoot.appendingPathComponent(file))
+        let body = try #require(Self.enumBody(source, startingAt: marker), "no \(marker) in \(file)")
+
+        let cases = Self.labelledCases(in: body)
+        let caseCount = body.matches(of: /(?m)^\s*case\s+\w+\s*=/).count
+        #expect(cases.count == caseCount, "\(file): \(caseCount - cases.count) status case(s) carry no HKDFGUARD_* label")
+        for (label, value) in cases {
+            #expect(header[label] == value, "\(file): case labelled \(label) is \(value), the header says \(header[label].map(String.init) ?? "it isn't defined")")
+        }
+    }
+}
