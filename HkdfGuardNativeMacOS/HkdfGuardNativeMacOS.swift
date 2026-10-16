@@ -708,18 +708,6 @@ private func wrapDekCore(
     outPtr: UnsafeMutablePointer<UInt8>,
     outLen: UnsafeMutablePointer<Int32>
 ) -> Int32 {
-    guard dekLen == Int32(hkdfguardDekLength) else {
-        return HKDFGuardStatus.invalidInputLength.rawValue
-    }
-
-    // The output size is a constant, so a too-small buffer is reported here
-    // -- before any keychain lookup or Secure Enclave operation, and without
-    // ever producing a ciphertext the caller cannot receive.
-    guard Int(outLen.pointee) >= hkdfguardWrappedLength else {
-        outLen.pointee = Int32(hkdfguardWrappedLength)
-        return HKDFGuardStatus.outputBufferTooSmall.rawValue
-    }
-
     let (getStatus, maybeEnclaveKey) = getKEK(service: service)
     guard let enclaveKey = maybeEnclaveKey else {
         return getStatus
@@ -1003,11 +991,45 @@ public func hkdfguard_wrap_dek(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    guard let dekPtr, let outPtr, let outLen else {
+    wrapDekChecked(servicePtr: servicePtr, dekPtr: dekPtr, dekLen: dekLen, outPtr: outPtr, outLen: outLen)
+}
+
+/// The argument checks shared by `hkdfguard_wrap_dek` and
+/// `hkdfguard_generate_and_wrap_dek`, in Linux's `wrap_impl` order, then the
+/// wrap itself. Everything here is answered before any keychain lookup or
+/// Secure Enclave operation:
+///
+/// - NULL `dek` or `out_len`, a `dek_len` other than 32, or a negative
+///   capacity: -1.
+/// - An invalid service: -8.
+/// - NULL `out` with a positive capacity (somewhere declared, nowhere to
+///   write): -1.
+/// - A capacity under 146 -- including the 0 of a size probe, which may pass
+///   a NULL `out`: -2 with `*out_len` = 146. The payload size is a constant,
+///   so no ciphertext is ever produced for a caller who can't receive it.
+private func wrapDekChecked(
+    servicePtr: UnsafePointer<CChar>?,
+    dekPtr: UnsafePointer<UInt8>?,
+    dekLen: Int32,
+    outPtr: UnsafeMutablePointer<UInt8>?,
+    outLen: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    guard let dekPtr, let outLen, dekLen == Int32(hkdfguardDekLength) else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    let capacity = outLen.pointee
+    guard capacity >= 0 else {
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
     guard let servicePtr, let service = normalizedService(from: servicePtr) else {
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
+    }
+    guard outPtr != nil || capacity == 0 else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    guard Int(capacity) >= hkdfguardWrappedLength, let outPtr else {
+        outLen.pointee = Int32(hkdfguardWrappedLength)
+        return HKDFGuardStatus.outputBufferTooSmall.rawValue
     }
 
     return wrapDekCore(service: service, dekPtr: dekPtr, dekLen: dekLen, outPtr: outPtr, outLen: outLen)
@@ -1030,13 +1052,8 @@ public func hkdfguard_generate_and_wrap_dek(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    guard let outPtr, let outLen else {
-        return HKDFGuardStatus.invalidInputLength.rawValue
-    }
-    guard let servicePtr, let service = normalizedService(from: servicePtr) else {
-        return HKDFGuardStatus.invalidServiceIdentifier.rawValue
-    }
-    
+    // As on Linux: the DEK is generated first, then every argument is
+    // checked exactly as hkdfguard_wrap_dek checks it.
     guard var dek = generateRandomDek() else {
         return HKDFGuardStatus.encryptionFailed.rawValue
     }
@@ -1044,8 +1061,8 @@ public func hkdfguard_generate_and_wrap_dek(
     defer { secureZero(&dek) }
 
     return dek.withUnsafeBytes { raw -> Int32 in
-        wrapDekCore(
-            service: service,
+        wrapDekChecked(
+            servicePtr: servicePtr,
             dekPtr: raw.bindMemory(to: UInt8.self).baseAddress!,
             dekLen: Int32(dek.count),
             outPtr: outPtr,
@@ -1096,27 +1113,35 @@ private func unwrapDekCore(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    guard let wrappedPtr, let outPtr, let outLen else {
+    // Argument checks in Linux's unwrap_impl order, all before any keychain
+    // lookup or Secure Enclave operation.
+    guard let outLen, let wrappedPtr else {
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
+    let capacity = outLen.pointee
+    guard wrappedLen >= 0, capacity >= 0 else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    guard let servicePtr, let service = normalizedService(from: servicePtr) else {
+        return HKDFGuardStatus.invalidServiceIdentifier.rawValue
+    }
 
-    // The plaintext size is a constant: a too-small buffer is reported
-    // before the payload is even looked at, and so before any keychain
-    // lookup or Secure Enclave operation -- a DEK is never decrypted into
-    // memory for a caller who cannot receive it.
-    guard Int(outLen.pointee) >= hkdfguardDekLength else {
+    // The plaintext size is a constant: a too-small buffer -- including the
+    // 0 of a size probe, which may pass a NULL `out` -- is reported before
+    // the payload is even looked at, so a DEK is never decrypted into memory
+    // for a caller who cannot receive it.
+    guard Int(capacity) >= hkdfguardDekLength else {
         outLen.pointee = Int32(hkdfguardDekLength)
         return HKDFGuardStatus.outputBufferTooSmall.rawValue
+    }
+    guard let outPtr else {
+        return HKDFGuardStatus.invalidInputLength.rawValue // a declared capacity with nowhere to write
     }
 
     // Every payload this library produces is exactly hkdfguardWrappedLength
     // bytes, so anything else is malformed and rejected before it is read.
     guard wrappedLen == Int32(hkdfguardWrappedLength) else {
         return HKDFGuardStatus.payloadMalformed.rawValue
-    }
-
-    guard let servicePtr, let service = normalizedService(from: servicePtr) else {
-        return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
     let storedFingerprint = Data(bytes: wrappedPtr, count: hkdfguardFingerprintLength)
@@ -1173,8 +1198,7 @@ private func unwrapDekCore(
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
 
-    let capacity = Int(outLen.pointee)
-    guard capacity >= plaintext.count else {
+    guard Int(capacity) >= plaintext.count else {
         outLen.pointee = Int32(plaintext.count)
         return HKDFGuardStatus.outputBufferTooSmall.rawValue
     }
@@ -1317,9 +1341,10 @@ private func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool {
 /// `hkdfguard_unwrap_dek`. Never touches the keychain or the Secure
 /// Enclave, and never unwraps anything.
 ///
-/// `*outLen` is the capacity on entry and is written on every return path:
-/// 146 on success or `outputBufferTooSmall` (the required size, reported
-/// before the file is opened), 0 on every other failure. File contents are
+/// `*outLen` is the capacity on entry. It is written only with 146: on
+/// success, and on `outputBufferTooSmall` (the required size, reported
+/// before the file is opened). Every other failure leaves it as the caller
+/// set it, as on Linux and as wrap and unwrap do. File contents are
 /// copied to `out` only on success, so a rejected file — in particular one
 /// holding a plaintext DEK — never reaches the caller's buffer; on any
 /// failure every byte of the declared capacity is zeroed instead, as on
@@ -1340,16 +1365,28 @@ private func openFileCore(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    guard let outPtr, let outLen else {
+    // Argument checks in Linux's open_file_impl order, before the file is
+    // opened. As on Linux (and as wrap and unwrap do), `*out_len` is written
+    // only on success (146) and on buffer-too-small (the size to retry
+    // with); every other failure leaves it as the caller set it.
+    guard let outLen else {
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
-    guard Int(outLen.pointee) >= hkdfguardWrappedLength else {
+    let capacity = outLen.pointee
+    guard capacity >= 0 else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    guard let pathPtr, pathPtr.pointee != 0 else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    // Too small for a payload -- including the 0 of a size probe, which may
+    // pass a NULL `out`: answered without opening the file.
+    guard Int(capacity) >= hkdfguardWrappedLength else {
         outLen.pointee = Int32(hkdfguardWrappedLength)
         return HKDFGuardStatus.outputBufferTooSmall.rawValue
     }
-    outLen.pointee = 0
-    guard let pathPtr, pathPtr.pointee != 0 else {
-        return HKDFGuardStatus.invalidInputLength.rawValue
+    guard let outPtr else {
+        return HKDFGuardStatus.invalidInputLength.rawValue // a declared capacity with nowhere to write
     }
 
     // One byte more than a payload, so a file that grew past the fstat

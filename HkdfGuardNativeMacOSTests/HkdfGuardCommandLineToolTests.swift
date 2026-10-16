@@ -129,7 +129,7 @@ struct HkdfGuardCommandLineToolTests {
         .deletingLastPathComponent() // repo root
 
     private static let dylibPath = repoRoot
-        .appendingPathComponent("build/Release/libhkdfguard_v1.dylib")
+        .appendingPathComponent("build/Release/libhkdfguard.dylib")
         .path
 
     private static let cliPackageDir = repoRoot
@@ -485,7 +485,7 @@ struct HkdfGuardCommandLineToolTests {
 
         let opened = Self.openFile(dekFilePath)
         #expect(opened.status == -37) // fileUnprotectedKey
-        #expect(opened.bytes.isEmpty, "no byte of a plaintext key may reach the caller")
+        #expect(opened.bytes.allSatisfy { $0 == 0 }, "no byte of a plaintext key may reach the caller")
     }
 
     // MARK: - File handling: refuses to clobber, --force overwrites correctly
@@ -853,17 +853,28 @@ struct HkdfGuardCommandLineToolTests {
         #expect(Data(tail) != Data(repeating: 0, count: tail.count), "the partial last chunk was not overwritten")
     }
 
-    @Test func cliRejectsWhitespaceOnlyStdin() throws {
-        let keyFilePath = Self.makeTempFilePath()
-        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+    @Test func cliRejectsEmptyOrWhitespaceOnlyStdin() throws {
+        // Empty, or nothing but the one tolerated trailing newline: no data.
+        // Any other whitespace is input like any other (the Linux tool's
+        // rule), so whitespace-only input is invalid base64.
+        let cases: [(input: String, message: String)] = [
+            ("", "no data on standard input"),
+            ("\n", "no data on standard input"),
+            ("\r\n", "no data on standard input"),
+            (" \t\r\n\n", "not valid base64"),
+        ]
+        for (input, message) in cases {
+            let keyFilePath = Self.makeTempFilePath()
+            defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
 
-        let result = try Self.runCLI(
-            ["wrap", "--key-file-path", keyFilePath, "--service-name", "com.hkdfguard.tests.cli.blank.stdin", "--dek-stdin"],
-            stdin: Data(" \t\r\n\n".utf8)
-        )
-        #expect(result.exitCode == 1)
-        #expect(result.stderr.contains("no data on standard input"), "stderr: \(result.stderr)")
-        #expect(!FileManager.default.fileExists(atPath: keyFilePath))
+            let result = try Self.runCLI(
+                ["wrap", "--key-file-path", keyFilePath, "--service-name", "com.hkdfguard.tests.cli.blank.stdin", "--dek-stdin"],
+                stdin: Data(input.utf8)
+            )
+            #expect(result.exitCode == 1, "\(input.debugDescription)")
+            #expect(result.stderr.contains(message), "\(input.debugDescription): \(result.stderr)")
+            #expect(!FileManager.default.fileExists(atPath: keyFilePath))
+        }
     }
 
     @Test func cliRejectsOversizedDekInputWithoutReadingItAll() throws {
@@ -876,7 +887,7 @@ struct HkdfGuardCommandLineToolTests {
             try? FileManager.default.removeItem(atPath: keyFilePath)
             try? FileManager.default.removeItem(atPath: dekFilePath)
         }
-        let oversized = Data(repeating: UInt8(ascii: "A"), count: 1025)
+        let oversized = Data(repeating: UInt8(ascii: "A"), count: 65) // the Linux tool's 64-byte limit, plus one
         try Self.writeDekFile(oversized, to: dekFilePath)
 
         let fromStdin = try Self.runCLI(
@@ -884,11 +895,11 @@ struct HkdfGuardCommandLineToolTests {
             stdin: oversized
         )
         #expect(fromStdin.exitCode == 1)
-        #expect(fromStdin.stderr.contains("larger than 1024 bytes"), "stderr: \(fromStdin.stderr)")
+        #expect(fromStdin.stderr.contains("longer than 64 bytes"), "stderr: \(fromStdin.stderr)")
 
         let fromFile = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.oversized.dek", "--dek-file", dekFilePath])
         #expect(fromFile.exitCode == 1)
-        #expect(fromFile.stderr.contains("larger than 1024 bytes"), "stderr: \(fromFile.stderr)")
+        #expect(fromFile.stderr.contains("longer than 64 bytes"), "stderr: \(fromFile.stderr)")
 
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
         #expect(!Self.kekItemExists(service: "com.hkdfguard.tests.cli.oversized.dek"))
@@ -909,17 +920,50 @@ struct HkdfGuardCommandLineToolTests {
     }
 
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
-    func cliAcceptsDekInputWithSurroundingWhitespaceAndCRLF() throws {
+    func cliAcceptsDekInputWithOneTrailingCRLF() throws {
         let service = "com.hkdfguard.tests.cli.dek.crlf"
         defer { Self.deleteKEK(service: service) }
         try Self.provision(service: service)
 
         let keyFilePath = Self.makeTempFilePath()
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
-        let padded = Data(("  \t" + Data(Self.randomDEK()).base64EncodedString() + "\r\n\r\n").utf8)
+        let padded = Data((Data(Self.randomDEK()).base64EncodedString() + "\r\n").utf8)
         let result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"], stdin: padded)
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
         #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 146)
+    }
+
+    @Test func cliRejectsDekInputWithAnyPaddingButOneTrailingNewline() throws {
+        // The Linux tool's rule: exactly one trailing "\n" or "\r\n" is
+        // ignored; any other whitespace is part of the input and fails to
+        // decode. Refused before the library is called, so nothing is created.
+        let b64 = Data(Self.randomDEK()).base64EncodedString()
+        for input in [" " + b64, "\t" + b64, b64 + " ", b64 + "\n\n", b64 + "\r\n\r\n", b64 + "\r", " " + b64 + "\n"] {
+            let keyFilePath = Self.makeTempFilePath()
+            defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+            let result = try Self.runCLI(
+                ["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.dek.padding", "--dek-stdin"],
+                stdin: Data(input.utf8)
+            )
+            #expect(result.exitCode == 1, "\(input.debugDescription)")
+            #expect(result.stderr.contains("not valid base64"), "\(input.debugDescription): \(result.stderr)")
+            #expect(!FileManager.default.fileExists(atPath: keyFilePath))
+        }
+    }
+
+    @Test func cliAcceptsDekInputWithNoneOrOneTrailingNewline() throws {
+        // Passes input parsing: whatever the wrap then reports for this
+        // never-provisioned service, it is not about the DEK input.
+        let b64 = Data(Self.randomDEK()).base64EncodedString()
+        for input in [b64, b64 + "\n", b64 + "\r\n"] {
+            let keyFilePath = Self.makeTempFilePath()
+            defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+            let result = try Self.runCLI(
+                ["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.dek.newline", "--dek-stdin"],
+                stdin: Data(input.utf8)
+            )
+            #expect(!result.stderr.contains("--dek-stdin"), "\(input.debugDescription): \(result.stderr)")
+        }
     }
 
     @Test func cliDekFileThatCannotBeOpenedIsReported() throws {

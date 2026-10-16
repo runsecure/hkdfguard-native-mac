@@ -5,7 +5,7 @@
 #
 # The package installs, root:wheel, into /Library/Application Support/HkdfGuard/v1/:
 #
-#   libhkdfguard_v1.dylib          the library
+#   libhkdfguard.dylib          the library
 #   hkdfguard.h                    its C header
 #   hkdfguard        the CLI, legacy keychain mode
 #   hkdfguard.app    the CLI, data-protection keychain mode
@@ -52,7 +52,7 @@ LIB_DIR="$DIST/osx-arm64"
 APP_SRC="$DIST/osx-arm64-app/hkdfguard.app"
 PKG_RES="$ROOT/pkg"
 
-DYLIB_NAME="libhkdfguard_v1.dylib"
+DYLIB_NAME="libhkdfguard.dylib"
 HEADER_NAME="hkdfguard.h"
 CLI_NAME="hkdfguard"
 APP_NAME="hkdfguard.app"

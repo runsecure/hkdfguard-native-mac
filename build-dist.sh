@@ -44,7 +44,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
 CLI_PKG="$ROOT/hkdfguard-cli"
-DYLIB_NAME="libhkdfguard_v1.dylib"
+DYLIB_NAME="libhkdfguard.dylib"
 HEADER="$ROOT/HkdfGuardNativeMacOS/hkdfguard.h"
 
 # Signing identity for every artifact below. Override with

@@ -115,6 +115,27 @@ format precludes it.
 There is no in-band format version. **A change of payload format is
 signalled by adopting a new service name** (and therefore a new KEK).
 
+### Payload formats are per-platform
+
+The macOS, Linux, and Windows libraries share one C ABI: the function names
+and signatures, the status codes, the `HKDFGUARD_*` flags, and what every
+call does. The wrapped payload is not shared. Each platform has its own
+format and size: here, the 146-byte HPKE layout above; on Linux, ECDH
+against a per-payload hashed point, HKDF-SHA512, and AES-256-GCM, with a
+version byte, 132–276 bytes. That's why `HKDFGUARD_WRAPPED_MAX_LEN` has the
+same name everywhere but a per-platform value (146 here). A payload is only
+opened on the Mac whose Secure Enclave KEK wrapped it, so the formats never
+need to interoperate:
+
+- Treat a payload as opaque bytes. Size buffers with
+  `HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
+- Moving a service to another platform means re-wrapping its DEKs there,
+  under that host's KEK. A payload never moves between platforms.
+- The platforms also differ in **who can create a payload**. Here, as
+  described above, anyone holding the KEK's public key can, and the
+  boundary is the key file's ownership. Linux deliberately uses a scheme
+  where only the KEK holder can (see its README).
+
 ## Service names
 
 1–128 bytes, each an ASCII letter, digit, or `.`, not starting with `.` and
@@ -210,16 +231,17 @@ keychain or the Secure Enclave and never unwraps, so the plaintext DEK does
 not pass through it:
 
 ```c
-uint8_t wrapped[146];
+uint8_t wrapped[HKDFGUARD_WRAPPED_MAX_LEN];
 int32_t wrapped_len = sizeof wrapped;
 int32_t status = hkdfguard_open_file("/etc/example/ingest.key", wrapped, &wrapped_len);
 if (status == 0)
     status = hkdfguard_unwrap_dek("com.example.ingest", wrapped, wrapped_len, dek, &dek_len);
 ```
 
-`*out_len` is the capacity on entry (at least 146) and is always written:
-146 — the bytes read — on success, 146 on `outputBufferTooSmall` (checked
-before the file is opened), and 0 on every other failure. The file's bytes
+`*out_len` is the capacity on entry (at least 146). It is set to 146 — the
+bytes read — on success, and to 146 on `outputBufferTooSmall` (checked
+before the file is opened). Every other failure leaves it as the caller set
+it, as on Linux and as wrap and unwrap do. The file's bytes
 reach `out` only on success; on any failure the whole declared capacity of
 `out` is zeroed, as on Linux.
 
@@ -457,10 +479,15 @@ hkdfguard retire --service-name|-sn <name> \
     running the CLI, and grant no access to group or others (mode `0400` or
     `0600`). Every check is made on the opened descriptor, so it describes
     the file that is read.
-  - *Input handling.* The DEK text is read into one fixed-size buffer of at
-    most 1024 bytes (surrounding whitespace, including CRLF, is allowed;
-    anything larger is refused before it is read in full), decoded in
-    place, and zeroed on every exit path; it is never held as a string.
+  - *Input handling (same as the Linux tool).* At most 64 bytes are
+    accepted -- base64 of a 32-byte DEK is 44 characters -- and anything
+    longer is refused before it is read in full. One trailing newline (or
+    CRLF) is ignored and nothing else: leading spaces, trailing spaces, or a
+    second newline make the input invalid base64. Decoding is strict,
+    padded standard base64. The text and the decoded DEK live in one
+    fixed-size buffer locked into memory with `mlock` (a warning is printed
+    if the lock is refused), are never held as a string, and are zeroed on
+    every exit path.
   - *Output file.* Created with POSIX `0600` permissions set at creation
     (owner read/write, nothing for anyone else), then the file and its
     directory entry are flushed to the storage device (`F_FULLFSYNC`)
@@ -539,7 +566,7 @@ hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 | Target / package | Product | Purpose |
 |---|---|---|
 | `HkdfGuardNativeMacOS` | `HkdfGuardNativeMacOS.framework` | Embed in a signed macOS app; carries the public header and an app-sandbox entitlement |
-| `HkdfGuardNativeMacOSDylib` | `libhkdfguard_v1.dylib` | Flat shared library for `dlopen`-based FFI from arbitrary, often unsandboxed, host processes |
+| `HkdfGuardNativeMacOSDylib` | `libhkdfguard.dylib` | Flat shared library for `dlopen`-based FFI from arbitrary, often unsandboxed, host processes |
 | `HkdfGuardNativeMacOSTests` | `.xctest` | Swift Testing suites for the C entry points and for the CLI as a real subprocess |
 | `hkdfguard-cli/` | `hkdfguard` | SwiftPM package for the CLI; links the dylib through its C ABI only. Bare Mach-O → legacy keychain mode |
 | `hkdfguard-app` | `hkdfguard.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
@@ -789,7 +816,7 @@ It installs, all `root:wheel`, into
 `/Library/Application Support/HkdfGuard/v1/`:
 
 ```
-libhkdfguard_v1.dylib          0644   the library
+libhkdfguard.dylib          0644   the library
 hkdfguard.h                    0644   its C header
 hkdfguard        0755   the CLI, legacy keychain mode
 hkdfguard.app           the CLI, data-protection keychain mode
@@ -869,7 +896,7 @@ SIP; `/Users/Shared` and `/tmp` are writable by everyone.
 There is exactly one place to load the library from:
 
 ```
-/Library/Application Support/HkdfGuard/v1/libhkdfguard_v1.dylib
+/Library/Application Support/HkdfGuard/v1/libhkdfguard.dylib
 ```
 
 Load it by that absolute path. Do not search other folders, and do not take
@@ -883,22 +910,22 @@ dylib's code signature against the expected Team ID
 `python`, or `java` host has no library validation of its own.
 
 For C#, route the `DllImport` name to that path with a resolver, so the
-existing `[DllImport("hkdfguard_v1")]` declarations stay unchanged:
+existing `[DllImport("hkdfguard")]` declarations stay unchanged:
 
 ```csharp
 NativeLibrary.SetDllImportResolver(typeof(HkdfGuardInterop).Assembly, (name, assembly, searchPath) =>
-    name == "hkdfguard_v1"
+    name == "hkdfguard"
         ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath()) // the fixed path; checks above
         : IntPtr.Zero);
 ```
 
 Other languages load the same absolute path in place of the
-`./libhkdfguard_v1.dylib` used in the examples below.
+`./libhkdfguard.dylib` used in the examples below.
 
 ## Consuming this library
 
 Every consumer uses the files the installer package puts in
-`/Library/Application Support/HkdfGuard/v1/`: `libhkdfguard_v1.dylib`,
+`/Library/Application Support/HkdfGuard/v1/`: `libhkdfguard.dylib`,
 loaded by that absolute path (see
 [Loading the installed library](#loading-the-installed-library));
 `hkdfguard.h`, for the exact signatures (see [C ABI](#c-abi)); and, for
@@ -945,7 +972,7 @@ prompt at all. It is not required.
 ```python
 import ctypes
 
-lib = ctypes.CDLL("./libhkdfguard_v1.dylib")
+lib = ctypes.CDLL("./libhkdfguard.dylib")
 lib.hkdfguard_create_kek.argtypes = [ctypes.c_char_p]
 lib.hkdfguard_create_kek.restype = ctypes.c_int32
 
@@ -956,7 +983,7 @@ status = lib.hkdfguard_create_kek(b"com.example.ingest")
 
 ```js
 const koffi = require("koffi");
-const lib = koffi.load("./libhkdfguard_v1.dylib");
+const lib = koffi.load("./libhkdfguard.dylib");
 const hkdfguard_create_kek = lib.func("int32_t hkdfguard_create_kek(const char *service)");
 
 const status = hkdfguard_create_kek("com.example.ingest");
@@ -966,7 +993,7 @@ const status = hkdfguard_create_kek("com.example.ingest");
 
 ```java
 public interface HkdfGuard extends Library {
-    HkdfGuard INSTANCE = Native.load("./libhkdfguard_v1.dylib", HkdfGuard.class);
+    HkdfGuard INSTANCE = Native.load("./libhkdfguard.dylib", HkdfGuard.class);
     int hkdfguard_create_kek(String service);
 }
 
@@ -977,7 +1004,7 @@ int status = HkdfGuard.INSTANCE.hkdfguard_create_kek("com.example.ingest");
 
 ```go
 /*
-#cgo LDFLAGS: -L${SRCDIR} -lhkdfguard_v1
+#cgo LDFLAGS: -L${SRCDIR} -lhkdfguard
 #include "hkdfguard.h"
 */
 import "C"
@@ -992,16 +1019,19 @@ non-`cgo` bindings above.)
 **C#** (P/Invoke):
 
 ```csharp
-[DllImport("hkdfguard_v1", CallingConvention = CallingConvention.Cdecl)]
+[DllImport("hkdfguard", CallingConvention = CallingConvention.Cdecl)]
 static extern int hkdfguard_create_kek(string service);
 
 int status = hkdfguard_create_kek("com.example.ingest");
 ```
 
-`hkdfguard_v1` is the platform-neutral library name: .NET resolves it to
-`libhkdfguard_v1.dylib` here by adding the platform's `lib` prefix and
+`hkdfguard` is the platform-neutral library name: .NET resolves it to
+`libhkdfguard.dylib` here by adding the platform's `lib` prefix and
 extension, so the same `DllImport` works wherever the library follows the
-standard naming.
+standard naming -- including Linux, where the same name resolves to
+`libhkdfguard.so`. (Both libraries dropped an earlier `_v1` suffix from the
+name; the ABI's major version is carried by the install folder
+`HkdfGuard/v1/` here and by the `libhkdfguard.so.1` SONAME on Linux.)
 
 ## Signing and entitlements
 

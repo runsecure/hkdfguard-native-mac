@@ -106,7 +106,7 @@ struct HkdfGuardOpenFileTests {
             try Self.write(Array(payload.prefix(length)), to: file)
             let result = Self.openFile(file.path)
             #expect(result.status == -35, "length \(length)")
-            #expect(result.outLen == 0, "length \(length)")
+            #expect(result.outLen == 1024, "length \(length): *out_len left as the caller set it")
             #expect(result.zeroed, "length \(length): out must be zeroed")
         }
     }
@@ -121,7 +121,7 @@ struct HkdfGuardOpenFileTests {
             try Self.write(payload + [UInt8](repeating: 0x41, count: extra), to: file)
             let result = Self.openFile(file.path)
             #expect(result.status == -36, "extra \(extra)")
-            #expect(result.outLen == 0, "extra \(extra)")
+            #expect(result.outLen == 1024, "extra \(extra): *out_len left as the caller set it")
             #expect(result.zeroed, "extra \(extra)")
         }
     }
@@ -153,7 +153,7 @@ struct HkdfGuardOpenFileTests {
             try Self.write(bytes, to: file)
             let result = Self.openFile(file.path)
             #expect(result.status == -37, "\(name)")
-            #expect(result.outLen == 0, "\(name)")
+            #expect(result.outLen == 1024, "\(name): *out_len left as the caller set it")
             #expect(result.zeroed, "\(name): a plaintext key must never reach the caller's buffer")
         }
     }
@@ -242,6 +242,24 @@ struct HkdfGuardOpenFileTests {
     }
 
     // MARK: - Path and file type
+
+    @Test func aSizeProbeWithANullOutReportsTheSizeWithoutOpeningTheFile() {
+        // As on Linux: `out = NULL, *out_len = 0` is -2 with 146, answered
+        // before the path is opened -- so even a missing file gives the size.
+        var len: Int32 = 0
+        #expect(hkdfguard_open_file(pathPtr: "/nonexistent/hkdfguard/probe.key", outPtr: nil, outLen: &len) == -2)
+        #expect(len == Int32(Self.wrappedLength))
+
+        len = 200
+        #expect(hkdfguard_open_file(pathPtr: "/nonexistent/hkdfguard/probe.key", outPtr: nil, outLen: &len) == -1, "NULL out with a positive capacity")
+        #expect(len == 200, "*out_len left as the caller set it")
+
+        var out = [UInt8](repeating: 0, count: 256)
+        len = -1
+        let rc = out.withUnsafeMutableBufferPointer { hkdfguard_open_file(pathPtr: "/nonexistent/hkdfguard/probe.key", outPtr: $0.baseAddress, outLen: &len) }
+        #expect(rc == -1, "negative capacity")
+        #expect(len == -1, "*out_len left as the caller set it")
+    }
 
     @Test func zeroesTheDeclaredOutCapacityOnFailure() throws {
         // A missing file (-32) and a too-small buffer (-2): either way the
@@ -399,7 +417,7 @@ struct HkdfGuardOpenFileTests {
 
         out.withUnsafeMutableBufferPointer { outBuf in
             #expect(hkdfguard_open_file(pathPtr: nil, outPtr: outBuf.baseAddress, outLen: &outLen) == -1)
-            #expect(outLen == 0, "outLen must still be written")
+            #expect(outLen == 1024, "*out_len left as the caller set it, as on Linux")
             outLen = 1024
             #expect(hkdfguard_open_file(pathPtr: "/tmp/x", outPtr: nil, outLen: &outLen) == -1)
             #expect(hkdfguard_open_file(pathPtr: "/tmp/x", outPtr: outBuf.baseAddress, outLen: nil) == -1)

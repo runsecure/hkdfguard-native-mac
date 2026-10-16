@@ -64,7 +64,9 @@
 //
 // For `wrap`, exactly one DEK source is required:
 //   --dek-stdin        base64 DEK read from standard input (e.g. piped from
-//                      the pipeline or a secret store; trailing newline ok).
+//                      the pipeline or a secret store). At most 64 bytes;
+//                      one trailing newline (or CRLF) is ignored, nothing
+//                      else -- the Linux tool's rule, for both sources.
 //   --dek-file <path>  base64 DEK read from a file. It must be a regular
 //                      file (not a symlink, FIFO, or device), owned by root
 //                      or by this process's user, granting no access to
@@ -952,18 +954,11 @@ func wrapDek(service: String, dek: UnsafeRawBufferPointer) throws -> [UInt8] {
 
 // MARK: - Reading the pipeline's DEK
 
-// Upper bound on the DEK input, in bytes. Base64 of a 32-byte DEK is 44
-// characters; this leaves generous room for surrounding whitespace while
-// refusing anything that is clearly not a DEK (a file passed by mistake, an
-// unbounded pipe) before it is ever buffered in full.
-let maxDekInputLength = 1024
-
-// ASCII whitespace that may surround the base64 text (trailing newline from
-// `echo`, CRLF from a Windows-edited file, ...). Interior whitespace is not
-// stripped: the base64 decoder rejects it, as before.
-func isDekInputWhitespace(_ byte: UInt8) -> Bool {
-    byte == 0x20 || (0x09...0x0D).contains(byte)
-}
+// Upper bound on the DEK input, in bytes -- the Linux tool's
+// MAX_DEK_INPUT_LEN. Base64 of a 32-byte DEK is 44 characters; this leaves
+// room for a trailing newline (or CRLF) and little more, so a wrong file or
+// an unbounded pipe fails fast instead of being buffered.
+let maxDekInputLength = 64
 
 // Mode bits that must be clear on a --dek-file: no access at all for group
 // or others.
@@ -1130,14 +1125,20 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
         total += n
     }
     guard total <= maxDekInputLength else {
-        throw CLIError("\(flag): \(what) is larger than \(maxDekInputLength) bytes, which cannot be a base64 DEK")
+        throw CLIError("\(flag): \(what) is longer than \(maxDekInputLength) bytes; expected base64 of a \(dekLen)-byte DEK")
     }
 
+    // Exactly one trailing newline (optionally CRLF) is tolerated, so a file
+    // written by `printf '%s\n'` or an editor still works -- nothing else,
+    // as in the Linux tool: leading or other trailing whitespace is part of
+    // the input and fails to decode.
     let bytes = UnsafeRawBufferPointer(rebasing: input[0..<total])
-    var start = 0
+    let start = 0
     var end = total
-    while start < end && isDekInputWhitespace(bytes[start]) { start += 1 }
-    while end > start && isDekInputWhitespace(bytes[end - 1]) { end -= 1 }
+    if end > start && bytes[end - 1] == 0x0A {
+        end -= 1
+        if end > start && bytes[end - 1] == 0x0D { end -= 1 }
+    }
     guard start < end else {
         if case .stdin = source {
             throw CLIError("\(flag): no data on standard input")

@@ -719,6 +719,65 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(result.status == -8) // invalidServiceIdentifier
     }
 
+    // MARK: - Size probes and argument order (as on Linux)
+
+    @Test func sizeProbesWithANullOutReportTheSizeWithoutTouchingTheKeychain() {
+        // `out = NULL, *out_len = 0`: -2 with the size to allocate. The
+        // service has no KEK, so reaching the keychain would be -17 instead.
+        let service = "com.hkdfguard.tests.size.probe"
+        let dek = Self.randomDEK()
+        let blob = [UInt8](repeating: 0, count: Self.wrappedLength)
+        var len: Int32 = 0
+
+        #expect(dek.withUnsafeBufferPointer { d in service.withCString { hkdfguard_wrap_dek(servicePtr: $0, dekPtr: d.baseAddress, dekLen: 32, outPtr: nil, outLen: &len) } } == -2)
+        #expect(len == Int32(Self.wrappedLength))
+
+        len = 0
+        #expect(service.withCString { hkdfguard_generate_and_wrap_dek(servicePtr: $0, outPtr: nil, outLen: &len) } == -2)
+        #expect(len == Int32(Self.wrappedLength))
+
+        len = 0
+        #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: Int32(b.count), outPtr: nil, outLen: &len) } } == -2)
+        #expect(len == 32)
+        #expect(!Self.kekExists(service: service).exists)
+    }
+
+    @Test func nullOutWithAPositiveCapacityOrANegativeCapacityIsInvalidArgument() {
+        let service = "com.hkdfguard.tests.null.out"
+        let dek = Self.randomDEK()
+        let blob = [UInt8](repeating: 0, count: Self.wrappedLength)
+        var out = [UInt8](repeating: 0, count: 256)
+
+        for capacity: Int32 in [10, 200] {
+            var len = capacity
+            #expect(dek.withUnsafeBufferPointer { d in service.withCString { hkdfguard_wrap_dek(servicePtr: $0, dekPtr: d.baseAddress, dekLen: 32, outPtr: nil, outLen: &len) } } == -1, "wrap, capacity \(capacity)")
+            len = capacity
+            #expect(service.withCString { hkdfguard_generate_and_wrap_dek(servicePtr: $0, outPtr: nil, outLen: &len) } == -1, "generate, capacity \(capacity)")
+        }
+        var len: Int32 = 64
+        #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: Int32(b.count), outPtr: nil, outLen: &len) } } == -1)
+
+        out.withUnsafeMutableBufferPointer { o in
+            var negative: Int32 = -1
+            #expect(dek.withUnsafeBufferPointer { d in service.withCString { hkdfguard_wrap_dek(servicePtr: $0, dekPtr: d.baseAddress, dekLen: 32, outPtr: o.baseAddress, outLen: &negative) } } == -1)
+            negative = -1
+            #expect(service.withCString { hkdfguard_generate_and_wrap_dek(servicePtr: $0, outPtr: o.baseAddress, outLen: &negative) } == -1)
+            negative = -1
+            #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: Int32(b.count), outPtr: o.baseAddress, outLen: &negative) } } == -1)
+            var capacity: Int32 = 64
+            #expect(blob.withUnsafeBufferPointer { b in service.withCString { hkdfguard_unwrap_dek(servicePtr: $0, wrappedPtr: b.baseAddress, wrappedLen: -1, outPtr: o.baseAddress, outLen: &capacity) } } == -1, "negative wrapped_len")
+        }
+    }
+
+    @Test func unwrapChecksTheServiceBeforeTheBufferAndThePayload() {
+        // Linux's order: an invalid service (-8) is reported ahead of a
+        // too-small buffer (-2) and a malformed payload length (-10).
+        let short = [UInt8](repeating: 0, count: 10)
+        #expect(Self.unwrapIntoMarkedBuffer(short, service: "bad-service", allocated: 64, declared: 64).status == -8)
+        #expect(Self.unwrapIntoMarkedBuffer(short, service: "bad-service", allocated: 64, declared: 8).status == -8)
+        #expect(Self.unwrapIntoMarkedBuffer(short, service: "com.hkdfguard.tests.order", allocated: 64, declared: 8).status == -2)
+    }
+
     // MARK: - Zeroing `out` on failure (as on Linux)
 
     /// Calls hkdfguard_unwrap_dek with an `out` of `allocated` bytes filled

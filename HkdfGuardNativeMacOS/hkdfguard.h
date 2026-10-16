@@ -28,16 +28,27 @@ FOUNDATION_EXPORT const unsigned char HkdfGuardNativeMacOSVersionString[];
 
 #include <stdint.h>
 
-// Every pointer parameter below is required. Under clang that is checked
-// at the call site; elsewhere this macro is documentation. At run time a
-// NULL is never dereferenced: it is reported as
-// HKDFGUARD_ERR_INVALID_ARGUMENT, or as HKDFGUARD_ERR_INVALID_SERVICE_NAME
+// Every pointer parameter marked HKDFGUARD_NONNULL is required. Under clang
+// that is checked at the call site; elsewhere these macros are
+// documentation. At run time a NULL is never dereferenced: it is reported
+// as HKDFGUARD_ERR_INVALID_ARGUMENT, or as HKDFGUARD_ERR_INVALID_SERVICE_NAME
 // when it is `service`. A NULL or empty `path` is
 // HKDFGUARD_ERR_INVALID_ARGUMENT.
+//
+// The one HKDFGUARD_NULLABLE pointer is `out` on hkdfguard_wrap_dek,
+// hkdfguard_unwrap_dek, hkdfguard_generate_and_wrap_dek, and
+// hkdfguard_open_file, as on Linux: a size probe passes `out = NULL` with
+// `*out_len = 0` and gets HKDFGUARD_ERR_BUFFER_TOO_SMALL with the size to
+// allocate in `*out_len` (146 for a payload, 32 for a DEK), without the
+// keychain, the Secure Enclave, or the file being touched. A NULL `out` with
+// a positive `*out_len` is HKDFGUARD_ERR_INVALID_ARGUMENT, and so is a
+// negative `*out_len` on any of the four.
 #if defined(__clang__)
 #  define HKDFGUARD_NONNULL _Nonnull
+#  define HKDFGUARD_NULLABLE _Nullable
 #else
 #  define HKDFGUARD_NONNULL
+#  define HKDFGUARD_NULLABLE
 #endif
 
 #ifdef __cplusplus
@@ -51,9 +62,12 @@ extern "C" {
 /* Required length of a DEK, in bytes. */
 #define HKDFGUARD_DEK_LEN 32
 
-/* Length of every wrapped payload this library produces (see "Buffer
- * contract" below). */
-#define HKDFGUARD_WRAPPED_LEN 146
+/* Largest wrapped payload hkdfguard_wrap_dek / hkdfguard_generate_and_wrap_dek
+ * can produce, for any valid service name. A buffer of this size never needs
+ * a retry. Shared name with every platform's header; the value is
+ * per-platform (Linux: 276). On macOS every payload is exactly this long
+ * (see "Buffer contract" below). */
+#define HKDFGUARD_WRAPPED_MAX_LEN 146
 
 /*
  * Status codes returned by every hkdfguard_* function.
@@ -166,6 +180,19 @@ extern "C" {
 // refer to the same KEK. Each distinct service gets its own, independent
 // Secure Enclave key; wrapping under one service and unwrapping under
 // another fails by design.
+//
+// The payload format below is macOS's own. Like the Linux and Windows
+// libraries, this one shares the function names and signatures, status
+// codes, flags, and call semantics -- not the payload format, which is
+// per-platform (Linux's is ECDH/HKDF-SHA512/AES-256-GCM with a version byte,
+// 132..276 bytes). HKDFGUARD_WRAPPED_MAX_LEN has the same name everywhere
+// and a per-platform value. A payload is only ever opened on the Mac whose
+// Secure Enclave KEK wrapped it, so treat it as opaque bytes and never parse
+// it; moving a service to another platform means re-wrapping its DEKs
+// there. The formats also differ in who can CREATE a payload: on macOS
+// (HPKE base mode) anyone holding the KEK's public key can, so the key
+// file's ownership checks are the boundary (see hkdfguard_open_file); on
+// Linux only the KEK holder can.
 //
 // The service name is also how payload-format versions are distinguished:
 // a consumer that changes format adopts a new service name (and therefore
@@ -341,7 +368,7 @@ int32_t hkdfguard_wrap_dek(
     const char* HKDFGUARD_NONNULL service,
     const uint8_t* HKDFGUARD_NONNULL dek,
     int32_t dek_len,
-    uint8_t* HKDFGUARD_NONNULL out,
+    uint8_t* HKDFGUARD_NULLABLE out,
     int32_t* HKDFGUARD_NONNULL out_len
 );
 
@@ -360,7 +387,7 @@ int32_t hkdfguard_unwrap_dek(
     const char* HKDFGUARD_NONNULL service,
     const uint8_t* HKDFGUARD_NONNULL wrapped,
     int32_t wrapped_len,
-    uint8_t* HKDFGUARD_NONNULL out,
+    uint8_t* HKDFGUARD_NULLABLE out,
     int32_t* HKDFGUARD_NONNULL out_len
 );
 
@@ -371,7 +398,7 @@ int32_t hkdfguard_unwrap_dek(
 // sourcing their own randomness. Never creates a KEK.
 int32_t hkdfguard_generate_and_wrap_dek(
     const char* HKDFGUARD_NONNULL service,
-    uint8_t* HKDFGUARD_NONNULL out,
+    uint8_t* HKDFGUARD_NULLABLE out,
     int32_t* HKDFGUARD_NONNULL out_len
 );
 
@@ -400,10 +427,11 @@ int32_t hkdfguard_generate_and_wrap_dek(
 // opened attacker-chosen paths would leak that much about them. Store the
 // file in a directory only its owner can write.
 //
-// `*out_len` is the capacity of `out` on entry (at least 146) and is
-// written on every return: 146 -- the number of bytes read -- on success,
-// 146 on HKDFGUARD_ERR_BUFFER_TOO_SMALL (reported before the file is opened), and
-// 0 on every other failure. The file's bytes are copied to `out` only on
+// `*out_len` is the capacity of `out` on entry (at least 146). It is
+// written with 146 -- the number of bytes read -- on success, and with 146
+// on HKDFGUARD_ERR_BUFFER_TOO_SMALL (reported before the file is opened).
+// Every other failure leaves it as the caller set it, as on Linux and as
+// with hkdfguard_wrap_dek and hkdfguard_unwrap_dek. The file's bytes are copied to `out` only on
 // success; on any failure every byte of the capacity declared in `*out_len`
 // on entry is zeroed instead, as on Linux.
 //
@@ -413,7 +441,7 @@ int32_t hkdfguard_generate_and_wrap_dek(
 // provisioning before unwrapping.
 int32_t hkdfguard_open_file(
     const char* HKDFGUARD_NONNULL path,
-    uint8_t* HKDFGUARD_NONNULL out,
+    uint8_t* HKDFGUARD_NULLABLE out,
     int32_t* HKDFGUARD_NONNULL out_len
 );
 
