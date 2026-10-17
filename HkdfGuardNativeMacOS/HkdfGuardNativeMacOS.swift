@@ -1012,20 +1012,97 @@ struct SetupCallCounter {
 
 private let setupCalls = OSAllocatedUnfairLock(initialState: SetupCallCounter())
 
-/// Called on every setup call that names a valid service.
-func auditNoteSetupCall() {
+/// Called on every setup call that names a valid service, inside the
+/// setup gate (see `gatedSetup`).
+func auditNoteSetupCall(floor: Duration) {
     if setupCalls.withLock({ $0.record() }) {
-        auditSetupCallsExceeded()
+        auditSetupCallsExceeded(floorMs: floor.wholeMilliseconds)
     }
 }
 
-func auditSetupCallsExceeded() {
+func auditSetupCallsExceeded(floorMs: Int64) {
     let calls = auditSetupCallsWarnAt
     auditEmit(
         .warning, .setupCallsExceeded,
-        fields: "calls=\(calls)",
-        message: "more than \(calls) hkdfguard_create_kek / hkdfguard_kek_exists calls in this process; these are meant to run once per application startup -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
+        fields: "calls=\(calls) setup_min_delay_ms=\(floorMs)",
+        message: "more than \(calls) hkdfguard_create_kek / hkdfguard_kek_exists calls in this process; these are meant to run once per application startup, and each costs a Secure Enclave round trip plus at least \(floorMs) ms -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
     )
+}
+
+// MARK: - Setup gate
+
+/// The least wall-clock time each setup call (`hkdfguard_create_kek`,
+/// `hkdfguard_kek_exists`) takes, whatever its outcome -- the Linux and
+/// Windows default. Fixed on macOS: there is no policy file or
+/// administrator setting to tune it (Linux reads
+/// `startup_behavior.setup_min_delay_ms`, Windows
+/// `HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs`).
+///
+/// Setup calls are meant to run once per application startup. Holding
+/// each to a floor, serialized across threads, caps how fast a caller --
+/// a bug looping on them, or code probing which services have a KEK --
+/// can drive the Secure Enclave and keychain through them: at most one
+/// per second per process. And "exists" and "doesn't exist" take the same
+/// time.
+let setupMinDelay: Duration = .milliseconds(1_000)
+
+/// Test-only override of `setupMinDelay`: `nil` (the default, and always
+/// in production) uses `setupMinDelay`. The test suites that make setup
+/// calls set it to zero so their many calls don't each cost a second;
+/// the tests of the floor itself set it explicitly. Internal, so only
+/// `@testable import` can reach it -- never part of the C ABI.
+let setupMinDelayOverrideForTests = OSAllocatedUnfairLock<Duration?>(initialState: nil)
+
+func effectiveSetupMinDelay() -> Duration {
+    setupMinDelayOverrideForTests.withLock { $0 } ?? setupMinDelay
+}
+
+/// Serializes every setup call, so that together with the floor their
+/// aggregate rate is capped regardless of how many threads call in. A
+/// blocking lock rather than an unfair lock: it is held across a keychain
+/// round trip and a sleep.
+private let setupGate = NSLock()
+
+/// Runs `body` (the keychain-touching part of a setup call) under the
+/// setup gate: serialized against every other setup call, and not
+/// returning until at least `effectiveSetupMinDelay()` has passed since
+/// entry -- whatever `body` returned, and however quickly. Argument
+/// validation happens before callers reach this, so a NULL pointer or an
+/// invalid service name still fails immediately; only calls that would
+/// reach the keychain pay the floor. The counterpart of Linux's
+/// `gated_setup` and Windows' `GatedSetup`.
+/// `floor` is a parameter only so the tests of the gate itself can pass
+/// their own without racing other suites over the override.
+func gatedSetup<T>(floor: Duration? = nil, _ body: () -> T) -> T {
+    setupGate.lock()
+    defer { setupGate.unlock() }
+    let clock = ContinuousClock()
+    let entered = clock.now
+    let floor = floor ?? effectiveSetupMinDelay()
+    // Waited out on every exit path, after `body`'s result is in hand.
+    defer {
+        let remaining = floor - (clock.now - entered)
+        if remaining > .zero {
+            Thread.sleep(forTimeInterval: remaining.secondsAsDouble)
+        }
+    }
+
+    let result = body()
+    auditNoteSetupCall(floor: floor)
+    return result
+}
+
+extension Duration {
+    /// Whole milliseconds, truncated.
+    var wholeMilliseconds: Int64 {
+        let (s, attos) = components
+        return s * 1_000 + attos / 1_000_000_000_000_000
+    }
+
+    var secondsAsDouble: Double {
+        let (s, attos) = components
+        return Double(s) + Double(attos) / 1e18
+    }
 }
 
 /// The normalized service name a C caller passed, or nil when it isn't a
@@ -1203,7 +1280,8 @@ public func hkdfguard_keychain_mode(
 /// without creating one — `*outExists` is always written, on every return
 /// path (1 if a valid KEK exists, 0 otherwise, including when the status
 /// isn't `success`, in which case existence couldn't be determined), so
-/// the caller's variable is never left in an undefined state.
+/// the caller's variable is never left in an undefined state. A setup
+/// call: held to `setupMinDelay` and serialized (see `gatedSetup`).
 @_cdecl("hkdfguard_kek_exists")
 public func hkdfguard_kek_exists(
     servicePtr: UnsafePointer<CChar>?,
@@ -1220,8 +1298,7 @@ public func hkdfguard_kek_exists(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    auditNoteSetupCall()
-    let (status, exists) = kekExists(service: service)
+    let (status, exists) = gatedSetup { kekExists(service: service) }
     outExists.pointee = exists ? 1 : 0
     if status != HKDFGuardStatus.success.rawValue {
         auditOperationFailed(.kekExists, service: service, code: status)
@@ -1269,7 +1346,8 @@ public func hkdfguard_kek_fingerprint(
 /// exist. Paired with `hkdfguard_kek_exists` above so a caller can decide
 /// for itself whether creation is needed — e.g. prompting for user
 /// consent, or provisioning on a schedule — rather than have that decision
-/// made implicitly inside a single combined "ensure" call.
+/// made implicitly inside a single combined "ensure" call. A setup call:
+/// held to `setupMinDelay` and serialized (see `gatedSetup`).
 @_cdecl("hkdfguard_create_kek")
 public func hkdfguard_create_kek(
     servicePtr: UnsafePointer<CChar>?
@@ -1278,8 +1356,7 @@ public func hkdfguard_create_kek(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    auditNoteSetupCall()
-    let status = createKEK(service: service)
+    let status = gatedSetup { createKEK(service: service) }
     if status != HKDFGuardStatus.success.rawValue {
         auditOperationFailed(.createKek, service: service, code: status)
     }

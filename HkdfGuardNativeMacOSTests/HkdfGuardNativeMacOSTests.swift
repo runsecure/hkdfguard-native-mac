@@ -74,6 +74,16 @@ import os
 )
 struct HkdfGuardNativeMacOSWrapUnwrapTests {
 
+    /// Every helper below provisions or probes through the exported setup
+    /// calls, which production holds to a 1 s floor each; zero it so the
+    /// suite doesn't spend minutes asleep. Only this suite writes the
+    /// override, and it runs serialized, so the floor test in it
+    /// (`theExportedSetupCallsPayTheFloor`) can set its own and restore
+    /// zero without a race.
+    init() {
+        setupMinDelayOverrideForTests.withLock { $0 = .zero }
+    }
+
     // MARK: - Helpers
 
     private static let dekLength = 32
@@ -893,6 +903,42 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         }
     }
 
+    @Test func theExportedSetupCallsPayTheFloor() {
+        // Through the C entry points, both setup calls are gated -- "doesn't
+        // exist" included -- while argument errors return before the gate.
+        let floor = Duration.milliseconds(300)
+        setupMinDelayOverrideForTests.withLock { $0 = floor }
+        defer { setupMinDelayOverrideForTests.withLock { $0 = .zero } }
+        let clock = ContinuousClock()
+        let service = "com.hkdfguard.tests.floor.\(UInt64.random(in: .min ... .max))"
+        defer { Self.deleteKEK(service: service) }
+
+        var probe: (status: Int32, exists: Bool) = (-1, true)
+        var created: Int32 = -1
+        var elapsed = clock.measure { probe = Self.kekExists(service: service) }
+        #expect(probe.status == 0 && !probe.exists)
+        #expect(elapsed >= floor, "kek_exists for a missing KEK took \(elapsed)")
+        elapsed = clock.measure { created = Self.createKEK(service: service) }
+        #expect(created == 0)
+        #expect(elapsed >= floor, "create_kek took \(elapsed)")
+        elapsed = clock.measure { probe = Self.kekExists(service: service) }
+        #expect(probe.status == 0 && probe.exists)
+        #expect(elapsed >= floor, "kek_exists for an existing KEK took \(elapsed)")
+
+        var exists: Int32 = -1
+        var codes: [Int32] = []
+        elapsed = clock.measure {
+            codes = [
+                hkdfguard_kek_exists(servicePtr: "bad-name", outExists: &exists),
+                hkdfguard_kek_exists(servicePtr: "com.hkdfguard.tests.floor", outExists: nil),
+                hkdfguard_create_kek(servicePtr: "bad_name"),
+                hkdfguard_create_kek(servicePtr: nil),
+            ]
+        }
+        #expect(codes == [-8, -1, -8, -8])
+        #expect(elapsed < floor, "argument errors must not pay the floor; took \(elapsed)")
+    }
+
     @Test func nullPointersAreReportedNotDereferenced() {
         // A NULL from a C caller is a contract violation, but the library
         // must report it -- -1 for buffers/lengths, -8 for the service --
@@ -1420,9 +1466,64 @@ struct HkdfGuardAuditTests {
 
     @Test func theSetupCallRecordIsAWarningWith2007() {
         let before = Self.records(containing: "event=2007 ").count
-        auditSetupCallsExceeded()
+        auditSetupCallsExceeded(floorMs: 1000)
         let records = Self.records(containing: "event=2007 ")
         #expect(records.count == before + 1)
-        #expect(records.last?.hasPrefix("[warning] event=2007 calls=10 ") == true, "\(records)")
+        #expect(records.last?.hasPrefix("[warning] event=2007 calls=10 setup_min_delay_ms=1000 ") == true, "\(records)")
+        #expect(records.last?.contains("plus at least 1000 ms") == true, "\(records)")
+    }
+}
+
+/// The setup gate (`gatedSetup`) on its own, without the Secure Enclave:
+/// each test passes its own floor rather than touching the shared
+/// override, so these run safely alongside the other suites.
+@Suite
+struct HkdfGuardSetupGateTests {
+    @Test func theProductionFloorIsOneSecondAsOnLinuxAndWindows() {
+        #expect(setupMinDelay == .milliseconds(1_000))
+    }
+
+    @Test func aFastCallIsHeldToTheFloor() {
+        let floor = Duration.milliseconds(200)
+        let clock = ContinuousClock()
+        var result = 0
+        let elapsed = clock.measure { result = gatedSetup(floor: floor) { 42 } }
+        #expect(result == 42)
+        #expect(elapsed >= floor, "took \(elapsed)")
+    }
+
+    @Test func aSlowCallPaysNoMoreThanItsOwnTime() {
+        let floor = Duration.milliseconds(100)
+        let clock = ContinuousClock()
+        let elapsed = clock.measure {
+            gatedSetup(floor: floor) { Thread.sleep(forTimeInterval: 0.3) }
+        }
+        #expect(elapsed >= .milliseconds(300))
+        #expect(elapsed < .milliseconds(300) + floor, "the floor is a minimum, not added on top; took \(elapsed)")
+    }
+
+    @Test func aZeroFloorDoesNotWait() {
+        let clock = ContinuousClock()
+        let elapsed = clock.measure { gatedSetup(floor: .zero) { () } }
+        #expect(elapsed < .milliseconds(100), "took \(elapsed)")
+    }
+
+    @Test func callsAreSerializedAcrossThreads() {
+        // Three concurrent callers: never two inside at once, and together
+        // they take at least three floors.
+        let floor = Duration.milliseconds(150)
+        let inside = OSAllocatedUnfairLock(initialState: (now: 0, peak: 0))
+        let clock = ContinuousClock()
+        let elapsed = clock.measure {
+            DispatchQueue.concurrentPerform(iterations: 3) { _ in
+                gatedSetup(floor: floor) {
+                    inside.withLock { $0.now += 1; $0.peak = max($0.peak, $0.now) }
+                    Thread.sleep(forTimeInterval: 0.01)
+                    inside.withLock { $0.now -= 1 }
+                }
+            }
+        }
+        #expect(inside.withLock { $0.peak } == 1)
+        #expect(elapsed >= floor * 3, "took \(elapsed)")
     }
 }

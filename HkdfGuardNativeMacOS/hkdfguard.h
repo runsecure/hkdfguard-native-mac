@@ -340,6 +340,10 @@ int32_t hkdfguard_keychain_mode(
 // yet" (0, *out_exists = 0). Treat it as an error to investigate, not as
 // "safe to create a new one". HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18) means the
 // keychain would not answer; a key may well exist.
+//
+// Subject to the same latency floor and serialization as
+// hkdfguard_create_kek below; "exists" and "doesn't exist" take the same
+// time.
 int32_t hkdfguard_kek_exists(
     const char* HKDFGUARD_NONNULL service,
     int32_t* HKDFGUARD_NONNULL out_exists);
@@ -360,6 +364,15 @@ int32_t hkdfguard_kek_fingerprint(
 // processes: whoever wins the race creates it, everyone else finds it, and
 // all return 0 provided the resulting key can be reconstructed. The only
 // function in this library that creates a key.
+//
+// Deliberately slow: this and hkdfguard_kek_exists are setup calls, meant
+// to run once per application startup, and each takes at least 1000 ms of
+// wall-clock time whatever its outcome (fixed on macOS; the Linux and
+// Windows builds default to the same and let an administrator tune it),
+// and they are serialized with each other across threads. Do not call them
+// per request; call once at startup and then use hkdfguard_wrap_dek /
+// hkdfguard_unwrap_dek. Argument errors (NULL pointer or invalid service
+// name) return immediately.
 int32_t hkdfguard_create_kek(
     const char* HKDFGUARD_NONNULL service);
 

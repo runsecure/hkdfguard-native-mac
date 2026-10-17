@@ -252,7 +252,7 @@ Console.app shows the same records live.
 | 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
 | 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
 | 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
-| 2007 | error | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. Logged once per process. |
+| 2007 | warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls (each held to at least 1000 ms; see [Concurrency](#concurrency)). Logged once per process. |
 
 The unified log has no "warning" level, so Linux's info / warning / error
 are `default` / `error` / `fault` here. `default` is the level the log keeps
@@ -1122,6 +1122,16 @@ name; the ABI's major version is carried by the install folder
 
 ## Concurrency
 
+- `hkdfguard_create_kek` and `hkdfguard_kek_exists` are setup calls, meant
+  to run once per application startup. Each takes at least 1000 ms of
+  wall-clock time whatever its outcome, and they are serialized with each
+  other across threads, so a process can make at most about one per
+  second -- the same floor as the Linux and Windows builds. On macOS it is
+  fixed (Linux reads `startup_behavior.setup_min_delay_ms` from its policy
+  file, Windows `HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs`).
+  A NULL pointer or an invalid service name returns immediately. Call them
+  once at startup, then use `hkdfguard_wrap_dek` / `hkdfguard_unwrap_dek`,
+  which are not gated.
 - `hkdfguard_create_kek` is safe under concurrent first use: the keychain's
   unique index on (service, account) lets exactly one creation win and the
   others load the winner's key.
