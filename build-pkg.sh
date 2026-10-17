@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the signed, notarized installer package from build-dist.sh's output:
 #
-#   dist/hkdfguard-native-macos-v1-<version>-osx-arm64.pkg   (+ .sha256)
+#   dist/hkdfguard-native-macos-<version>-osx-arm64.pkg   (+ .sha256)
 #
 # The package installs, root:wheel, into /Library/Application Support/HkdfGuard/v1/:
 #
@@ -56,7 +56,10 @@ DYLIB_NAME="libhkdfguard.dylib"
 HEADER_NAME="hkdfguard.h"
 CLI_NAME="hkdfguard"
 APP_NAME="hkdfguard.app"
-PKG_ID="com.hkdfguard.native.v1"
+# The package ID macOS records the installation under (pkgutil --pkg-info).
+# Earlier packages used com.hkdfguard.native.v1; postinstall forgets
+# that old receipt, since this package takes over the same files.
+PKG_ID="com.hkdfguard.native"
 INSTALL_LOCATION="/Library/Application Support/HkdfGuard"
 
 fail() { echo "error: $*" >&2; exit 1; }
@@ -84,10 +87,10 @@ if [ -z "$TEAM_ID" ]; then
 fi
 
 if [ "$UNSIGNED" = 1 ]; then
-    OUT_NAME="hkdfguard-native-macos-v1-$VERSION-osx-arm64-UNSIGNED.pkg"
+    OUT_NAME="hkdfguard-native-macos-$VERSION-osx-arm64-UNSIGNED.pkg"
     echo "note: HKDFGUARD_PKG_UNSIGNED=1 -- unsigned, unnotarized; for local layout testing only" >&2
 else
-    OUT_NAME="hkdfguard-native-macos-v1-$VERSION-osx-arm64.pkg"
+    OUT_NAME="hkdfguard-native-macos-$VERSION-osx-arm64.pkg"
     [ -n "$NOTARY_PROFILE" ] || fail "set HKDFGUARD_NOTARY_PROFILE (or HKDFGUARD_PKG_UNSIGNED=1 for a local test build)"
     IDENTITY="${HKDFGUARD_INSTALLER_IDENTITY:-}"
     identities="$(security find-identity -v)"
@@ -216,7 +219,7 @@ DIST_XML="$STAGE/distribution.xml"
 cat >"$DIST_XML" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-    <title>HkdfGuard Native v1</title>
+    <title>HkdfGuard Native</title>
     <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
     <allowed-os-versions>

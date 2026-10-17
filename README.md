@@ -801,7 +801,7 @@ HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary \
 ./build-dist.sh
 
 HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary ./build-pkg.sh
-PKG="hkdfguard-native-macos-v1-${VERSION#v}-osx-arm64.pkg"
+PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"
 
 # The checksum goes in the release notes -- outside the asset, so replacing
 # the package cannot also replace the value it is checked against.
@@ -831,7 +831,7 @@ it.
 
 ### The installer package: `build-pkg.sh`
 
-Builds `dist/hkdfguard-native-macos-v1-<version>-osx-arm64.pkg` and its
+Builds `dist/hkdfguard-native-macos-<version>-osx-arm64.pkg` and its
 `.sha256` from `build-dist.sh`'s output. The version is the app's
 `CFBundleShortVersionString`, i.e. `MARKETING_VERSION` in the Xcode project —
 the one place it is set.
@@ -897,12 +897,12 @@ Check the package against the release notes, then install it:
 
 ```sh
 VERSION=v0.9.0
-PKG="hkdfguard-native-macos-v1-${VERSION#v}-osx-arm64.pkg"
+PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"
 gh release download "$VERSION" --pattern "$PKG"
 shasum -a 256 "$PKG"                      # must match the release notes
 pkgutil --check-signature "$PKG"          # Developer ID Installer: <Name> (<TEAMID>); notarized
 sudo installer -pkg "$PKG" -target /
-pkgutil --pkg-info com.hkdfguard.native.v1   # the receipt, with the installed version
+pkgutil --pkg-info com.hkdfguard.native      # the receipt, with the installed version
 ```
 
 Double-clicking the package in Finder works too. For a fleet, upload the
@@ -912,7 +912,12 @@ themselves. Installing a newer package over an older one upgrades `v1/` in
 place. Installer does not refuse an *older* package over a newer one — it
 replaces `v1/` as a whole, so the result is a consistent downgrade, not a
 mix — so have the MDM policy or the operator compare
-`pkgutil --pkg-info com.hkdfguard.native.v1` first.
+`pkgutil --pkg-info com.hkdfguard.native` first.
+
+Earlier packages used the package ID `com.hkdfguard.native.v1`. The current
+package installs over one of those normally and forgets the old receipt, so
+afterwards `pkgutil` lists only `com.hkdfguard.native`. MDM policies that
+check the installed version should look for the new ID, or for either.
 
 ### The `PATH` symlink
 
