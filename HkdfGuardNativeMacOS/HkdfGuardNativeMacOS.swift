@@ -256,8 +256,8 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: the payload's suite byte names a
     /// ciphersuite this build does not implement — a payload written by a
     /// newer or different build, not a tampered one. Returned by
-    /// hkdfguard_unwrap_dek and hkdfguard_open_file before any keychain or
-    /// Secure Enclave work.
+    /// hkdfguard_unwrap_dek before any keychain or Secure Enclave work
+    /// (hkdfguard_open_file reports the same file as `fileMalformed`, -38).
     case unsupportedCiphersuite = -12
 
     // MARK: KEK
@@ -314,11 +314,10 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// can't be read by this process (`EACCES`, `EPERM`).
     case fileAccessDenied = -33
 
-    /// HKDFGUARD_ERR_FILE_IO: the path names a symbolic link, directory,
-    /// FIFO, socket, or device rather than a regular file, or `open`,
-    /// `fstat`, or `read` failed for any other reason. A symlink is refused
-    /// rather than followed (`O_NOFOLLOW`), and a FIFO is opened non-blocking
-    /// so it can't hang the caller.
+    /// HKDFGUARD_ERR_FILE_IO: the path names a directory, FIFO, socket, or
+    /// device rather than a regular file, or `open`, `fstat`, or `read`
+    /// failed for any other reason. A FIFO is opened non-blocking so it
+    /// can't hang the caller. (A symbolic link is `fileInsecure`.)
     case fileIO = -34
 
     /// HKDFGUARD_ERR_FILE_TOO_SHORT: fewer bytes than a wrapped payload —
@@ -341,20 +340,24 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     case fileUnprotectedKey = -37
 
     /// HKDFGUARD_ERR_FILE_MALFORMED: exactly the payload's length, but not a
-    /// payload: its KEK fingerprint is all zeros.
+    /// payload this build can read: its KEK fingerprint is all zeros, or its
+    /// suite byte names a construction this build does not implement. As on
+    /// Linux and Windows, every format problem in a key file is this one
+    /// code; hkdfguard_unwrap_dek, given the same bytes, reports the suite
+    /// as `unsupportedCiphersuite` (-12).
     case fileMalformed = -38
 
-    /// HKDFGUARD_ERR_FILE_UNTRUSTED: the file is owned by someone other than
-    /// this process's effective user or root, is writable by group or
-    /// others, or has more than one hard link; or a folder above it, up to
-    /// `/`, is owned by someone else or writable by group or others without
-    /// being sticky (see `keyFileFoldersAreTrusted`) — so a party other than
-    /// its owner could have replaced its contents, renamed another file over
-    /// it, or linked an older payload into its place. Root is accepted so an administrator or MDM can
-    /// deploy key files a service account reads; root can already alter
-    /// anything on the machine, so this adds no new party who could tamper
-    /// with the file. The CLI's `wrap` writes owner-only, 0600, one link,
-    /// which always passes.
+    /// HKDFGUARD_ERR_FILE_UNTRUSTED: the path's last component is a symbolic
+    /// link (refused, never followed: `O_NOFOLLOW`), or the file is owned by
+    /// someone other than this process's effective user or root, or is
+    /// writable by group or others; or a folder above it, up to `/`, is
+    /// owned by someone else or writable by group or others without being
+    /// sticky (see `keyFileFoldersAreTrusted`) — so a party other than its
+    /// owner could have replaced its contents or renamed another file over
+    /// it. Root is accepted so an administrator or MDM can deploy key files
+    /// a service account reads; root can already alter anything on the
+    /// machine, so this adds no new party who could tamper with the file.
+    /// The CLI's `wrap` writes owner-only, 0600, which always passes.
     case fileInsecure = -39
 
     // MARK: macOS-specific — each refines HKDFGUARD_ERR_PROVIDER_ERROR (-4).
@@ -1715,11 +1718,14 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
         return .fileNotFound
     case EACCES, EPERM:
         return .fileAccessDenied
+    case ELOOP:
+        // O_NOFOLLOW found a symbolic link as the final component (or the
+        // path loops through links): a link is refused as untrusted, as the
+        // Windows build refuses any reparse point -- not as an I/O failure.
+        return .fileInsecure
     default:
-        // Including ELOOP (O_NOFOLLOW found a symbolic link as the final
-        // component, or the path loops) and EOPNOTSUPP (the path names a
-        // socket): HKDFGUARD_ERR_FILE_IO covers "not a regular file" and
-        // "could not be read" alike.
+        // Including EOPNOTSUPP (the path names a socket): HKDFGUARD_ERR_FILE_IO
+        // covers "not a regular file" and "could not be read" alike.
         return .fileIO
     }
 }
@@ -1818,15 +1824,18 @@ private func readWrappedFile(
     guard info.st_mode & S_IFMT == S_IFREG else {
         return (.fileIO, 0)
     }
-    // Same rules the CLI's `wrap` writes to (0600, one link) and the
-    // install scripts apply to the library itself: nobody but the owner can
-    // have put these bytes here, and the owner is either this user or root
-    // (an admin- or MDM-deployed file; root can alter anything anyway). A
-    // file linked in from elsewhere (st_nlink > 1) could be an older payload
-    // replayed.
+    // Same rules the CLI's `wrap` writes to (0600) and the install scripts
+    // apply to the library itself: nobody but the owner can have put these
+    // bytes here, and the owner is either this user or root (an admin- or
+    // MDM-deployed file; root can alter anything anyway).
+    //
+    // A file with more than one hard link is accepted, as on Linux and
+    // Windows. Another name for the file only matters if someone could use
+    // it to put an older payload where the service looks -- and that takes
+    // creating an entry in the key's own folder, which
+    // `keyFileFoldersAreTrusted` below limits to the owner and root.
     guard info.st_uid == geteuid() || info.st_uid == 0,
-          info.st_mode & (S_IWGRP | S_IWOTH) == 0,
-          info.st_nlink == 1 else {
+          info.st_mode & (S_IWGRP | S_IWOTH) == 0 else {
         return (.fileInsecure, 0)
     }
     // And the folders that decide what the path names, as on Linux --
@@ -2056,16 +2065,17 @@ private func openFileCore(
 
     // Structural checks only -- authenticity is the AEAD's job at unwrap.
     // A SHA-256 fingerprint of all zeros does not occur in practice (checked
-    // first, so an all-zero file is "malformed", not "newer suite"), and the
-    // suite byte must be one this build implements. The salt, nonce and
-    // ciphertext are random-looking by design; nothing more can be checked
-    // without the KEK.
+    // first), and the suite byte must be one this build implements. Either
+    // failure is `fileMalformed`, as Linux and Windows report every format
+    // problem in a key file; unwrap, given the same bytes, still names an
+    // unknown suite specifically (-12). The salt, nonce and ciphertext are
+    // random-looking by design; nothing more can be checked without the KEK.
     let fingerprint = buffer[0..<hkdfguardFingerprintLength]
     guard fingerprint.contains(where: { $0 != 0 }) else {
         return HKDFGuardStatus.fileMalformed.rawValue
     }
     guard buffer[hkdfguardSuiteIdOffset] == hkdfguardSuiteId else {
-        return HKDFGuardStatus.unsupportedCiphersuite.rawValue
+        return HKDFGuardStatus.fileMalformed.rawValue
     }
 
     buffer.withUnsafeBytes { raw in

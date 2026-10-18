@@ -48,8 +48,9 @@
 //       ( --dek-stdin | --dek-file <path> ) \
 //       [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]
 //
-// `provision` is idempotent: a second run against the same service reports
-// that the KEK already exists and exits 0.
+// `provision` is idempotent: a second run against the same service verifies
+// the existing KEK (hkdfguard_create_kek loads and rebuilds it), reports
+// "already provisioned ...; verified", and exits 0.
 //
 // `wrap` always prints the fingerprint of the KEK the payload was actually
 // wrapped under (bytes 0-31 of the payload the library returned), and with
@@ -64,14 +65,17 @@
 //
 // For `wrap`, exactly one DEK source is required:
 //   --dek-stdin        base64 DEK read from standard input (e.g. piped from
-//                      the pipeline or a secret store). At most 64 bytes;
-//                      one trailing newline (or CRLF) is ignored, nothing
-//                      else -- the Linux tool's rule, for both sources.
+//                      the pipeline or a secret store), never from an
+//                      interactive terminal. At most 64 bytes; one
+//                      trailing newline (or CRLF) and a leading UTF-8 BOM
+//                      are ignored, nothing else, and UTF-16 is refused --
+//                      the Linux tool's rules, for both sources.
 //   --dek-file <path>  base64 DEK read from a file. It must be a regular
 //                      file (not a symlink, FIFO, or device), owned by root
 //                      or by this process's user, granting no access to
-//                      group or others (mode 0400/0600) -- the Linux tool's
-//                      rule (see openDekFile).
+//                      group or others (mode 0400/0600), and not reached
+//                      through a symlinked folder -- the Linux tool's rule
+//                      (see openDekFile, requireRealFolder).
 //
 // There is deliberately no way to pass the DEK itself as a command-line
 // argument: an argv value is visible to every other process on the host
@@ -667,21 +671,27 @@ func validateServiceCharset(_ service: String) throws {
 //
 // This is the only place in the tool that calls either function: `wrap`
 // never checks for or creates a KEK.
+// `provision`: the only place the setup calls are made. Always calls
+// hkdfguard_create_kek, whether or not the KEK exists, as the Linux and
+// Windows tools do: for an existing KEK that call loads the keychain item
+// and rebuilds the Secure Enclave key from it, so an item that exists but
+// can't be used (kekCorrupted, -19; an access denial, -18) fails here at
+// deployment rather than at the first wrap. kek_exists is still asked
+// first, only to report the outcome precisely -- "provisioned" versus
+// "already provisioned". Neither call changes an existing KEK. Returns
+// whether the KEK was newly created.
 func provisionKEK(service: String) throws -> Bool {
     var exists: Int32 = 0
     let existsStatus = service.withCString { hkdfguard_kek_exists($0, &exists) }
     guard existsStatus == HKDFGuardStatus.success.rawValue else {
         throw CLIError("hkdfguard_kek_exists failed: \(describeStatus(existsStatus))")
     }
-    if exists != 0 {
-        return false
-    }
 
     let createStatus = service.withCString { hkdfguard_create_kek($0) }
     guard createStatus == HKDFGuardStatus.success.rawValue else {
-        throw CLIError("hkdfguard_create_kek failed: \(describeStatus(createStatus))")
+        throw CLIError("hkdfguard_create_kek failed for service \"\(service)\": \(describeStatus(createStatus))")
     }
-    return true
+    return exists == 0
 }
 
 // The fingerprint of the KEK `service` resolves to, or the library's status
@@ -1027,6 +1037,82 @@ let maxDekInputLength = 64
 // or others.
 let forbidGroupOtherAccess: mode_t = 0o077
 
+// The folder `path` is named in must be a real folder at the place spelled:
+// no symbolic link anywhere in it, as the Linux tool requires (and as the
+// Windows tool refuses junctions). O_NOFOLLOW and O_EXCL only guard the
+// last component, so without this a symlinked folder above the path is
+// followed silently -- and whoever can plant one where the operator writes
+// could redirect an (often root) `wrap --force` into overwriting and
+// deleting a file in another folder, or make `--dek-file` read a DEK they
+// put somewhere else.
+//
+// One difference from Linux, for macOS's own layout: /tmp, /var and /etc
+// are symbolic links into /private. A link is accepted when only root can
+// have made it or can change it -- owned by root, in a root-owned folder no
+// one else can write -- and is followed to its real folder. Any other link
+// is refused.
+//
+// Returns the real path (folders resolved, `.` and `..` removed as text),
+// and callers use *that* for every filesystem call that follows, so the
+// kernel reaches exactly the folder that was checked. `what` names the
+// path in messages.
+func requireRealFolder(_ path: String, what: String) throws -> String {
+    var components: [String] = []
+    let absolute = path.hasPrefix("/") ? path : FileManager.default.currentDirectoryPath + "/" + path
+    for part in absolute.split(separator: "/", omittingEmptySubsequences: true) {
+        switch part {
+        case ".": continue
+        case "..": if !components.isEmpty { components.removeLast() }
+        default: components.append(String(part))
+        }
+    }
+    guard let leaf = components.popLast() else {
+        throw CLIError("\(what) \(path) has no file name")
+    }
+
+    var current = "/"
+    for name in components {
+        let candidate = current == "/" ? "/" + name : current + "/" + name
+        var st = stat()
+        guard lstat(candidate, &st) == 0 else {
+            throw CLIError("failed to resolve the folder of \(what) \(path): \(candidate): \(String(cString: strerror(errno)))")
+        }
+        switch st.st_mode & S_IFMT {
+        case S_IFDIR:
+            current = candidate
+        case S_IFLNK:
+            var parent = stat()
+            let rootOnly = st.st_uid == 0 && lstat(current, &parent) == 0 && parent.st_uid == 0
+                && parent.st_mode & (S_IWGRP | S_IWOTH) == 0
+            guard rootOnly, let resolved = realpath(candidate, nil) else {
+                throw CLIError("\(what) \(path): the folder \(candidate) is a symbolic link; the path must be a real path with no links in it (macOS's own root-owned links, such as /tmp and /var, are accepted)")
+            }
+            current = String(cString: resolved)
+            free(resolved)
+            var target = stat()
+            guard lstat(current, &target) == 0, target.st_mode & S_IFMT == S_IFDIR else {
+                throw CLIError("\(what) \(path): \(candidate) does not lead to a folder")
+            }
+        default:
+            throw CLIError("\(what) \(path): \(candidate) is not a folder")
+        }
+    }
+    return current == "/" ? "/" + leaf : current + "/" + leaf
+}
+
+// After an open: `fd` must be the file now at `realPath` (see
+// requireRealFolder) -- nothing was swapped between the folder check and
+// the open. Judged by device and inode, as the Linux tool does where
+// /proc isn't available.
+func requireOpenedAt(_ fd: Int32, realPath: String, what: String) throws {
+    var opened = stat()
+    var named = stat()
+    guard fstat(fd, &opened) == 0, lstat(realPath, &named) == 0,
+          opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
+        throw CLIError("\(what) \(realPath) was moved or replaced while it was being opened; refusing to use it")
+    }
+}
+
 // Opens a --dek-file with the same hardening as the Linux tool's
 // read_dek_file: O_NOFOLLOW so a symlink fails the open outright, O_NONBLOCK
 // so a FIFO fails the regular-file check below instead of blocking the open,
@@ -1034,7 +1120,10 @@ let forbidGroupOtherAccess: mode_t = 0o077
 // rather than the path, so nothing can be swapped between the check and the
 // read. The file must be a regular file owned by root or this process's
 // effective user, granting no access to group or others (0400/0600).
-func openDekFile(_ path: String) throws -> Int32 {
+func openDekFile(_ spelledPath: String) throws -> Int32 {
+    // No symbolic link in the folders above it either (see requireRealFolder);
+    // O_NOFOLLOW below covers the file itself.
+    let path = try requireRealFolder(spelledPath, what: "--dek-file")
     let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
     guard fd >= 0 else {
         let err = errno
@@ -1045,6 +1134,7 @@ func openDekFile(_ path: String) throws -> Int32 {
     }
     var ok = false
     defer { if !ok { close(fd) } }
+    try requireOpenedAt(fd, realPath: path, what: "--dek-file")
 
     var st = stat()
     guard fstat(fd, &st) == 0 else {
@@ -1067,61 +1157,79 @@ func openDekFile(_ path: String) throws -> Int32 {
     return fd
 }
 
-// The value of each standard-base64 character (RFC 4648 section 4), or nil.
-func base64Value(_ c: UInt8) -> UInt8? {
-    switch c {
-    case 0x41...0x5A: return c - 0x41      // A-Z
-    case 0x61...0x7A: return c - 0x61 + 26 // a-z
-    case 0x30...0x39: return c - 0x30 + 52 // 0-9
-    case 0x2B: return 62                   // +
-    case 0x2F: return 63                   // /
-    default: return nil
-    }
-}
+// The Linux and Windows tools' messages, word for word.
+//
+// Deliberately fixed: it names no character, offset or bit pattern, so a
+// mistyped DEK never puts part of itself into a log.
+let invalidBase64DekMessage = "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)"
+// A DEK typed or pasted at a terminal is echoed and stays in the scrollback.
+let terminalDekMessage = "refusing to read the DEK from an interactive terminal, where it would be echoed and kept in the scrollback; pipe it in instead, e.g. printf '%s' \"$DEK_B64\" | hkdfguard wrap ... --dek-stdin"
+// The fix is on the sending side, so say what it is.
+let utf16DekMessage = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text (in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)"
 
-// How many bytes `text` decodes to as strict, padded standard base64, or nil
-// if it is not that: the length is a multiple of 4, '=' appears only as the
-// last one or two characters, and the bits padding leaves unused are zero.
-// The rules of the Linux tool's decoder (the base64 crate's STANDARD
-// engine) -- stricter than Foundation's Data(base64Encoded:), which accepts
-// padding mid-text and runs of '='.
-func strictBase64DecodedLength(_ text: UnsafeRawBufferPointer) -> Int? {
-    guard !text.isEmpty, text.count % 4 == 0 else { return nil }
-    var padding = 0
-    if text[text.count - 1] == 0x3D { padding += 1 }
-    if text[text.count - 2] == 0x3D { padding += 1 }
-    let dataEnd = text.count - padding
-    for i in 0..<dataEnd where base64Value(text[i]) == nil {
-        return nil
-    }
-    // The last data character's bits that padding leaves unused must be 0.
-    if padding > 0, let last = base64Value(text[dataEnd - 1]) {
-        let unusedBits: UInt8 = padding == 2 ? 0b1111 : 0b11
-        guard last & unusedBits == 0 else { return nil }
-    }
-    return text.count / 4 * 3 - padding
+// Branch-free helpers for decodeBase64ConstantTime. Every one returns 0 or 1
+// (or a masked value) using wrapping arithmetic on UInt32, with no
+// data-dependent branch or table lookup.
+@inline(__always) func ctEq(_ a: UInt32, _ b: UInt32) -> UInt32 { ((a ^ b) &- 1) >> 31 }
+@inline(__always) func ctInRange(_ c: UInt32, _ lo: UInt32, _ hi: UInt32) -> UInt32 {
+    (((lo &- 1) &- c) & (c &- (hi &+ 1))) >> 31 & 1
 }
+@inline(__always) func ctMask(_ bit: UInt32) -> UInt32 { 0 &- bit }
 
-// Decodes text already accepted by strictBase64DecodedLength into `out`,
-// which must be exactly that many bytes. Writes only into `out`.
-func strictBase64Decode(_ text: UnsafeRawBufferPointer, into out: UnsafeMutableRawBufferPointer) {
+// Decodes strict, padded, standard base64 (RFC 4648 section 4: the `+/`
+// alphabet, a length that is a multiple of 4, `=` only as the last one or
+// two characters, and zero in the bits the padding leaves unused) into
+// `out`, and returns how many bytes it decodes to -- or nil if `text` is
+// not that. The rules of the Linux tool's decoder (base64ct) and the
+// Windows tool's.
+//
+// Constant time with respect to the text, as both of theirs are: the only
+// branches are on its length, which is public; every character is
+// classified and accumulated with mask arithmetic, so how long this takes
+// says nothing about which character, if any, was wrong. Bytes are written
+// to `out` at fixed positions only, up to its size; the caller checks the
+// returned length.
+func decodeBase64ConstantTime(_ text: UnsafeRawBufferPointer, into out: UnsafeMutableRawBufferPointer) -> Int? {
+    let n = text.count
+    guard n > 0, n % 4 == 0 else { return nil }
+
+    let pad1 = ctEq(UInt32(text[n - 1]), 0x3D)        // '=' last
+    let pad2 = ctEq(UInt32(text[n - 2]), 0x3D) & pad1 // and '=' before it
+    var valid: UInt32 = 1
+    var lastValue2: UInt32 = 0 // the value at n-2: the last data character when one '='
+    var lastValue3: UInt32 = 0 // the value at n-3: the last data character when two
     var o = 0
-    var i = 0
-    while i < text.count {
-        var quad: UInt32 = 0
-        var chars = 0
-        for j in 0..<4 {
-            if let v = base64Value(text[i + j]) {
-                quad |= UInt32(v) << (18 - 6 * j)
-                chars += 1
+    var quad: UInt32 = 0
+    for i in 0..<n {
+        let c = UInt32(text[i])
+        let isPad = (ctEq(UInt32(i), UInt32(n - 1)) & pad1) | (ctEq(UInt32(i), UInt32(n - 2)) & pad2)
+        let upper = ctInRange(c, 0x41, 0x5A)
+        let lower = ctInRange(c, 0x61, 0x7A)
+        let digit = ctInRange(c, 0x30, 0x39)
+        let plus = ctEq(c, 0x2B)
+        let slash = ctEq(c, 0x2F)
+        let value = ((c &- 0x41) & ctMask(upper)) | ((c &- (0x61 - 26)) & ctMask(lower))
+            | ((c &+ (52 - 0x30)) & ctMask(digit)) | (62 & ctMask(plus)) | (63 & ctMask(slash))
+        valid &= upper | lower | digit | plus | slash | isPad
+        let v = value & ~ctMask(isPad) & 0x3F // a pad contributes zero bits
+        lastValue2 = (lastValue2 & ~ctMask(ctEq(UInt32(i), UInt32(n - 2)))) | (v & ctMask(ctEq(UInt32(i), UInt32(n - 2))))
+        lastValue3 = (lastValue3 & ~ctMask(ctEq(UInt32(i), UInt32(n - 3)))) | (v & ctMask(ctEq(UInt32(i), UInt32(n - 3))))
+        quad = (quad << 6) | v
+        if i % 4 == 3 { // public: the position, not the data
+            for k in 0..<3 where o < out.count {
+                out[o] = UInt8(truncatingIfNeeded: quad >> (16 - 8 * UInt32(k)))
+                o += 1
             }
+            quad = 0
         }
-        for k in 0..<(chars - 1) where o < out.count {
-            out[o] = UInt8(truncatingIfNeeded: quad >> (16 - 8 * k))
-            o += 1
-        }
-        i += 4
     }
+    // '=' anywhere but the end is not a pad, so it already failed above.
+    // The unused bits: 2 under one '=' (n-2's low 2), 4 under two (n-3's low 4).
+    let oneBad = (pad1 & (pad2 ^ 1)) & (ctEq(lastValue2 & 0x3, 0) ^ 1)
+    let twoBad = pad2 & (ctEq(lastValue3 & 0xF, 0) ^ 1)
+    valid &= (oneBad | twoBad) ^ 1
+    let length = n / 4 * 3 - Int(pad1 + pad2)
+    return valid == 1 ? length : nil
 }
 
 // Reads the base64 DEK for `source`, decodes it, and hands the decoded bytes
@@ -1165,6 +1273,12 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     let what: String
     switch source {
     case .stdin:
+        // A DEK typed or pasted at a terminal is echoed and stays in the
+        // scrollback: refuse a terminal outright rather than read it, as the
+        // Linux and Windows tools do.
+        guard isatty(STDIN_FILENO) != 1 else {
+            throw CLIError(terminalDekMessage)
+        }
         fd = STDIN_FILENO
         what = "standard input"
     case .file(let path):
@@ -1188,6 +1302,11 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
         total += n
     }
     guard total <= maxDekInputLength else {
+        // UTF-16 doubles the text, so it is over the limit long before the
+        // decoder could say why: name it here instead.
+        if total >= 2 && ((input[0] == 0xFF && input[1] == 0xFE) || (input[0] == 0xFE && input[1] == 0xFF)) {
+            throw CLIError(utf16DekMessage)
+        }
         throw CLIError("\(flag): \(what) is longer than \(maxDekInputLength) bytes; expected base64 of a \(dekLen)-byte DEK")
     }
 
@@ -1195,8 +1314,17 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     // written by `printf '%s\n'` or an editor still works -- nothing else,
     // as in the Linux tool: leading or other trailing whitespace is part of
     // the input and fails to decode.
+    // A leading UTF-8 byte-order mark, which some Windows tools (PowerShell,
+    // .NET) prepend, is skipped; a UTF-16 one is refused as such, since the
+    // fix is on the sending side -- the Linux and Windows tools' rules.
     let bytes = UnsafeRawBufferPointer(rebasing: input[0..<total])
-    let start = 0
+    var start = 0
+    if total >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        start = 3
+    }
+    if total - start >= 2 && ((bytes[start] == 0xFF && bytes[start + 1] == 0xFE) || (bytes[start] == 0xFE && bytes[start + 1] == 0xFF)) {
+        throw CLIError(utf16DekMessage)
+    }
     var end = total
     if end > start && bytes[end - 1] == 0x0A {
         end -= 1
@@ -1210,13 +1338,12 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     }
 
     let text = UnsafeRawBufferPointer(rebasing: bytes[start..<end])
-    guard let decodedLength = strictBase64DecodedLength(text) else {
-        throw CLIError("\(flag): the DEK is not valid base64")
+    guard let decodedLength = decodeBase64ConstantTime(text, into: decoded) else {
+        throw CLIError("\(flag): \(invalidBase64DekMessage)")
     }
     guard decodedLength == dekLen else {
         throw CLIError("\(flag): the DEK must decode to exactly \(dekLen) bytes, got \(decodedLength)")
     }
-    strictBase64Decode(text, into: decoded)
     return try body(UnsafeRawBufferPointer(decoded))
 }
 
@@ -1430,6 +1557,7 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
     // `defer`, and the unlink happens once, after the loop, on the
     // fall-through success path.
     defer { close(fd) }
+    try requireOpenedAt(fd, realPath: path, what: "the existing key file")
 
     var st = stat()
     guard fstat(fd, &st) == 0 else {
@@ -1586,6 +1714,8 @@ func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool, group: (gid:
         }
     }
 
+    try requireOpenedAt(fd, realPath: path, what: "the new key file")
+
     if let group {
         guard fchown(fd, uid_t.max, group.gid) == 0 else { // uid -1: the owner stays as it is
             throw CLIError("could not give \(path) to group \"\(group.name)\": \(String(cString: strerror(errno))) (only root, or a member of the group, can)")
@@ -1612,13 +1742,15 @@ func runProvision(_ args: ProvisionArgs) throws {
     guard status == HKDFGuardStatus.success.rawValue else {
         throw CLIError("the KEK for service \"\(args.serviceName)\" exists but its fingerprint could not be read: \(describeStatus(status))")
     }
+    // The Linux and Windows tools' wording, plus the keychain mode and the
+    // fingerprint, which only this platform reports.
     if created {
-        print("provisioned KEK for service \"\(args.serviceName)\" (keychain: \(keychainModeName()))")
+        print("KEK provisioned for service \"\(args.serviceName)\" (keychain: \(keychainModeName()))")
         print("fingerprint: \(hexString(fingerprint)) -- record this; retire requires it")
     } else {
         // A KEK this operator didn't create could have been planted by another
         // process; the fingerprint is how to tell.
-        print("KEK already exists for service \"\(args.serviceName)\" (keychain: \(keychainModeName())); nothing to do")
+        print("KEK already provisioned for service \"\(args.serviceName)\"; verified, nothing to do (keychain: \(keychainModeName()))")
         print("fingerprint: \(hexString(fingerprint)) -- confirm it matches the one recorded when this service was provisioned")
     }
 }
@@ -1665,7 +1797,14 @@ func runStatus(serviceName: String) throws {
     }
 }
 
-func runWrap(_ args: WrapArgs) throws {
+func runWrap(_ spelledArgs: WrapArgs) throws {
+    // The key file's folder must be a real folder with no symbolic link in
+    // it (requireRealFolder), checked first, before any Secure Enclave or
+    // keychain work. Every filesystem call below uses the real path it
+    // returns; messages name the path as the operator spelled it.
+    var args = spelledArgs
+    args.keyFilePath = try requireRealFolder(spelledArgs.keyFilePath, what: "--key-file-path")
+
     // Fast, friendly pre-check: fail before ever touching the Secure
     // Enclave/Keychain if the output path obviously already exists,
     // rather than making the caller pay for a full wrap operation just to
@@ -1727,7 +1866,7 @@ func runWrap(_ args: WrapArgs) throws {
 
     // The Linux tool's wording for who can read it.
     let access = group.map { "owner read/write + \($0.name) read-only" } ?? "owner read/write"
-    print("wrapped key written to \(args.keyFilePath) (\(wrapped.count) bytes, \(access), service \"\(args.serviceName)\", keychain: \(keychainModeName()))")
+    print("wrapped key written to \(spelledArgs.keyFilePath) (\(wrapped.count) bytes, \(access), service \"\(args.serviceName)\", keychain: \(keychainModeName()))")
     print("fingerprint: \(hexString(usedFingerprint))\(args.expectedFingerprint == nil ? " -- confirm it matches the one recorded when this service was provisioned" : " (confirmed)")")
 }
 

@@ -96,8 +96,9 @@ Pipelines and consumers pin a KEK by comparing these 32 bytes with the
 fingerprint recorded at provisioning.
 
 The **suite id** names the construction above. This build implements exactly
-one, `0x01`; any other value is `unsupportedCiphersuite` (-12), reported
-before the keychain is consulted, so a future construction is a parse-time
+one, `0x01`; any other value is `unsupportedCiphersuite` (-12) from unwrap,
+reported before the keychain is consulted (`fileMalformed`, -38, from
+`hkdfguard_open_file`, as on Linux and Windows), so a future construction is a parse-time
 dispatch rather than a new file format.
 
 Unwrap failures are kept apart: the Secure Enclave refusing the key
@@ -116,8 +117,8 @@ sealed for a different service.
   saw the public key) cannot forge one.
 - A key file can be **swapped** for another genuine one only by someone who
   can write it as its owner (or root). `hkdfguard_open_file` refuses files
-  owned by anyone else, writable by anyone else, hard-linked, or in a folder
-  someone else can write (`-39`); the AEAD rejects any alteration of a
+  owned by anyone else, writable by anyone else, reached through a
+  symbolic link, or in a folder someone else can write (`-39`); the AEAD rejects any alteration of a
   genuine file; `wrap --fingerprint` and the fingerprint check at unwrap
   reject a payload for the wrong KEK.
 - Whoever **is** the owning user — or has code running as them — can wrap a
@@ -312,21 +313,24 @@ reach `out` only on success; on any failure the whole declared capacity of
 `out` is zeroed, as on Linux.
 
 - **Safe opening.** The path must name a regular file. A symbolic link as
-  its last component is refused, not followed (`O_NOFOLLOW`); symlinks in
+  its last component is refused, not followed (`O_NOFOLLOW`), as
+  `fileInsecure` (-39); symlinks in
   directory components resolve as usual, so `/etc/...` works. A FIFO,
   socket, directory, or device is refused without blocking. Every check is
   made on the opened descriptor (`fstat`), so it describes the file that is
   actually read. At most 147 bytes are read, and a file larger than a
   payload is rejected from its size before any read.
 - **Ownership.** The file must be owned by the process's effective user
-  **or by root**, writable by no one but its owner, and have a single hard
-  link, or it is `fileInsecure` (-39). The CLI's `wrap` output (0600, one
-  link) always passes. Root is accepted so an administrator or MDM can
+  **or by root**, and writable by no one but its owner, or it is
+  `fileInsecure` (-39). The CLI's `wrap` output (0600) always passes. Root is accepted so an administrator or MDM can
   deploy key files that a service account reads; root can already alter
   anything on the machine, so this adds no new party who could tamper with
   the file. A file owned by any *other* user is refused, because that user
-  could swap in a different payload or hard-link an older one into place,
-  and that would otherwise be a silent rollback rather than a loud error.
+  could swap in a different payload, and that would otherwise be a silent
+  rollback rather than a loud error. A file with more than one hard link is
+  accepted, as on Linux and Windows: putting a second name for an older
+  payload where the service looks means creating an entry in the key's
+  folder, which the folder checks below limit to the owner and root.
   Group- or world-*readable* is allowed, since the payload is ciphertext. A
   root-owned file must still be readable by the reading account: `0644`, or
   `0640` with a group the account belongs to. Otherwise it is
@@ -360,8 +364,9 @@ reach `out` only on success; on any failure the whole declared capacity of
   now. Its bytes never reach the caller's buffer, and the library zeroes
   its own read buffer on every return.
 - **Malformed.** A 125-byte file whose KEK fingerprint is all zeros is
-  `fileMalformed` (-38); one whose suite byte is not `0x01` is `unsupportedCiphersuite`
-  (-12). These are structural checks only: whether the payload is genuine,
+  `fileMalformed` (-38), and so is one whose suite byte is not `0x01`: as
+  on Linux and Windows, every format problem in a key file is this one code
+  (unwrap, given the same bytes, reports the suite as -12). These are structural checks only: whether the payload is genuine,
   unaltered, and for this service is decided by `hkdfguard_unwrap_dek`
   (`-16`, `-11`). Reading the file proves nothing about it — pin the KEK by
   comparing bytes 0–31 with the recorded fingerprint before unwrapping, as
@@ -392,12 +397,12 @@ here are defined there but never returned on macOS.
 | `-19` | `ERR_KEK_INVALID` | `kekCorrupted` | an item exists but can't be reconstructed into a key; never auto-replaced |
 | `-32` | `ERR_FILE_NOT_FOUND` | `fileNotFound` | no file at the path, or a path component is not a directory (`hkdfguard_open_file` only, as are `-33` to `-39`) |
 | `-33` | `ERR_FILE_ACCESS_DENIED` | `fileAccessDenied` | this process may not read the file or a directory on its path |
-| `-34` | `ERR_FILE_IO` | `fileIO` | a symbolic link (refused, never followed), directory, FIFO, socket, or device; or `open`/`fstat`/`read` failed |
+| `-34` | `ERR_FILE_IO` | `fileIO` | a directory, FIFO, socket, or device; or `open`/`fstat`/`read` failed |
 | `-35` | `ERR_FILE_TOO_SHORT` | `fileTooShort` | fewer than 125 bytes, and not a plaintext DEK |
 | `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 125 bytes |
 | `-37` | `ERR_FILE_PLAINTEXT_KEY` | `fileUnprotectedKey` | the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
 | `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 125 bytes, but the fingerprint is all zeros |
-| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | owned by someone other than this user or root, writable by group or others, or more than one hard link; or a folder above it is owned by someone else or writable by group or others without being sticky |
+| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | a symbolic link (refused, never followed); owned by someone other than this user or root, or writable by group or others; or a folder above it is owned by someone else or writable by group or others without being sticky |
 | `-96` | `ERR_MAC_ACCESS_CONTROL_CREATION_FAILED` | `accessControlCreationFailed` | refines `ERR_PROVIDER_ERROR` (-4) |
 | `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
 | `-98` | `ERR_MAC_KEYCHAIN_WRITE_FAILED` | `keychainWriteFailed` | refines -4 |
@@ -497,11 +502,15 @@ hkdfguard retire --service-name|-sn <name> \
 ```
 
 - **`provision`** creates the KEK for `<name>` if it doesn't exist. The only
-  command that creates keys; idempotent (a second run reports "already
-  exists" and exits 0). Prints the keychain mode it used and the KEK's
-  **fingerprint** (SHA-256 of its public key) — record it. On "already
-  exists", compare it with the recorded value: a mismatch means the KEK
-  under that name is not the one you provisioned.
+  command that creates keys; idempotent. As on Linux and Windows it always
+  calls `hkdfguard_create_kek`, which for an existing KEK loads the keychain
+  item and rebuilds the Secure Enclave key from it, so a KEK that exists but
+  can't be used fails here, at deployment, not at the first wrap; a second
+  run reports "already provisioned …; verified" and exits 0. Prints the
+  keychain mode it used and the KEK's **fingerprint** (SHA-256 of its
+  public key) — record it. On "already provisioned", compare it with the
+  recorded value: a mismatch means the KEK under that name is not the one
+  you provisioned.
 - **`status`** reports the keychain mode, whether a KEK exists for `<name>`
   (`present`, `absent`, or `corrupt`), and its fingerprint. Read-only: it
   never creates or deletes anything, so it is the safe way to check a
@@ -567,12 +576,26 @@ hkdfguard retire --service-name|-sn <name> \
     running the CLI, and grant no access to group or others (mode `0400` or
     `0600`). Every check is made on the opened descriptor, so it describes
     the file that is read.
+  - *No symbolic link above a path (same as the Linux tool).* Neither
+    `--key-file-path` nor `--dek-file` may be reached through a symlinked
+    folder: whoever could plant one where the operator writes could redirect
+    a `wrap --force` into overwriting a file elsewhere, or make `wrap` read a
+    DEK they put somewhere else. `..` is resolved as text first, and the
+    opened file is confirmed to be the one at the checked path. macOS's own
+    root-owned links -- `/tmp`, `/var`, `/etc` into `/private` -- are
+    accepted: a link owned by root in a root-owned folder no one else can
+    write is followed to its real folder; any other link is refused.
   - *Input handling (same as the Linux tool).* At most 64 bytes are
     accepted -- base64 of a 32-byte DEK is 44 characters -- and anything
     longer is refused before it is read in full. One trailing newline (or
     CRLF) is ignored and nothing else: leading spaces, trailing spaces, or a
-    second newline make the input invalid base64. Decoding is strict,
-    padded standard base64. The text and the decoded DEK live in one
+    second newline make the input invalid base64. A leading UTF-8
+    byte-order mark (PowerShell, .NET) is skipped; UTF-16 input is refused
+    with a message saying how to send UTF-8. `--dek-stdin` refuses an
+    interactive terminal, where a typed or pasted DEK would be echoed and
+    kept in the scrollback. Decoding is strict, padded standard base64, in
+    constant time with respect to the text, and every malformed input gets
+    the same fixed message, which quotes none of it. The text and the decoded DEK live in one
     fixed-size buffer locked into memory with `mlock` (a warning is printed
     if the lock is refused), are never held as a string, and are zeroed on
     every exit path.
@@ -1184,9 +1207,9 @@ Three Swift Testing suites:
   enclave: exact-length success, too short/too long, plaintext DEKs in
   every accepted encoding (`-37`, never copied out) versus short text that
   is not a key, malformed payloads (zero
-  fingerprint), unknown suite bytes (-12), missing and unreadable files, symlink/directory/FIFO
-  refusal, ownership rules (group/world-writable and multiply-linked files
-  refused; 0600/0644/0400 and root-owned files accepted), buffer sizing
+  fingerprint, unknown suite bytes: -38), missing and unreadable files, symlink (-39)
+  and directory/FIFO refusal, ownership rules (group/world-writable files
+  refused; 0600/0644/0400, root-owned and hard-linked files accepted), buffer sizing
   before the file is
   opened, and NULL pointers.
 - **`HkdfGuardCommandLineToolTests`** (`.serialized`) builds and runs the real CLI as a

@@ -158,14 +158,16 @@ extern "C" {
  *                              its fingerprint was altered, or it was wrapped
  *                              for a different service under the same KEK.
  *   PAYLOAD_UNSUPPORTED (-12)  the payload's suite byte names a ciphersuite
- *                              this build does not implement.
+ *                              this build does not implement (unwrap; the
+ *                              same file read by hkdfguard_open_file is
+ *                              FILE_MALFORMED, as on Linux and Windows).
  *   KEK_NOT_FOUND (-17)        no keychain item for this service in this
  *                              process's keychain mode -- including a
  *                              provisioner/consumer keychain-mode mismatch.
- *   FILE_IO (-34)              also: the path's last component is a symbolic
- *                              link (refused, never followed), or a
- *                              directory, FIFO, socket, or device.
- *   FILE_UNTRUSTED (-39)       also: the file has more than one hard link.
+ *   FILE_IO (-34)              also: the path names a directory, FIFO,
+ *                              socket, or device.
+ *   FILE_UNTRUSTED (-39)       also: the path's last component is a symbolic
+ *                              link (refused, never followed).
  * PROVIDER_ERROR (-4) itself is never returned: macOS always reports one of
  * its refinements (-96..-100) instead.
  */
@@ -426,7 +428,7 @@ int32_t hkdfguard_generate_and_wrap_dek(
 //
 // `path` is a null-terminated filesystem path. It must name a regular file
 // owned by this process's effective user or by root, writable by no one but
-// its owner, with a single hard link, in folders that are each -- up to / --
+// its owner, in folders that are each -- up to / --
 // owned by root or this user and not writable by group or others unless
 // sticky (/tmp-style); write bits are ignored on a read-only volume
 // (HKDFGUARD_ERR_FILE_UNTRUSTED otherwise, as on Linux; the CLI's `wrap`
@@ -434,7 +436,7 @@ int32_t hkdfguard_generate_and_wrap_dek(
 // /Applications, is refused. A root-owned file deployed by an administrator must
 // still be readable by the caller -- 0644, or 0640 with a shared group --
 // or it is HKDFGUARD_ERR_FILE_ACCESS_DENIED. A
-// symbolic link as its last component is refused (HKDFGUARD_ERR_FILE_IO), not followed;
+// symbolic link as its last component is refused (HKDFGUARD_ERR_FILE_UNTRUSTED), not followed;
 // symlinks in directory components resolve as usual (/etc, /tmp). A FIFO,
 // socket, directory, or device is refused (HKDFGUARD_ERR_FILE_IO) without blocking. Every
 // check is made on the opened descriptor, so it describes the file that is

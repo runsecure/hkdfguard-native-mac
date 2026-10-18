@@ -1058,6 +1058,127 @@ struct HkdfGuardCommandLineToolTests {
         return result
     }
 
+    // MARK: - DEK input encoding (as on Linux and Windows)
+
+    @Test func cliSkipsAUtf8ByteOrderMarkAndRefusesUtf16() throws {
+        let dek = Data(Self.randomDEK()).base64EncodedString()
+
+        // A UTF-8 BOM (PowerShell, .NET) is skipped: the input decodes and
+        // the run gets as far as the KEK lookup.
+        let bomFile = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: bomFile) }
+        try Self.writeDekFile(Data([0xEF, 0xBB, 0xBF]) + Data((dek + "\n").utf8), to: bomFile)
+        let bom = try Self.wrapWithDekFile(bomFile)
+        #expect(bom.exitCode == 1)
+        #expect(!bom.stderr.contains("not valid base64") && !bom.stderr.contains("UTF-16"), "\(bom.stderr)")
+
+        // UTF-16, either byte order: named as such, with the fix. Its text is
+        // twice as long, so it is over the 64-byte limit -- the message must
+        // still say UTF-16, not just "too long".
+        for bomBytes in [Data([0xFF, 0xFE]), Data([0xFE, 0xFF])] {
+            let utf16 = bomBytes + Data(dek.utf8.flatMap { bomBytes[0] == 0xFF ? [$0, 0] : [0, $0] })
+            let file = Self.makeTempFilePath()
+            defer { try? FileManager.default.removeItem(atPath: file) }
+            try Self.writeDekFile(utf16, to: file)
+            let result = try Self.wrapWithDekFile(file)
+            #expect(result.exitCode == 1)
+            #expect(result.stderr.contains("the DEK input is UTF-16 encoded"), "\(result.stderr)")
+
+            // And a short UTF-16 input, under the limit, the same.
+            let short = try Self.runCLI(
+                ["wrap", "-kf", Self.makeTempFilePath(), "-sn", "com.hkdfguard.tests.cli.utf16", "--dek-stdin"],
+                stdin: bomBytes + Data("AAAA".utf8))
+            #expect(short.stderr.contains("the DEK input is UTF-16 encoded"), "\(short.stderr)")
+        }
+    }
+
+    @Test func cliReportsMalformedBase64WithTheOneFixedMessage() throws {
+        // The Linux and Windows tools' exact sentence: it names no character
+        // or position, so a mistyped DEK never puts part of itself in a log.
+        let dek = Data(Self.randomDEK()).base64EncodedString()
+        for bad in [String(dek.dropLast()) + "*", "=" + dek.dropFirst(), String(dek.prefix(42)) + "B=", dek + "\n\n"] {
+            let result = try Self.runCLI(
+                ["wrap", "-kf", Self.makeTempFilePath(), "-sn", "com.hkdfguard.tests.cli.bad.base64", "--dek-stdin"],
+                stdin: Data(bad.utf8))
+            #expect(result.stderr.contains("the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)"), "\(bad.debugDescription): \(result.stderr)")
+            #expect(!result.stderr.contains(String(dek.prefix(8))), "the input must not be echoed")
+        }
+    }
+
+    @Test func cliRefusesToReadTheDekFromATerminal() throws {
+        // stdin is a pseudo-terminal: refused before anything is read.
+        let master = posix_openpt(O_RDWR | O_NOCTTY)
+        try #require(master >= 0)
+        defer { close(master) }
+        try #require(grantpt(master) == 0 && unlockpt(master) == 0)
+        let slaveName = try #require(ptsname(master).map { String(cString: $0) })
+        let slave = FileHandle(forUpdatingAtPath: slaveName)
+        let terminal = try #require(slave)
+        defer { try? terminal.close() }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: Self.cliExecutablePath)
+        process.arguments = ["wrap", "-kf", Self.makeTempFilePath(), "-sn", "com.hkdfguard.tests.cli.tty", "--dek-stdin"]
+        // As `run` does: no DYLD_* from the test host, so the CLI loads its
+        // own library.
+        process.environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("DYLD_") }
+        let stderr = Pipe()
+        process.standardInput = terminal
+        process.standardOutput = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let message = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(process.terminationStatus == 1)
+        #expect(message.contains("refusing to read the DEK from an interactive terminal"), "\(message)")
+    }
+
+    // MARK: - No symbolic link in the folders above a path (as on Linux)
+
+    @Test func cliRefusesASymlinkedFolderAboveTheKeyFileOrTheDekFile() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard-cli-link-\(UUID().uuidString)")
+        let real = base.appendingPathComponent("real")
+        let link = base.appendingPathComponent("link")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+        // The key file: nothing is written through the link, and nothing in
+        // the real folder.
+        let viaLink = link.appendingPathComponent("out.key").path
+        let wrap = try Self.runCLI(
+            ["wrap", "-kf", viaLink, "-sn", "com.hkdfguard.tests.cli.folder.link", "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(wrap.exitCode == 1)
+        #expect(wrap.stderr.contains("is a symbolic link; the path must be a real path with no links in it"), "\(wrap.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: real.appendingPathComponent("out.key").path))
+
+        // The DEK file: refused before it is opened.
+        let dekFile = real.appendingPathComponent("dek.b64").path
+        try Self.writeDekFile(Data(Data(Self.randomDEK()).base64EncodedString().utf8), to: dekFile)
+        let viaLinkDek = try Self.wrapWithDekFile(link.appendingPathComponent("dek.b64").path)
+        #expect(viaLinkDek.exitCode == 1)
+        #expect(viaLinkDek.stderr.contains("is a symbolic link; the path must be a real path with no links in it"), "\(viaLinkDek.stderr)")
+
+        // `..` after a link is resolved as text: link/../real/x is real/x,
+        // which the kernel would otherwise reach through the link.
+        let dotted = link.appendingPathComponent("..").appendingPathComponent("real").appendingPathComponent("dek.b64").path
+        #expect(try Self.wrapWithDekFile(dotted).stderr.contains("symbolic link") == false, "a path whose folders are real after `..` is fine")
+    }
+
+    @Test func cliAcceptsMacOSsOwnRootOwnedLinksSuchAsTmp() throws {
+        // /tmp -> private/tmp is root's link in a root-owned folder: allowed,
+        // as is every test's temporary folder under /var.
+        var st = stat()
+        try #require(lstat("/tmp", &st) == 0 && st.st_mode & S_IFMT == S_IFLNK, "/tmp is no longer a link on this macOS")
+        let path = "/tmp/hkdfguard-cli-tmp-\(UUID().uuidString).key"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let result = try Self.runCLI(
+            ["wrap", "-kf", path, "-sn", "com.hkdfguard.tests.cli.tmp.link", "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(!result.stderr.contains("symbolic link"), "\(result.stderr)")
+    }
+
     @Test func cliDekFileRefusesASymlink() throws {
         let target = Self.makeTempFilePath()
         let link = Self.makeTempFilePath()
@@ -1163,12 +1284,14 @@ struct HkdfGuardCommandLineToolTests {
 
         let first = try Self.runCLI(["provision", "--service-name", service])
         #expect(first.exitCode == 0, "provision failed: \(first.stderr)")
-        #expect(first.stdout.contains("provisioned KEK"))
+        #expect(first.stdout.contains("KEK provisioned for service \"\(service)\""), "\(first.stdout)")
         #expect(Self.kekItemExists(service: service))
 
         let second = try Self.runCLI(["provision", "-sn", service])
         #expect(second.exitCode == 0, "second provision failed: \(second.stderr)")
-        #expect(second.stdout.contains("already exists"))
+        // As on Linux and Windows: create_kek runs again and verifies the
+        // existing KEK, rather than provision stopping at kek_exists.
+        #expect(second.stdout.contains("KEK already provisioned for service \"\(service)\"; verified, nothing to do"), "\(second.stdout)")
         #expect(Self.kekItemExists(service: service))
     }
 

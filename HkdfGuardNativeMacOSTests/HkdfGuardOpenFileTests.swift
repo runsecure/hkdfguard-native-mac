@@ -13,7 +13,7 @@ import CryptoKit
 ///
 /// Status codes mirrored from the module's private `HKDFGuardStatus`:
 ///   0 = success, -1 = invalidInputLength, -2 = outputBufferTooSmall,
-///   -12 = unsupportedCiphersuite, -32 = fileNotFound, -33 = fileAccessDenied,
+///   -32 = fileNotFound, -33 = fileAccessDenied,
 ///   -34 = fileIO, -35 = fileTooShort, -36 = fileTooLong,
 ///   -37 = fileUnprotectedKey, -38 = fileMalformed, -39 = fileInsecure
 ///   (the shared HkdfGuard status table; see hkdfguard.h).
@@ -231,9 +231,10 @@ struct HkdfGuardOpenFileTests {
         }
     }
 
-    @Test func reportsAnUnknownSuiteByteAsUnsupportedNotMalformed() throws {
-        // A plausible payload (non-zero fingerprint) sealed with a suite this
-        // build doesn't implement: a version mismatch, reported as such.
+    @Test func reportsAnUnknownSuiteByteAsMalformedAsOnLinuxAndWindows() throws {
+        // A plausible payload (non-zero fingerprint) with a suite this build
+        // doesn't implement. In a key file every format problem is -38, the
+        // Linux and Windows answer; unwrap names the suite itself (-12).
         let dir = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         for suite: UInt8 in [0x00, 0x02, 0xFF] {
@@ -242,7 +243,7 @@ struct HkdfGuardOpenFileTests {
             payload[32] = suite
             try Self.write(payload, to: file)
             let result = Self.openFile(file.path)
-            #expect(result.status == -12, "suite \(suite)")
+            #expect(result.status == -38, "suite \(suite)")
             #expect(result.zeroed, "suite \(suite)")
         }
     }
@@ -329,8 +330,9 @@ struct HkdfGuardOpenFileTests {
         let link = dir.appendingPathComponent("link.key")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
 
+        // Untrusted (-39), as Windows reports any link -- not an I/O error.
         let result = Self.openFile(link.path)
-        #expect(result.status == -34)
+        #expect(result.status == -39)
         #expect(result.zeroed)
     }
 
@@ -453,25 +455,29 @@ struct HkdfGuardOpenFileTests {
         #expect(Self.openFile(viaAlias).status == -39, "the real folder is writable, whatever the path says")
     }
 
-    @Test func refusesAFileWithMoreThanOneHardLink() throws {
-        // A second name for the same inode could have been created by anyone
-        // with write access to some directory and read access to an older
-        // payload -- the replay the check exists to catch. The link is
-        // refused through either name.
+    @Test func acceptsAFileWithMoreThanOneHardLinkAsOnLinuxAndWindows() throws {
+        // A second name only matters if it could put an older payload where
+        // the service looks, and that takes an entry in the key's own folder
+        // -- which the folder checks limit to the owner and root. Accepted
+        // through either name, as on the other platforms.
         let dir = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let original = dir.appendingPathComponent("ingest.key")
-        try Self.write(Self.structurallyValidPayload(), to: original)
-        #expect(Self.openFile(original.path).status == 0)
+        let payload = Self.structurallyValidPayload()
+        try Self.write(payload, to: original)
 
         let alias = dir.appendingPathComponent("alias.key")
         try FileManager.default.linkItem(at: original, to: alias)
-        #expect(Self.openFile(original.path).status == -39)
-        #expect(Self.openFile(alias.path).status == -39)
+        for path in [original.path, alias.path] {
+            let result = Self.openFile(path)
+            #expect(result.status == 0, "\(path)")
+            #expect(result.bytes == payload, "\(path)")
+        }
 
-        // Removing the extra link restores the file.
-        try FileManager.default.removeItem(at: alias)
-        #expect(Self.openFile(original.path).status == 0)
+        // But a link name in a folder others can write is still refused,
+        // by the folder rule.
+        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: dir.path)
+        #expect(Self.openFile(alias.path).status == -39)
     }
 
     @Test(.timeLimit(.minutes(1)))
