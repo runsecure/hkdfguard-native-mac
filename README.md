@@ -547,8 +547,18 @@ hkdfguard retire --service-name|-sn <name> \
   `<path>`. It never creates a KEK (an unprovisioned service is an error
   naming the `provision` command) and never generates a DEK. There is
   deliberately no `--dek <base64>` argument: an argv value is visible to
-  every process via `ps` and lands in shell history. `--dek` and
-  `--generate` are refused with an explanation.
+  every process via `ps` and lands in shell history. `--dek` is refused
+  with an explanation.
+  - *`--group|-g <name>` (as on Linux and Windows).* The file is written
+    `0600` (owner read/write) by default. With `--group` it is `0640` and
+    given that group, so the group's members can read it too. The group is
+    set on the open file before a byte is written. Name a dedicated group
+    for the service that unwraps the key, one you belong to (or run as
+    root); a group name or a numeric gid both work. Groups that cover
+    essentially every account or the administrators -- `staff`,
+    `everyone`, `localaccounts`, `netaccounts`, `admin`, `wheel`, `nobody`,
+    `nogroup`, and gid 0 -- are refused, by resolved gid, before the DEK is
+    read.
   - *`--dek-file` rules (same as the Linux tool).* The file must be a
     regular file -- a symbolic link is refused, never followed, and a FIFO
     or device is refused without blocking -- owned by root or by the user

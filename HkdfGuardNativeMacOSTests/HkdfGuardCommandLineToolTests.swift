@@ -684,25 +684,94 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.stderr.contains("--dek-file"))
         #expect(!result.stderr.contains("--dek|"), "usage must not advertise a --dek argument")
         #expect(!result.stderr.contains("--generate"), "usage must not advertise DEK generation")
+        #expect(result.stderr.contains("--group|-g <name>"))
     }
 
     // MARK: - DEK sources: --dek-stdin, --dek-file (and the rejected --dek / --generate)
 
-    @Test func cliRejectsGenerate() throws {
-        // This tool wraps the pipeline's existing DEK -- the key its data was
-        // already encrypted with -- so there is nothing for it to generate.
+    @Test func cliTreatsGenerateAsAnUnknownArgument() throws {
+        // There is no --generate: this tool wraps the pipeline's existing
+        // DEK. -g is --group, as on Linux and Windows.
         let service = "com.hkdfguard.tests.cli.generate.rejected"
         let keyFilePath = Self.makeTempFilePath()
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
 
-        for flag in ["--generate", "-g"] {
-            let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", service, flag])
-            #expect(result.exitCode == 2, "\(flag): exit \(result.exitCode), stderr: \(result.stderr)")
-            #expect(result.stderr.contains("not supported"))
-            #expect(result.stderr.contains("--dek-stdin"))
-            #expect(!FileManager.default.fileExists(atPath: keyFilePath))
-            #expect(!Self.kekItemExists(service: service))
+        let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", service, "--dek-stdin", "--generate"])
+        #expect(result.exitCode == 2, "exit \(result.exitCode), stderr: \(result.stderr)")
+        #expect(result.stderr.contains("unrecognized argument for `wrap`: --generate"), "\(result.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath))
+        #expect(!Self.kekItemExists(service: service))
+    }
+
+    // MARK: - --group (as on Linux)
+
+    /// A group this user belongs to that --group accepts, if any: not one of
+    /// the broad groups every account is in (staff, everyone, ...).
+    private static func eligibleGroup() -> (gid: gid_t, name: String)? {
+        let broad: Set<String> = ["wheel", "admin", "staff", "everyone", "localaccounts", "netaccounts", "nobody", "nogroup"]
+        var gids = [gid_t](repeating: 0, count: 64)
+        let count = getgroups(Int32(gids.count), &gids)
+        guard count > 0 else { return nil }
+        for gid in gids.prefix(Int(count)) where gid != 0 {
+            if let entry = getgrgid(gid), let name = entry.pointee.gr_name.map({ String(cString: $0) }), !broad.contains(name) {
+                return (gid, name)
+            }
         }
+        return nil
+    }
+
+    @Test func cliGroupRefusesBroadAndUnknownGroupsBeforeReadingTheDek() throws {
+        // Refused while resolving --group, before any DEK is read or KEK
+        // used: no stdin is supplied, and nothing is written.
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        let service = "com.hkdfguard.tests.cli.group.refused"
+        for group in ["staff", "everyone", "admin", "wheel", "0", "20"] {
+            let result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", group])
+            #expect(result.exitCode == 1, "\(group): \(result.stderr)")
+            #expect(result.stderr.contains("is an over-broad group"), "\(group): \(result.stderr)")
+        }
+        let missing = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "--group", "hkdfguard-no-such-group"])
+        #expect(missing.exitCode == 1)
+        #expect(missing.stderr.contains("does not name a group on this host"), "\(missing.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath))
+    }
+
+    @Test func cliGroupParsing() throws {
+        let keyFilePath = Self.makeTempFilePath()
+        let service = "com.hkdfguard.tests.cli.group.parse"
+        var result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "--group"])
+        #expect(result.exitCode == 2 && result.stderr.contains("--group requires a value"), "\(result.stderr)")
+        result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", ""])
+        #expect(result.exitCode == 2 && result.stderr.contains("--group must not be empty"), "\(result.stderr)")
+        result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", "a", "--group", "a"])
+        #expect(result.exitCode == 2 && result.stderr.contains("give --group at most once"), "\(result.stderr)")
+        result = try Self.runCLI(["provision", "-sn", service, "-g", "a"])
+        #expect(result.exitCode == 2 && result.stderr.contains("-g is not valid for `provision`; it belongs to `wrap`"), "\(result.stderr)")
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliGroupWritesTheFile0640WithThatGroup() throws {
+        guard let group = Self.eligibleGroup() else {
+            // Every group this account is in is a broad one; nothing to grant.
+            return
+        }
+        let service = "com.hkdfguard.tests.cli.group.write"
+        defer { Self.deleteKEK(service: service) }
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        try Self.provision(service: service)
+
+        let result = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", group.name],
+            stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(result.exitCode == 0, "\(result.stderr)")
+        #expect(result.stdout.contains("owner read/write + \(group.name) read-only"), "\(result.stdout)")
+        var info = stat()
+        try #require(stat(keyFilePath, &info) == 0)
+        #expect(info.st_mode & 0o777 == 0o640)
+        #expect(info.st_gid == group.gid)
+        #expect(info.st_uid == geteuid())
     }
 
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))

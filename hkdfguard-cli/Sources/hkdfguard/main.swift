@@ -46,7 +46,7 @@
 //       --key-file-path|-kf <key-file-path> \
 //       --service-name|-sn <name> \
 //       ( --dek-stdin | --dek-file <path> ) \
-//       [--fingerprint|-fp <64 hex chars>] [--force|-f]
+//       [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]
 //
 // `provision` is idempotent: a second run against the same service reports
 // that the KEK already exists and exits 0.
@@ -80,7 +80,9 @@
 //
 // The wrapped payload is written to <key-file-path> with POSIX permissions
 // 0600 (owner read/write, no access for anyone else) -- set
-// atomically at file-creation time. With --force against a pre-existing
+// atomically at file-creation time -- or, with --group <name>, 0640 with
+// that group: the owner plus one group, read-only, as the Linux tool's
+// --group does (see resolveKeyFileGroup for the groups refused). With --force against a pre-existing
 // file, that file's old contents are securely overwritten in place (8
 // alternating all-zero/random passes) and then deleted before the new file
 // is created -- see secureOverwriteAndRemoveIfExists/writeWrappedKeyFile
@@ -286,6 +288,8 @@ struct WrapArgs {
     /// `--fingerprint`: the KEK the operator expects to wrap under. When set,
     /// the payload's embedded fingerprint must equal it or nothing is written.
     var expectedFingerprint: [UInt8]?
+    /// `--group`: who besides the owner may read the key file. nil: no one.
+    var groupName: String?
 }
 
 // How the operator confirms which KEK item `retire` may delete.
@@ -315,7 +319,8 @@ func printUsage() {
         Usage:
           \(programName) provision --service-name|-sn <name>
           \(programName) wrap --key-file-path|-kf <path> --service-name|-sn <name> \\
-                                    ( \(dekSourceFlags) ) [--fingerprint|-fp <hex>] [--force|-f]
+                                    ( \(dekSourceFlags) ) [--group|-g <name>]
+                                    [--fingerprint|-fp <hex>] [--force|-f]
           \(programName) retire --service-name|-sn <name> ( --fingerprint|-fp <hex> | --corrupt )
           \(programName) status --service-name|-sn <name>
 
@@ -343,6 +348,9 @@ func printUsage() {
           --dek-stdin         read the base64 DEK from standard input
           --dek-file <path>   read the base64 DEK from a file (a regular file, not a
                       symlink, owned by you or root, mode 0400 or 0600)
+          --group|-g <name>   also let this group read the file (mode 0640): a dedicated
+                      group for the service that unwraps it, which you belong to;
+                      broad groups (staff, everyone, admin, wheel, ...) are refused
           --fingerprint|-fp <hex>  refuse to write unless the KEK actually used has this
                       fingerprint (64 hex characters, as printed by provision)
           --force|-f          securely overwrite an existing <path>
@@ -506,7 +514,7 @@ func parseProvision(_ arguments: [String]) throws -> Command {
             return .help
         case "--service-name", "-sn":
             try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
-        case "--key-file-path", "-kf", "--dek-stdin", "--dek-file", "--force", "-f":
+        case "--key-file-path", "-kf", "--dek-stdin", "--dek-file", "--force", "-f", "--group", "-g":
             throw CLIError("\(arg) is not valid for `provision`; it belongs to `wrap`")
         default:
             throw CLIError("unrecognized argument for `provision`: \(arg)")
@@ -523,6 +531,7 @@ func parseWrap(_ arguments: [String]) throws -> Command {
     var dekSource: DekSource?
     var force = false
     var expectedFingerprint: [UInt8]?
+    var groupName: String?
 
     // Rejects a second DEK source rather than letting the last one win:
     // silently ignoring one of two explicitly requested inputs is exactly
@@ -557,11 +566,14 @@ func parseWrap(_ arguments: [String]) throws -> Command {
             try setOnce(&keyFilePath, "--key-file-path", value)
         case "--service-name", "-sn":
             try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
-        case "--generate", "-g":
-            // This tool only wraps a DEK the calling pipeline already has --
-            // the key its data was encrypted with. Generating one here
-            // would produce a key nothing has used.
-            throw CLIError("\(arg) is not supported: this tool wraps the pipeline's existing DEK; supply it with \(dekSourceFlags)")
+        case "--group", "-g":
+            guard let value = iterator.next() else {
+                throw CLIError("\(arg) requires a value")
+            }
+            guard !value.isEmpty else {
+                throw CLIError("--group must not be empty")
+            }
+            try setOnce(&groupName, "--group", value)
         case "--dek-stdin":
             try setSource(.stdin)
         case "--dek-file":
@@ -600,7 +612,8 @@ func parseWrap(_ arguments: [String]) throws -> Command {
             serviceName: serviceName,
             dekSource: dekSource,
             force: force,
-            expectedFingerprint: expectedFingerprint
+            expectedFingerprint: expectedFingerprint,
+            groupName: groupName
         )
     )
 }
@@ -1213,6 +1226,78 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
 // read/write, no access for anyone else (POSIX 0600). The user who wraps
 // must be the user whose keychain holds the KEK, so the same user unwraps.
 let keyFilePermissions: mode_t = 0o600
+// With --group: rw-r-----, the owner plus that one group, read-only -- the
+// Linux tool's 0640 and the Windows tool's owner-plus-group DACL.
+let keyFileGroupPermissions: mode_t = 0o640
+
+// Groups --group refuses: each covers essentially every account on a Mac
+// (staff, everyone, localaccounts), its administrators (admin, wheel), or
+// nobody in particular (nobody, nogroup). Granting one read access is no
+// narrower than world-readable for this purpose. Matched by resolved gid,
+// so a numeric gid can't dodge the list; gid 0 is refused whatever its
+// name. The Linux and Windows tools refuse their own equivalents.
+let overBroadGroups = ["wheel", "admin", "staff", "everyone", "localaccounts", "netaccounts", "nobody", "nogroup"]
+
+// Looks a group up by name, or by gid when `spec` is all digits. nil when
+// no such group exists; throws when the lookup itself failed.
+func lookupGroup(_ spec: String) throws -> (gid: gid_t, name: String)? {
+    let byGid = !spec.isEmpty && spec.utf8.allSatisfy { $0 >= 0x30 && $0 <= 0x39 }
+    var gid: gid_t = 0
+    if byGid {
+        guard let parsed = gid_t(spec) else {
+            throw CLIError("--group \(spec) is not a valid gid")
+        }
+        gid = parsed
+    }
+    var size = 16 * 1024
+    while size <= 1024 * 1024 {
+        var entry = group()
+        var result: UnsafeMutablePointer<group>?
+        var buffer = [CChar](repeating: 0, count: size)
+        let rc = byGid
+            ? getgrgid_r(gid, &entry, &buffer, size, &result)
+            : getgrnam_r(spec, &entry, &buffer, size, &result)
+        if rc == ERANGE {
+            size *= 2 // a large directory group's member list didn't fit
+            continue
+        }
+        guard rc == 0 else {
+            throw CLIError("could not look up group \(spec): \(String(cString: strerror(rc)))")
+        }
+        guard let found = result, let namePtr = found.pointee.gr_name else {
+            return nil
+        }
+        return (found.pointee.gr_gid, String(cString: namePtr))
+    }
+    throw CLIError("could not look up group \(spec): its entry is too large")
+}
+
+// Resolves --group to the gid the key file is given, refusing a group that
+// doesn't exist or is over-broad. Done before the DEK is read or the Secure
+// Enclave is used, so a bad --group costs nothing. The Linux tool's
+// resolve_key_file_group.
+func resolveKeyFileGroup(_ spec: String) throws -> (gid: gid_t, name: String) {
+    guard let found = try lookupGroup(spec) else {
+        throw CLIError("--group \"\(spec)\" does not name a group on this host")
+    }
+    let (gid, name) = (found.gid, found.name)
+    // Fails closed: if a listed group can't be looked up, whether it is this
+    // gid can't be ruled out, so --group is refused rather than allowed.
+    var listed = overBroadGroups.contains(name)
+    for broad in overBroadGroups where !listed {
+        do {
+            if let broadGroup = try lookupGroup(broad), broadGroup.gid == gid {
+                listed = true
+            }
+        } catch {
+            throw CLIError("--group \"\(spec)\": can't confirm it isn't the over-broad group \"\(broad)\" (\(error)); refusing")
+        }
+    }
+    if gid == 0 || listed {
+        throw CLIError("--group \"\(spec)\" (\(name), gid \(gid)) is an over-broad group (it covers essentially every account, or the host's administrators); name a dedicated group for the service that unwraps this key")
+    }
+    return (gid, name)
+}
 
 // Number of secure-overwrite passes secureOverwriteAndRemoveIfExists below
 // performs on a pre-existing file before deleting it, alternating an
@@ -1394,7 +1479,7 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
                     // Fresh CSPRNG bytes for every chunk, so no two regions
                     // of the file receive the same random pattern -- same
                     // source as every other random value this project
-                    // generates (nonces, ephemeral keys).
+                    // generates (salts, nonces).
                     let status = chunk.withUnsafeMutableBytes { raw in
                         SecRandomCopyBytes(kSecRandomDefault, count, raw.baseAddress!)
                     }
@@ -1463,7 +1548,13 @@ func flushParentDirectory(of path: String) throws {
 //    refers to the very inode this call created (same st_dev/st_ino), so a
 //    file someone else put at that path in the meantime is never deleted. A
 //    truncated payload left behind would also block a retry with EEXIST.
-func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool) throws {
+//
+// With `group`, the file is given that group on the open descriptor
+// (fchown) before its mode widens to 0640 and before a byte is written, so
+// the payload never sits in it under any other group -- as the Linux tool
+// does. A caller who isn't root can only give a group they belong to: the
+// kernel's rule, reported plainly, and the empty file removed.
+func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
     if force {
         try secureOverwriteAndRemoveIfExists(path: path)
     }
@@ -1495,7 +1586,12 @@ func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool) throws {
         }
     }
 
-    guard fchmod(fd, keyFilePermissions) == 0 else {
+    if let group {
+        guard fchown(fd, uid_t.max, group.gid) == 0 else { // uid -1: the owner stays as it is
+            throw CLIError("could not give \(path) to group \"\(group.name)\": \(String(cString: strerror(errno))) (only root, or a member of the group, can)")
+        }
+    }
+    guard fchmod(fd, group == nil ? keyFilePermissions : keyFileGroupPermissions) == 0 else {
         throw CLIError("failed to set permissions on \(path): \(String(cString: strerror(errno)))")
     }
 
@@ -1592,6 +1688,10 @@ func runWrap(_ args: WrapArgs) throws {
     // any DEK is read.
     try validateServiceCharset(args.serviceName)
 
+    // Resolved before the DEK is read or the Secure Enclave is used, so a
+    // bad --group fails fast and costs nothing. Without --group: owner-only.
+    let group = try args.groupName.map(resolveKeyFileGroup)
+
     // `wrap` never checks for or creates a KEK -- hkdfguard_kek_exists and
     // hkdfguard_create_kek belong to the `provision` command alone. With no
     // KEK for this service hkdfguard_wrap_dek fails with kekNotFound before
@@ -1623,9 +1723,11 @@ func runWrap(_ args: WrapArgs) throws {
         throw CLIError("fingerprint mismatch for service \"\(args.serviceName)\": the KEK in the keychain is \(hexString(usedFingerprint)), not \(hexString(expected)); nothing was written -- the DEK was NOT committed to that key")
     }
 
-    try writeWrappedKeyFile(path: args.keyFilePath, bytes: wrapped, force: args.force)
+    try writeWrappedKeyFile(path: args.keyFilePath, bytes: wrapped, force: args.force, group: group)
 
-    print("wrapped key written to \(args.keyFilePath) (\(wrapped.count) bytes, permissions 0600, service \"\(args.serviceName)\", keychain: \(keychainModeName()))")
+    // The Linux tool's wording for who can read it.
+    let access = group.map { "owner read/write + \($0.name) read-only" } ?? "owner read/write"
+    print("wrapped key written to \(args.keyFilePath) (\(wrapped.count) bytes, \(access), service \"\(args.serviceName)\", keychain: \(keychainModeName()))")
     print("fingerprint: \(hexString(usedFingerprint))\(args.expectedFingerprint == nil ? " -- confirm it matches the one recorded when this service was provisioned" : " (confirmed)")")
 }
 
