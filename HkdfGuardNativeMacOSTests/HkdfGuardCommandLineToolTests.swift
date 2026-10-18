@@ -202,7 +202,7 @@ struct HkdfGuardCommandLineToolTests {
         // from an earlier build caused the CLI subprocess launched below to
         // silently load that wrong, outdated dylib instead of the current
         // one at build/Release — producing a pre-fingerprint 124-byte
-        // wrapped payload instead of 146, and in other runs, behavior odd
+        // wrapped payload instead of the current length, and in other runs, behavior odd
         // enough to hang. Stripping DYLD_* here removes that whole class of
         // environment leakage regardless of what DerivedData happens to
         // contain.
@@ -434,7 +434,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(permissions == 0o600)
 
         let wrapped = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
-        #expect(wrapped.count == 146) // 32-byte KEK fingerprint + 1-byte suite id + 65-byte HPKE encapsulated key + 32-byte ciphertext + 16-byte tag
+        #expect(wrapped.count == 125) // 32-byte KEK fingerprint + 1-byte suite id + 32-byte salt + 12-byte nonce + 32-byte ciphertext + 16-byte tag
     }
 
     // MARK: - hkdfguard_open_file against the CLI's own files
@@ -454,7 +454,7 @@ struct HkdfGuardCommandLineToolTests {
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
     func cliWrappedFileIsReadByOpenFile() throws {
         // The file format contract between the CLI (writer) and the library
-        // (reader): whatever `wrap` writes -- 0600, fsynced, 146 bytes --
+        // (reader): whatever `wrap` writes -- 0600, fsynced, 125 bytes --
         // hkdfguard_open_file accepts byte for byte.
         let service = "com.hkdfguard.tests.cli.openfile"
         defer { Self.deleteKEK(service: service) }
@@ -684,25 +684,94 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.stderr.contains("--dek-file"))
         #expect(!result.stderr.contains("--dek|"), "usage must not advertise a --dek argument")
         #expect(!result.stderr.contains("--generate"), "usage must not advertise DEK generation")
+        #expect(result.stderr.contains("--group|-g <name>"))
     }
 
     // MARK: - DEK sources: --dek-stdin, --dek-file (and the rejected --dek / --generate)
 
-    @Test func cliRejectsGenerate() throws {
-        // This tool wraps the pipeline's existing DEK -- the key its data was
-        // already encrypted with -- so there is nothing for it to generate.
+    @Test func cliTreatsGenerateAsAnUnknownArgument() throws {
+        // There is no --generate: this tool wraps the pipeline's existing
+        // DEK. -g is --group, as on Linux and Windows.
         let service = "com.hkdfguard.tests.cli.generate.rejected"
         let keyFilePath = Self.makeTempFilePath()
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
 
-        for flag in ["--generate", "-g"] {
-            let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", service, flag])
-            #expect(result.exitCode == 2, "\(flag): exit \(result.exitCode), stderr: \(result.stderr)")
-            #expect(result.stderr.contains("not supported"))
-            #expect(result.stderr.contains("--dek-stdin"))
-            #expect(!FileManager.default.fileExists(atPath: keyFilePath))
-            #expect(!Self.kekItemExists(service: service))
+        let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", service, "--dek-stdin", "--generate"])
+        #expect(result.exitCode == 2, "exit \(result.exitCode), stderr: \(result.stderr)")
+        #expect(result.stderr.contains("unrecognized argument for `wrap`: --generate"), "\(result.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath))
+        #expect(!Self.kekItemExists(service: service))
+    }
+
+    // MARK: - --group (as on Linux)
+
+    /// A group this user belongs to that --group accepts, if any: not one of
+    /// the broad groups every account is in (staff, everyone, ...).
+    private static func eligibleGroup() -> (gid: gid_t, name: String)? {
+        let broad: Set<String> = ["wheel", "admin", "staff", "everyone", "localaccounts", "netaccounts", "nobody", "nogroup"]
+        var gids = [gid_t](repeating: 0, count: 64)
+        let count = getgroups(Int32(gids.count), &gids)
+        guard count > 0 else { return nil }
+        for gid in gids.prefix(Int(count)) where gid != 0 {
+            if let entry = getgrgid(gid), let name = entry.pointee.gr_name.map({ String(cString: $0) }), !broad.contains(name) {
+                return (gid, name)
+            }
         }
+        return nil
+    }
+
+    @Test func cliGroupRefusesBroadAndUnknownGroupsBeforeReadingTheDek() throws {
+        // Refused while resolving --group, before any DEK is read or KEK
+        // used: no stdin is supplied, and nothing is written.
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        let service = "com.hkdfguard.tests.cli.group.refused"
+        for group in ["staff", "everyone", "admin", "wheel", "0", "20"] {
+            let result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", group])
+            #expect(result.exitCode == 1, "\(group): \(result.stderr)")
+            #expect(result.stderr.contains("is an over-broad group"), "\(group): \(result.stderr)")
+        }
+        let missing = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "--group", "hkdfguard-no-such-group"])
+        #expect(missing.exitCode == 1)
+        #expect(missing.stderr.contains("does not name a group on this host"), "\(missing.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath))
+    }
+
+    @Test func cliGroupParsing() throws {
+        let keyFilePath = Self.makeTempFilePath()
+        let service = "com.hkdfguard.tests.cli.group.parse"
+        var result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "--group"])
+        #expect(result.exitCode == 2 && result.stderr.contains("--group requires a value"), "\(result.stderr)")
+        result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", ""])
+        #expect(result.exitCode == 2 && result.stderr.contains("--group must not be empty"), "\(result.stderr)")
+        result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", "a", "--group", "a"])
+        #expect(result.exitCode == 2 && result.stderr.contains("give --group at most once"), "\(result.stderr)")
+        result = try Self.runCLI(["provision", "-sn", service, "-g", "a"])
+        #expect(result.exitCode == 2 && result.stderr.contains("-g is not valid for `provision`; it belongs to `wrap`"), "\(result.stderr)")
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliGroupWritesTheFile0640WithThatGroup() throws {
+        guard let group = Self.eligibleGroup() else {
+            // Every group this account is in is a broad one; nothing to grant.
+            return
+        }
+        let service = "com.hkdfguard.tests.cli.group.write"
+        defer { Self.deleteKEK(service: service) }
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        try Self.provision(service: service)
+
+        let result = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", group.name],
+            stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(result.exitCode == 0, "\(result.stderr)")
+        #expect(result.stdout.contains("owner read/write + \(group.name) read-only"), "\(result.stdout)")
+        var info = stat()
+        try #require(stat(keyFilePath, &info) == 0)
+        #expect(info.st_mode & 0o777 == 0o640)
+        #expect(info.st_gid == group.gid)
+        #expect(info.st_uid == geteuid())
     }
 
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
@@ -719,7 +788,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
         #expect(!result.stderr.contains("warning:"))
         let wrapped = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
-        #expect(wrapped.count == 146)
+        #expect(wrapped.count == 125)
     }
 
     @Test(.enabled(if: legacyCrossProcessRoundTripEnabled && SecureEnclave.isAvailable, interactiveKeychainAndSecureEnclaveComment))
@@ -757,7 +826,7 @@ struct HkdfGuardCommandLineToolTests {
         let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", service, "--dek-file", dekFilePath])
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
         let wrapped = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
-        #expect(wrapped.count == 146)
+        #expect(wrapped.count == 125)
     }
 
     @Test func cliRejectsDekAsCommandLineArgument() throws {
@@ -827,8 +896,8 @@ struct HkdfGuardCommandLineToolTests {
         )
         #expect(result.exitCode == 0, "CLI --force failed: \(result.stderr)")
 
-        // The replacement: a fresh 146-byte, 0600 file.
-        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 146)
+        // The replacement: a fresh 125-byte, 0600 file.
+        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 125)
         let attributes = try FileManager.default.attributesOfItem(atPath: keyFilePath)
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
 
@@ -912,7 +981,9 @@ struct HkdfGuardCommandLineToolTests {
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
         let result = try Self.runCLI(
             ["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.nonascii.dek", "--dek-stdin"],
-            stdin: Data([0xFF, 0xFE, 0x41, 0x41, 0x0A])
+            // Non-ASCII that isn't a byte-order mark: FF FE would be read as
+            // UTF-16 and refused as such (tested on its own below).
+            stdin: Data([0xC3, 0xA9, 0x41, 0x41, 0x0A]) // UTF-8 "é", then "AA\n"
         )
         #expect(result.exitCode == 1)
         #expect(result.stderr.contains("not valid base64"), "stderr: \(result.stderr)")
@@ -930,7 +1001,7 @@ struct HkdfGuardCommandLineToolTests {
         let padded = Data((Data(Self.randomDEK()).base64EncodedString() + "\r\n").utf8)
         let result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"], stdin: padded)
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
-        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 146)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 125)
     }
 
     @Test func cliRejectsDekInputWithAnyPaddingButOneTrailingNewline() throws {
@@ -987,6 +1058,127 @@ struct HkdfGuardCommandLineToolTests {
         let result = try runCLI(["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.dek.file.rules", "--dek-file", dekFile])
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
         return result
+    }
+
+    // MARK: - DEK input encoding (as on Linux and Windows)
+
+    @Test func cliSkipsAUtf8ByteOrderMarkAndRefusesUtf16() throws {
+        let dek = Data(Self.randomDEK()).base64EncodedString()
+
+        // A UTF-8 BOM (PowerShell, .NET) is skipped: the input decodes and
+        // the run gets as far as the KEK lookup.
+        let bomFile = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: bomFile) }
+        try Self.writeDekFile(Data([0xEF, 0xBB, 0xBF]) + Data((dek + "\n").utf8), to: bomFile)
+        let bom = try Self.wrapWithDekFile(bomFile)
+        #expect(bom.exitCode == 1)
+        #expect(!bom.stderr.contains("not valid base64") && !bom.stderr.contains("UTF-16"), "\(bom.stderr)")
+
+        // UTF-16, either byte order: named as such, with the fix. Its text is
+        // twice as long, so it is over the 64-byte limit -- the message must
+        // still say UTF-16, not just "too long".
+        for bomBytes in [Data([0xFF, 0xFE]), Data([0xFE, 0xFF])] {
+            let utf16 = bomBytes + Data(dek.utf8.flatMap { bomBytes[0] == 0xFF ? [$0, 0] : [0, $0] })
+            let file = Self.makeTempFilePath()
+            defer { try? FileManager.default.removeItem(atPath: file) }
+            try Self.writeDekFile(utf16, to: file)
+            let result = try Self.wrapWithDekFile(file)
+            #expect(result.exitCode == 1)
+            #expect(result.stderr.contains("the DEK input is UTF-16 encoded"), "\(result.stderr)")
+
+            // And a short UTF-16 input, under the limit, the same.
+            let short = try Self.runCLI(
+                ["wrap", "-kf", Self.makeTempFilePath(), "-sn", "com.hkdfguard.tests.cli.utf16", "--dek-stdin"],
+                stdin: bomBytes + Data("AAAA".utf8))
+            #expect(short.stderr.contains("the DEK input is UTF-16 encoded"), "\(short.stderr)")
+        }
+    }
+
+    @Test func cliReportsMalformedBase64WithTheOneFixedMessage() throws {
+        // The Linux and Windows tools' exact sentence: it names no character
+        // or position, so a mistyped DEK never puts part of itself in a log.
+        let dek = Data(Self.randomDEK()).base64EncodedString()
+        for bad in [String(dek.dropLast()) + "*", "=" + dek.dropFirst(), String(dek.prefix(42)) + "B=", dek + "\n\n"] {
+            let result = try Self.runCLI(
+                ["wrap", "-kf", Self.makeTempFilePath(), "-sn", "com.hkdfguard.tests.cli.bad.base64", "--dek-stdin"],
+                stdin: Data(bad.utf8))
+            #expect(result.stderr.contains("the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)"), "\(bad.debugDescription): \(result.stderr)")
+            #expect(!result.stderr.contains(String(dek.prefix(8))), "the input must not be echoed")
+        }
+    }
+
+    @Test func cliRefusesToReadTheDekFromATerminal() throws {
+        // stdin is a pseudo-terminal: refused before anything is read.
+        let master = posix_openpt(O_RDWR | O_NOCTTY)
+        try #require(master >= 0)
+        defer { close(master) }
+        try #require(grantpt(master) == 0 && unlockpt(master) == 0)
+        let slaveName = try #require(ptsname(master).map { String(cString: $0) })
+        let slave = FileHandle(forUpdatingAtPath: slaveName)
+        let terminal = try #require(slave)
+        defer { try? terminal.close() }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: Self.cliExecutablePath)
+        process.arguments = ["wrap", "-kf", Self.makeTempFilePath(), "-sn", "com.hkdfguard.tests.cli.tty", "--dek-stdin"]
+        // As `run` does: no DYLD_* from the test host, so the CLI loads its
+        // own library.
+        process.environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("DYLD_") }
+        let stderr = Pipe()
+        process.standardInput = terminal
+        process.standardOutput = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let message = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(process.terminationStatus == 1)
+        #expect(message.contains("refusing to read the DEK from an interactive terminal"), "\(message)")
+    }
+
+    // MARK: - No symbolic link in the folders above a path (as on Linux)
+
+    @Test func cliRefusesASymlinkedFolderAboveTheKeyFileOrTheDekFile() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard-cli-link-\(UUID().uuidString)")
+        let real = base.appendingPathComponent("real")
+        let link = base.appendingPathComponent("link")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+        // The key file: nothing is written through the link, and nothing in
+        // the real folder.
+        let viaLink = link.appendingPathComponent("out.key").path
+        let wrap = try Self.runCLI(
+            ["wrap", "-kf", viaLink, "-sn", "com.hkdfguard.tests.cli.folder.link", "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(wrap.exitCode == 1)
+        #expect(wrap.stderr.contains("is a symbolic link; the path must be a real path with no links in it"), "\(wrap.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: real.appendingPathComponent("out.key").path))
+
+        // The DEK file: refused before it is opened.
+        let dekFile = real.appendingPathComponent("dek.b64").path
+        try Self.writeDekFile(Data(Data(Self.randomDEK()).base64EncodedString().utf8), to: dekFile)
+        let viaLinkDek = try Self.wrapWithDekFile(link.appendingPathComponent("dek.b64").path)
+        #expect(viaLinkDek.exitCode == 1)
+        #expect(viaLinkDek.stderr.contains("is a symbolic link; the path must be a real path with no links in it"), "\(viaLinkDek.stderr)")
+
+        // `..` after a link is resolved as text: link/../real/x is real/x,
+        // which the kernel would otherwise reach through the link.
+        let dotted = link.appendingPathComponent("..").appendingPathComponent("real").appendingPathComponent("dek.b64").path
+        #expect(try Self.wrapWithDekFile(dotted).stderr.contains("symbolic link") == false, "a path whose folders are real after `..` is fine")
+    }
+
+    @Test func cliAcceptsMacOSsOwnRootOwnedLinksSuchAsTmp() throws {
+        // /tmp -> private/tmp is root's link in a root-owned folder: allowed,
+        // as is every test's temporary folder under /var.
+        var st = stat()
+        try #require(lstat("/tmp", &st) == 0 && st.st_mode & S_IFMT == S_IFLNK, "/tmp is no longer a link on this macOS")
+        let path = "/tmp/hkdfguard-cli-tmp-\(UUID().uuidString).key"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let result = try Self.runCLI(
+            ["wrap", "-kf", path, "-sn", "com.hkdfguard.tests.cli.tmp.link", "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(!result.stderr.contains("symbolic link"), "\(result.stderr)")
     }
 
     @Test func cliDekFileRefusesASymlink() throws {
@@ -1072,7 +1264,7 @@ struct HkdfGuardCommandLineToolTests {
             "--dek-file", "/dev/null"
         ])
         #expect(result.exitCode == 2) // argument-parsing failure
-        #expect(result.stderr.contains("conflicting DEK sources"))
+        #expect(result.stderr.contains("give exactly one of --dek-stdin or --dek-file"), "\(result.stderr)")
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
@@ -1080,7 +1272,7 @@ struct HkdfGuardCommandLineToolTests {
         let keyFilePath = Self.makeTempFilePath()
         let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", "com.hkdfguard.tests.cli.missing.source"])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("missing required DEK source"))
+        #expect(result.stderr.contains("missing required --dek-stdin or --dek-file <path>"), "\(result.stderr)")
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
@@ -1094,12 +1286,14 @@ struct HkdfGuardCommandLineToolTests {
 
         let first = try Self.runCLI(["provision", "--service-name", service])
         #expect(first.exitCode == 0, "provision failed: \(first.stderr)")
-        #expect(first.stdout.contains("provisioned KEK"))
+        #expect(first.stdout.contains("KEK provisioned for service \"\(service)\""), "\(first.stdout)")
         #expect(Self.kekItemExists(service: service))
 
         let second = try Self.runCLI(["provision", "-sn", service])
         #expect(second.exitCode == 0, "second provision failed: \(second.stderr)")
-        #expect(second.stdout.contains("already exists"))
+        // As on Linux and Windows: create_kek runs again and verifies the
+        // existing KEK, rather than provision stopping at kek_exists.
+        #expect(second.stdout.contains("KEK already provisioned for service \"\(service)\"; verified, nothing to do"), "\(second.stdout)")
         #expect(Self.kekItemExists(service: service))
     }
 
@@ -1161,13 +1355,13 @@ struct HkdfGuardCommandLineToolTests {
     @Test func cliRejectsMissingCommand() throws {
         let result = try Self.runCLI([])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("missing command"))
+        #expect(result.stderr.contains("missing subcommand: expected `provision`, `wrap`, `retire` or `status`"), "\(result.stderr)")
     }
 
     @Test func cliRejectsUnknownCommand() throws {
         let result = try Self.runCLI(["frobnicate", "--service-name", "com.hkdfguard.tests.cli.unknown.command"])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("unknown command"))
+        #expect(result.stderr.contains("unknown subcommand \"frobnicate\""), "\(result.stderr)")
     }
 
     @Test func cliRejectsPositionalKeyFilePath() throws {
@@ -1183,7 +1377,31 @@ struct HkdfGuardCommandLineToolTests {
     @Test func cliProvisionRejectsWrapOnlyFlags() throws {
         let result = try Self.runCLI(["provision", "--service-name", "com.hkdfguard.tests.cli.provision.extra", "--dek-stdin"])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("unrecognized argument"))
+        #expect(result.stderr.contains("--dek-stdin is not valid for `provision`; it belongs to `wrap`"), "\(result.stderr)")
+    }
+
+    @Test func cliRefusesEveryRepeatedFlag() throws {
+        // A repeated flag is a usage error rather than the last value
+        // winning -- the same rule and message as the Linux and Windows
+        // tools. Refused while parsing, so nothing is read or written.
+        let keyFilePath = Self.makeTempFilePath()
+        let fp = String(repeating: "ab", count: 32)
+        let svc = "com.hkdfguard.tests.cli.repeated"
+        for (args, flag) in [
+            (["wrap", "-kf", keyFilePath, "-kf", keyFilePath + ".b", "-sn", svc, "--dek-stdin"], "--key-file-path"),
+            (["wrap", "-kf", keyFilePath, "-sn", svc, "--service-name", svc + ".b", "--dek-stdin"], "--service-name"),
+            (["wrap", "-kf", keyFilePath, "-sn", svc, "--dek-stdin", "-f", "--force"], "--force"),
+            (["wrap", "-kf", keyFilePath, "-sn", svc, "--dek-stdin", "-fp", fp, "--fingerprint", fp], "--fingerprint"),
+            (["provision", "-sn", svc, "-sn", svc], "--service-name"),
+            (["status", "-sn", svc, "-sn", svc], "--service-name"),
+            (["retire", "-sn", svc, "-fp", fp, "-fp", fp], "--fingerprint"),
+            (["retire", "-sn", svc, "--corrupt", "--corrupt"], "--corrupt"),
+        ] {
+            let result = try Self.runCLI(args)
+            #expect(result.exitCode == 2, "\(args)")
+            #expect(result.stderr.contains("give \(flag) at most once"), "\(args): \(result.stderr)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
     // MARK: - Data-protection mode: the bundled CLI provisions, the entitled host unwraps
@@ -1253,7 +1471,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(wrap.stdout.contains("keychain: data-protection"), "stdout: \(wrap.stdout)")
 
         let wrapped = try Array(Data(contentsOf: URL(fileURLWithPath: keyFilePath)))
-        #expect(wrapped.count == 146)
+        #expect(wrapped.count == 125)
         let recovered = Self.unwrapInApplicationCode(wrapped, service: service)
         #expect(recovered.status == 0, "unwrap in the entitled host failed with \(recovered.status)")
         #expect(recovered.dek == dek)

@@ -71,7 +71,7 @@ pkgutil --check-signature "$PKG" | sed -n '1,4p'
 UNINSTALLER="/Library/Application Support/HkdfGuard/v1/uninstall.sh"
 echo
 if [ -x "$UNINSTALLER" ]; then
-    installed="$(pkgutil --pkg-info com.hkdfguard.native 2>/dev/null || pkgutil --pkg-info com.hkdfguard.native.v1 2>/dev/null || true)"
+    installed="$(pkgutil --pkg-info com.hkdfguard.native 2>/dev/null || true)"
     echo "==> Removing the installed version ($(printf '%s\n' "$installed" | sed -n 's/^version: //p'))"
     sudo "$UNINSTALLER"
 else
