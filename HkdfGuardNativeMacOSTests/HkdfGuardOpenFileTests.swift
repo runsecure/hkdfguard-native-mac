@@ -6,6 +6,7 @@
 import Testing
 import Foundation
 import CryptoKit
+import os
 @testable import HkdfGuardNativeMacOS
 
 /// Exercises `hkdfguard_open_file`: reading a wrapped payload from disk and
@@ -478,6 +479,60 @@ struct HkdfGuardOpenFileTests {
         // by the folder rule.
         try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: dir.path)
         #expect(Self.openFile(alias.path).status == -39)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func judgesAHardLinkedFileByTheFolderItWasOpenedThroughNotItsOtherName() throws {
+        // One file, two names: one in a trusted folder, one in a folder
+        // anyone can write. macOS's F_GETPATH reports whichever name of a
+        // hard-linked file was looked up *last*, so a check that works back
+        // from the open file to its folder can judge the wrong folder when
+        // another name is looked up between the open and that check. Here a
+        // background thread looks the other name up continuously while the
+        // key is opened many times: every open must be judged by the folder
+        // its own path names, every time.
+        let base = try Self.makeTempDirectory()
+        let trusted = base.appendingPathComponent("trusted", isDirectory: true)
+        let shared = base.appendingPathComponent("shared", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: shared.path)
+            try? FileManager.default.removeItem(at: base)
+        }
+        try FileManager.default.createDirectory(at: trusted, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: shared.path) // not sticky
+        let key = trusted.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: key)
+        let otherName = shared.appendingPathComponent("planted.key")
+        try FileManager.default.linkItem(at: key, to: otherName)
+
+        /// Opens `path` `rounds` times while another thread keeps looking up
+        /// `meanwhile`, returning how many times each status came back.
+        func openRepeatedly(_ path: String, whileLookingUp meanwhile: String, rounds: Int = 3000) -> [Int32: Int] {
+            let stop = OSAllocatedUnfairLock(initialState: false)
+            let looker = Thread {
+                var st = stat()
+                while !stop.withLock({ $0 }) { _ = lstat(meanwhile, &st) }
+            }
+            looker.start()
+            defer { stop.withLock { $0 = true } }
+            var counts: [Int32: Int] = [:]
+            for _ in 0..<rounds {
+                counts[Self.openFile(path).status, default: 0] += 1
+            }
+            return counts
+        }
+
+        // The genuine key, opened through its trusted folder: always
+        // accepted, never refused because of where its other name lives.
+        let genuine = openRepeatedly(key.path, whileLookingUp: otherName.path)
+        #expect(genuine == [0: 3000], "through the trusted folder: \(genuine)")
+
+        // Through the folder anyone can write: always refused -- whoever
+        // controls it could have put any older payload there -- never passed
+        // on the strength of the trusted folder.
+        let planted = openRepeatedly(otherName.path, whileLookingUp: key.path)
+        #expect(planted == [-39: 3000], "through the shared folder: \(planted)")
     }
 
     @Test(.timeLimit(.minutes(1)))

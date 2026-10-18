@@ -1,6 +1,5 @@
 #!/bin/sh
-# Removes what the com.hkdfguard.native package installed (and what earlier
-# packages installed as com.hkdfguard.native.v1 -- the same files):
+# Removes what the com.hkdfguard.native package installed:
 #
 #   /Library/Application Support/HkdfGuard/v1/
 #   /usr/local/bin/hkdfguard   (only if it is still our symlink)
@@ -40,7 +39,5 @@ if [ -e "$root_dir" ] || [ -L "$root_dir" ]; then
     rmdir "$root_dir" 2>/dev/null || true
 fi
 
-for id in com.hkdfguard.native com.hkdfguard.native.v1; do
-    pkgutil --forget "$id" >/dev/null 2>&1 \
-        && echo "==> Forgot package receipt $id" || true
-done
+pkgutil --forget com.hkdfguard.native >/dev/null 2>&1 \
+    && echo "==> Forgot package receipt com.hkdfguard.native" || true

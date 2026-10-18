@@ -1754,8 +1754,8 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
     }
 }
 
-/// Whether every folder above the open key file `fd` -- its own folder and
-/// each one up to `/` -- is one nobody untrusted can rename, replace or
+/// Whether the key file's folder, open as `folderFd`, and every folder above
+/// it up to `/` are ones nobody untrusted can rename, replace or
 /// delete entries in: a directory owned by root or this process's
 /// effective user, and not writable by group or others unless sticky
 /// (`/tmp`-style: the kernel then lets only an entry's owner, or the
@@ -1763,27 +1763,33 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
 /// checked). Write bits are ignored on a read-only volume. Linux's
 /// `check_dir_chain_for_existing_file`, with the same rules.
 ///
-/// The folder is taken from the descriptor (`F_GETPATH`), so it is where
-/// the file that will be read actually sits. Linux also checks the folder
-/// the path names the file in, which differs when the last component is a
-/// symlink; here that is refused at the open (`O_NOFOLLOW`), so the two are
-/// the same folder. As on Linux, folders that symlinks inside the path
-/// live in are not walked: someone able to retarget one could at most send
-/// the path to a different file that itself passes every check here.
+/// The folder is the one the path names the file in, opened by
+/// `readWrappedFile` before the file, which is then opened *within* it
+/// (`openat`): so the file read is that folder's entry, whatever other
+/// names (hard links) it has elsewhere, and the folder checked is where it
+/// was found -- Linux's "folder the path names it in". (Working back from
+/// the open file instead, with F_GETPATH, fails for a hard-linked file:
+/// macOS reports whichever of its names was looked up last.) As on Linux,
+/// folders that symlinks inside the path live in are not walked: someone
+/// able to retarget one could at most send the path to a different file
+/// that itself passes every check here.
 ///
 /// A folder writable by the `admin` group (`/Applications`, say) fails,
 /// as a group-writable folder does on Linux: every administrator could
 /// replace the key there without root.
-func keyFileFoldersAreTrusted(_ fd: Int32) -> Bool {
+func keyFileFoldersAreTrusted(folderFd: Int32) -> Bool {
+    // The folder's own path, from its descriptor. Reliable for a folder, as
+    // it is not for a file: a file with several hard links has several
+    // names, and F_GETPATH reports whichever was looked up last -- not
+    // necessarily the one it was opened by. A folder has exactly one.
     var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-    guard fcntl(fd, F_GETPATH, &pathBuf) != -1 else {
+    guard fcntl(folderFd, F_GETPATH, &pathBuf) != -1 else {
         return false
     }
-    let filePath = String(cString: pathBuf)
-    guard filePath.hasPrefix("/"), let lastSlash = filePath.lastIndex(of: "/") else {
+    var folder = String(cString: pathBuf)
+    guard folder.hasPrefix("/") else {
         return false
     }
-    var folder = lastSlash == filePath.startIndex ? "/" : String(filePath[..<lastSlash])
 
     let uid = geteuid()
     while true {
@@ -1825,14 +1831,41 @@ private func readWrappedFile(
     path: UnsafePointer<CChar>,
     into buffer: inout [UInt8]
 ) -> (status: HKDFGuardStatus, count: Int) {
-    // O_NOFOLLOW: a symlink as the final component is refused, not followed
-    // (symlinks in directory components still resolve, so /etc and /tmp --
-    // themselves symlinks into /private -- work). O_NONBLOCK: a FIFO with
-    // no writer would otherwise block here; it has no effect on the regular
-    // files actually accepted. O_CLOEXEC: never inherited by a child.
+    // The path is split, as bytes, into the folder it names and its last
+    // component. The folder is opened first and the file then opened within
+    // it (openat), so the file read is exactly that folder's entry and the
+    // folder is the one checked below -- never inferred back from the file,
+    // which a hard link makes ambiguous (see keyFileFoldersAreTrusted).
+    let length = strlen(path)
+    var lastSlash = -1
+    for i in 0..<length where path[i] == 0x2F { // '/'
+        lastSlash = i
+    }
+    guard lastSlash + 1 < length else {
+        return (.fileIO, 0) // ends in '/': names a folder, not a file
+    }
+    let folderPath: [CChar] = lastSlash < 0
+        ? [0x2E, 0] // "." -- a bare file name is in the current folder
+        : lastSlash == 0 ? [0x2F, 0] : Array(UnsafeBufferPointer(start: path, count: lastSlash)) + [0]
+
+    // Symlinks in the folder part resolve as usual, so /etc and /tmp --
+    // themselves symlinks into /private -- work.
+    var folderFd: Int32
+    repeat {
+        folderFd = open(folderPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    } while folderFd < 0 && errno == EINTR
+    guard folderFd >= 0 else {
+        return (fileOpenStatus(errno: errno), 0)
+    }
+    defer { close(folderFd) }
+
+    // O_NOFOLLOW: a symlink as the final component is refused, not followed.
+    // O_NONBLOCK: a FIFO with no writer would otherwise block here; it has
+    // no effect on the regular files actually accepted. O_CLOEXEC: never
+    // inherited by a child.
     var fd: Int32
     repeat {
-        fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        fd = openat(folderFd, path + lastSlash + 1, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     } while fd < 0 && errno == EINTR
     guard fd >= 0 else {
         return (fileOpenStatus(errno: errno), 0)
@@ -1856,8 +1889,9 @@ private func readWrappedFile(
     // A file with more than one hard link is accepted, as on Linux and
     // Windows. Another name for the file only matters if someone could use
     // it to put an older payload where the service looks -- and that takes
-    // creating an entry in the key's own folder, which
-    // `keyFileFoldersAreTrusted` below limits to the owner and root.
+    // creating an entry in the key's own folder: the folder the file was
+    // just opened within, which `keyFileFoldersAreTrusted` below limits to
+    // the owner and root.
     guard info.st_uid == geteuid() || info.st_uid == 0,
           info.st_mode & (S_IWGRP | S_IWOTH) == 0 else {
         return (.fileInsecure, 0)
@@ -1865,7 +1899,7 @@ private func readWrappedFile(
     // And the folders that decide what the path names, as on Linux --
     // otherwise someone else could rename a file of their choosing over the
     // key, and the checks above would pass on whatever they put there.
-    guard keyFileFoldersAreTrusted(fd) else {
+    guard keyFileFoldersAreTrusted(folderFd: folderFd) else {
         return (.fileInsecure, 0)
     }
     guard info.st_size <= off_t(hkdfguardWrappedLength) else {

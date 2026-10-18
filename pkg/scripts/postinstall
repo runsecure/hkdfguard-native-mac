@@ -1,7 +1,6 @@
 #!/bin/sh
 # postinstall for com.hkdfguard.native. Runs as root after the payload is
-# in place. It forgets the receipt of the package's old ID (below), then
-# makes the PATH symlink:
+# in place. Its only job is the PATH symlink:
 #
 #   /usr/local/bin/hkdfguard
 #       -> /Library/Application Support/HkdfGuard/v1/hkdfguard
@@ -29,16 +28,6 @@ export PATH
 # $3 is the target volume ("/" for a normal install).
 volume="${3:-/}"
 volume="${volume%/}"
-
-# Earlier packages were built as com.hkdfguard.native.v1. This
-# package has just replaced the same files under its new ID, so the old
-# receipt describes nothing that isn't now this one's: forget it, so pkgutil
-# shows one installation. Done first, before any of the early exits below.
-if pkgutil --volume "${volume:-/}" --pkg-info com.hkdfguard.native.v1 >/dev/null 2>&1; then
-    pkgutil --volume "${volume:-/}" --forget com.hkdfguard.native.v1 >/dev/null 2>&1 \
-        && echo "hkdfguard postinstall: forgot the old package receipt com.hkdfguard.native.v1" \
-        || echo "hkdfguard postinstall: could not forget the old receipt com.hkdfguard.native.v1"
-fi
 
 cli="/Library/Application Support/HkdfGuard/v1/hkdfguard"
 bin_dir="$volume/usr/local/bin"

@@ -981,7 +981,9 @@ struct HkdfGuardCommandLineToolTests {
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
         let result = try Self.runCLI(
             ["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.nonascii.dek", "--dek-stdin"],
-            stdin: Data([0xFF, 0xFE, 0x41, 0x41, 0x0A])
+            // Non-ASCII that isn't a byte-order mark: FF FE would be read as
+            // UTF-16 and refused as such (tested on its own below).
+            stdin: Data([0xC3, 0xA9, 0x41, 0x41, 0x0A]) // UTF-8 "é", then "AA\n"
         )
         #expect(result.exitCode == 1)
         #expect(result.stderr.contains("not valid base64"), "stderr: \(result.stderr)")

@@ -964,11 +964,6 @@ replaces `v1/` as a whole, so the result is a consistent downgrade, not a
 mix — so have the MDM policy or the operator compare
 `pkgutil --pkg-info com.hkdfguard.native` first.
 
-Earlier packages used the package ID `com.hkdfguard.native.v1`. The current
-package installs over one of those normally and forgets the old receipt, so
-afterwards `pkgutil` lists only `com.hkdfguard.native`. MDM policies that
-check the installed version should look for the new ID, or for either.
-
 ### The `PATH` symlink
 
 The package's `postinstall` script creates

@@ -57,8 +57,6 @@ HEADER_NAME="hkdfguard.h"
 CLI_NAME="hkdfguard"
 APP_NAME="hkdfguard.app"
 # The package ID macOS records the installation under (pkgutil --pkg-info).
-# Earlier packages used com.hkdfguard.native.v1; postinstall forgets
-# that old receipt, since this package takes over the same files.
 PKG_ID="com.hkdfguard.native"
 INSTALL_LOCATION="/Library/Application Support/HkdfGuard"
 

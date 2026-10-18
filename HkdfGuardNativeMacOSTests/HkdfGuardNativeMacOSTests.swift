@@ -1314,7 +1314,7 @@ struct HkdfGuardCrossPlatformABITests {
     static let linuxPresent = FileManager.default.fileExists(atPath: linuxHeader.path)
     static let linuxMissing = Comment(rawValue: "hkdfguard-native-linux is not checked out next to this repository")
 
-    /// The functions only this platform exports, as both headers document.
+    /// The functions only this platform exports, as its header documents.
     static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_kek_fingerprint"]
 
     static func read(_ url: URL) throws -> String {
@@ -1589,7 +1589,11 @@ struct HkdfGuardAuditTests {
 /// The setup gate (`gatedSetup`) on its own, without the Secure Enclave:
 /// each test passes its own floor rather than touching the shared
 /// override, so these run safely alongside the other suites.
-@Suite
+// Serialized: the gate is one lock for the whole process, so these tests
+// would otherwise queue behind each other. The timing tests below also
+// start their clocks inside the body, so time spent waiting for the gate --
+// behind another suite's setup call, say -- is never counted against them.
+@Suite(.serialized)
 struct HkdfGuardSetupGateTests {
     @Test func theProductionFloorIsOneSecondAsOnLinuxAndWindows() {
         #expect(setupMinDelay == .milliseconds(1_000))
@@ -1607,16 +1611,21 @@ struct HkdfGuardSetupGateTests {
     @Test func aSlowCallPaysNoMoreThanItsOwnTime() {
         let floor = Duration.milliseconds(100)
         let clock = ContinuousClock()
-        let elapsed = clock.measure {
-            gatedSetup(floor: floor) { Thread.sleep(forTimeInterval: 0.3) }
+        var bodyStarted = clock.now
+        gatedSetup(floor: floor) {
+            bodyStarted = clock.now // once inside the gate: no queueing counted
+            Thread.sleep(forTimeInterval: 0.3)
         }
+        let elapsed = clock.now - bodyStarted
         #expect(elapsed >= .milliseconds(300))
         #expect(elapsed < .milliseconds(300) + floor, "the floor is a minimum, not added on top; took \(elapsed)")
     }
 
     @Test func aZeroFloorDoesNotWait() {
         let clock = ContinuousClock()
-        let elapsed = clock.measure { gatedSetup(floor: .zero) { () } }
+        var bodyStarted = clock.now
+        gatedSetup(floor: .zero) { bodyStarted = clock.now }
+        let elapsed = clock.now - bodyStarted
         #expect(elapsed < .milliseconds(100), "took \(elapsed)")
     }
 

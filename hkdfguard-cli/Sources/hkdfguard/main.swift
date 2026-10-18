@@ -1070,8 +1070,30 @@ func requireRealFolder(_ path: String, what: String) throws -> String {
         throw CLIError("\(what) \(path) has no file name")
     }
 
+    // Walked one folder at a time. An accepted link's *target* is pushed
+    // back onto the queue and walked the same way -- not handed to
+    // realpath(), which would follow any further link inside it, including
+    // one a user owns -- so every link on the way must itself be
+    // root-only. A `..` inside a link target goes up from `current`, which
+    // only ever holds real folders reached this way, so doing it as text is
+    // exact.
     var current = "/"
-    for name in components {
+    var remaining = components[...]
+    var linksFollowed = 0
+    func parentOf(_ folder: String) -> String {
+        guard folder != "/", let slash = folder.lastIndex(of: "/") else { return "/" }
+        return slash == folder.startIndex ? "/" : String(folder[..<slash])
+    }
+    while let name = remaining.popFirst() {
+        switch name {
+        case ".":
+            continue
+        case "..":
+            current = parentOf(current)
+            continue
+        default:
+            break
+        }
         let candidate = current == "/" ? "/" + name : current + "/" + name
         var st = stat()
         guard lstat(candidate, &st) == 0 else {
@@ -1084,15 +1106,23 @@ func requireRealFolder(_ path: String, what: String) throws -> String {
             var parent = stat()
             let rootOnly = st.st_uid == 0 && lstat(current, &parent) == 0 && parent.st_uid == 0
                 && parent.st_mode & (S_IWGRP | S_IWOTH) == 0
-            guard rootOnly, let resolved = realpath(candidate, nil) else {
+            guard rootOnly else {
                 throw CLIError("\(what) \(path): the folder \(candidate) is a symbolic link; the path must be a real path with no links in it (macOS's own root-owned links, such as /tmp and /var, are accepted)")
             }
-            current = String(cString: resolved)
-            free(resolved)
-            var target = stat()
-            guard lstat(current, &target) == 0, target.st_mode & S_IFMT == S_IFDIR else {
-                throw CLIError("\(what) \(path): \(candidate) does not lead to a folder")
+            linksFollowed += 1
+            guard linksFollowed <= 32 else { // the kernel's own ELOOP limit
+                throw CLIError("\(what) \(path): too many symbolic links in its folders")
             }
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) + 1)
+            let length = readlink(candidate, &buffer, Int(MAXPATHLEN))
+            guard length > 0 else {
+                throw CLIError("\(what) \(path): could not read the link \(candidate): \(String(cString: strerror(errno)))")
+            }
+            let target = String(decoding: buffer[0..<length].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            if target.hasPrefix("/") {
+                current = "/"
+            }
+            remaining = (target.split(separator: "/", omittingEmptySubsequences: true).map(String.init) + remaining)[...]
         default:
             throw CLIError("\(what) \(path): \(candidate) is not a folder")
         }
