@@ -1829,6 +1829,7 @@ private func folderIsOnReadOnlyVolume(_ folder: String) -> Bool {
 /// DEK.
 private func readWrappedFile(
     path: UnsafePointer<CChar>,
+    length: Int, // the path's length, already bounded by openFileCore
     into buffer: inout [UInt8]
 ) -> (status: HKDFGuardStatus, count: Int) {
     // The path is split, as bytes, into the folder it names and its last
@@ -1836,7 +1837,6 @@ private func readWrappedFile(
     // it (openat), so the file read is exactly that folder's entry and the
     // folder is the one checked below -- never inferred back from the file,
     // which a hard link makes ambiguous (see keyFileFoldersAreTrusted).
-    let length = strlen(path)
     var lastSlash = -1
     for i in 0..<length where path[i] == 0x2F { // '/'
         lastSlash = i
@@ -1901,6 +1901,12 @@ private func readWrappedFile(
     // key, and the checks above would pass on whatever they put there.
     guard keyFileFoldersAreTrusted(folderFd: folderFd) else {
         return (.fileInsecure, 0)
+    }
+    // Exactly a DEK's size: a plaintext key, refused from its size alone,
+    // never read into this process -- as on Linux (key_file.rs). A 32-byte
+    // file rewritten mid-call is still caught on its contents below.
+    guard info.st_size != off_t(hkdfguardDekLength) else {
+        return (.fileUnprotectedKey, 0)
     }
     guard info.st_size <= off_t(hkdfguardWrappedLength) else {
         return (.fileTooLong, 0)
@@ -2092,6 +2098,14 @@ private func openFileCore(
     guard let pathPtr, pathPtr.pointee != 0 else {
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
+    // The terminator is looked for in at most PATH_MAX bytes, as on Linux
+    // (cstr_to_path): no NUL in that range -- an unterminated buffer, or a
+    // path no open could take -- is an argument error, and nothing past it
+    // is ever read.
+    let pathLength = strnlen(pathPtr, Int(PATH_MAX))
+    guard pathLength < Int(PATH_MAX) else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
     // Too small for a payload -- including the 0 of a size probe, which may
     // pass a NULL `out`: answered without opening the file.
     guard Int(capacity) >= hkdfguardWrappedLength else {
@@ -2108,7 +2122,7 @@ private func openFileCore(
     var buffer = [UInt8](repeating: 0, count: hkdfguardWrappedLength + 1)
     defer { secureZero(&buffer) }
 
-    let (readStatus, count) = readWrappedFile(path: pathPtr, into: &buffer)
+    let (readStatus, count) = readWrappedFile(path: pathPtr, length: pathLength, into: &buffer)
     guard readStatus == .success else {
         return readStatus.rawValue
     }

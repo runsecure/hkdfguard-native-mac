@@ -623,9 +623,9 @@ hkdfguard retire --service-name|-sn <name> \
   `hkdfguard_wrap_dek` returns against their recorded fingerprint before
   storing it.
 - **`--force`** securely overwrites an existing `<path>` (eight alternating
-  zero/random passes, streamed through one 1 MiB buffer so memory use does
-  not grow with the file, each pass flushed with `F_FULLFSYNC`) before
-  replacing it. A `--fingerprint` mismatch is detected before the overwrite
+  zero/random passes, each flushed with `F_FULLFSYNC`) before replacing it.
+  It refuses a file over 64 KiB, as the Linux tool does: a wrapped key is
+  125 bytes, so anything far bigger at the key path isn't one. A `--fingerprint` mismatch is detected before the overwrite
   starts, so the existing file is left intact. It only ever
   touches a **regular file with a single link**: a symlink at `<path>` is
   refused rather than followed (`O_NOFOLLOW` + `fstat`), and so is a file
@@ -1212,8 +1212,8 @@ Three Swift Testing suites:
   and their bounds (whitespace, oversized, non-ASCII, missing file),
   rejected arguments, `wrap --fingerprint` (match, mismatch leaves an
   existing file untouched, malformed), `retire` by fingerprint and
-  `--corrupt`, `--force` symlink/hard-link/FIFO refusal and the chunked
-  overwrite of a multi-megabyte file, file permissions, exit codes, and —
+  `--corrupt`, `--force` symlink/hard-link/FIFO refusal, the 64 KiB size cap
+  and a full overwrite at that cap, file permissions, exit codes, and —
   hosted — the bundled CLI's data-protection provision/wrap/retire with
   this host unwrapping.
 

@@ -865,24 +865,68 @@ struct HkdfGuardCommandLineToolTests {
     }
 
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
-    func cliForceOverwritesALargeFileInChunksBeforeReplacingIt() throws {
-        // The secure overwrite streams through one 1 MiB buffer. A file of
-        // 2 MiB + 123 bytes spans two full chunks and a partial one, so every
-        // boundary case of the chunk loop is exercised.
+    func cliWrapWritesWhereThePathWasCheckedNotWhereALinkBeforeDotDotLeads() throws {
+        // keys/link -> elsewhere/deep: to the kernel keys/link/.. is
+        // `elsewhere`, while the folder check resolves `..` as text, to
+        // `keys`. The CLI must write exactly there -- the Linux tool's
+        // cli_wrap_writes_where_the_path_was_checked_not_where_a_link_before_dotdot_leads.
+        let service = "com.hkdfguard.tests.cli.dotdot"
+        defer { Self.deleteKEK(service: service) }
+        try Self.provision(service: service)
+
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard-dotdot-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let keys = base.appendingPathComponent("keys")
+        let elsewhere = base.appendingPathComponent("elsewhere")
+        try FileManager.default.createDirectory(at: elsewhere.appendingPathComponent("deep"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: keys, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: keys.appendingPathComponent("link"), withDestinationURL: elsewhere.appendingPathComponent("deep"))
+
+        let result = try Self.runCLI(
+            ["wrap", "-kf", keys.path + "/link/../wrapped.key", "-sn", service, "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(result.exitCode == 0, "\(result.stderr)")
+        #expect(FileManager.default.fileExists(atPath: keys.appendingPathComponent("wrapped.key").path), "written in the checked folder")
+        #expect(!FileManager.default.fileExists(atPath: elsewhere.appendingPathComponent("wrapped.key").path), "nothing where the link leads")
+    }
+
+    @Test func cliForceRefusesAFileOverTheSizeCapAndLeavesItIntact() throws {
+        // A wrapped key is 125 bytes; anything over 64 KiB at the key path
+        // isn't one, and --force refuses it (as the Linux tool does) --
+        // before any Secure Enclave or keychain work, so no KEK is needed.
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        let original = Data(repeating: 0xAB, count: 64 * 1024 + 1)
+        try original.write(to: URL(fileURLWithPath: keyFilePath))
+
+        let result = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.force.overcap", "--dek-stdin", "--force"],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(result.exitCode == 1)
+        #expect(result.stderr.contains("far larger than any wrapped key"), "stderr: \(result.stderr)")
+        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)) == original, "the file is left untouched")
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliForceOverwritesAFileUpToTheSizeCapBeforeReplacingIt() throws {
+        // --force overwrites a file of up to 64 KiB (the Linux tool's cap; a
+        // bigger one is refused, tested separately). A file of exactly
+        // 64 KiB, the largest accepted, must be overwritten in full.
         //
         // The test holds its own descriptor on the old file before running
         // the CLI. An open descriptor is not a link (st_nlink stays 1, so
         // --force accepts the file), but it keeps the inode readable after
         // the CLI unlinks the name -- which is how the overwritten bytes are
         // inspected here.
-        let service = "com.hkdfguard.tests.cli.force.chunked"
+        let service = "com.hkdfguard.tests.cli.force.atcap"
         defer { Self.deleteKEK(service: service) }
         try Self.provision(service: service)
 
         let keyFilePath = Self.makeTempFilePath()
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
-        let chunk = 1 << 20
-        let size = 2 * chunk + 123
+        let size = 64 * 1024 // exactly the cap: accepted
         let original = Data(repeating: 0xAB, count: size)
         try original.write(to: URL(fileURLWithPath: keyFilePath))
 
@@ -912,14 +956,11 @@ struct HkdfGuardCommandLineToolTests {
         #expect(after.count == size)
         #expect(after.firstRange(of: Data(repeating: 0xAB, count: 64)) == nil,
                 "a run of the original pattern survived the overwrite")
-        // The last pass is a random one, with fresh CSPRNG bytes per chunk:
-        // no two chunks, and not the partial tail, may repeat each other.
-        let first = after[0..<chunk]
-        let second = after[chunk..<(2 * chunk)]
-        let tail = after[(2 * chunk)...]
-        #expect(first != second)
-        #expect(Data(tail) != Data(first.prefix(tail.count)))
-        #expect(Data(tail) != Data(repeating: 0, count: tail.count), "the partial last chunk was not overwritten")
+        // The last pass is a random one, over the whole file: its two halves
+        // don't repeat each other, and its end isn't left zeroed.
+        let half = size / 2
+        #expect(after[0..<half] != after[half...])
+        #expect(Data(after.suffix(1024)) != Data(repeating: 0, count: 1024), "the end of the file was not overwritten")
     }
 
     @Test func cliRejectsEmptyOrWhitespaceOnlyStdin() throws {

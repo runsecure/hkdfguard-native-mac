@@ -432,7 +432,9 @@ int hkdfguard_generate_and_wrap_dek(
 // Enclave, and never unwraps: the plaintext DEK does not pass through this
 // function.
 //
-// `path` is a null-terminated filesystem path. It must name a regular file
+// `path` is a null-terminated filesystem path, at most PATH_MAX (1024) bytes
+// including the terminator: a path with no terminator within that is
+// HKDFGUARD_ERR_INVALID_ARGUMENT, and nothing past it is read. It must name a regular file
 // owned by this process's effective user or by root, writable by no one but
 // its owner, in folders that are each -- up to / --
 // owned by root or this user and not writable by group or others unless

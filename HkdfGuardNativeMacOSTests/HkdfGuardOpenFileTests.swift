@@ -556,6 +556,29 @@ struct HkdfGuardOpenFileTests {
         #expect(result.outLen == Int32(Self.wrappedLength))
     }
 
+    @Test func aPathWithNoTerminatorWithinPathMaxIsAnArgumentError() {
+        // As on Linux: the terminator is looked for in at most PATH_MAX
+        // bytes, and a path with none there is -1 -- never read past. The
+        // buffer here is exactly PATH_MAX bytes with no NUL at all.
+        var unterminated = [CChar](repeating: 0x61, count: Int(PATH_MAX)) // "aaaa..."
+        var out = [UInt8](repeating: 0, count: 256)
+        var outLen: Int32 = 256
+        let rc = unterminated.withUnsafeMutableBufferPointer { path in
+            out.withUnsafeMutableBufferPointer { hkdfguard_open_file(pathPtr: path.baseAddress, outPtr: $0.baseAddress, outLen: &outLen) }
+        }
+        #expect(rc == -1)
+
+        // One byte shorter, terminated: not an argument error (it just
+        // doesn't exist).
+        unterminated[Int(PATH_MAX) - 1] = 0
+        unterminated[0] = 0x2F // "/aaa..."
+        outLen = 256
+        let rc2 = unterminated.withUnsafeMutableBufferPointer { path in
+            out.withUnsafeMutableBufferPointer { hkdfguard_open_file(pathPtr: path.baseAddress, outPtr: $0.baseAddress, outLen: &outLen) }
+        }
+        #expect(rc2 != -1, "a terminated path within PATH_MAX is examined, got \(rc2)")
+    }
+
     @Test func nullPointersAreReportedNotDereferenced() {
         var out = [UInt8](repeating: 0, count: 1024)
         var outLen: Int32 = 1024

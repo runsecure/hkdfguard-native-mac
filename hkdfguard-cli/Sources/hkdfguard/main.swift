@@ -75,7 +75,7 @@
 //                      or by this process's user, granting no access to
 //                      group or others (mode 0400/0600), and not reached
 //                      through a symlinked folder -- the Linux tool's rule
-//                      (see openDekFile, requireRealFolder).
+//                      (see openDekFile, openRealFolder).
 //
 // There is deliberately no way to pass the DEK itself as a command-line
 // argument: an argv value is visible to every other process on the host
@@ -1052,11 +1052,28 @@ let forbidGroupOtherAccess: mode_t = 0o077
 // one else can write -- and is followed to its real folder. Any other link
 // is refused.
 //
-// Returns the real path (folders resolved, `.` and `..` removed as text),
-// and callers use *that* for every filesystem call that follows, so the
-// kernel reaches exactly the folder that was checked. `what` names the
-// path in messages.
-func requireRealFolder(_ path: String, what: String) throws -> String {
+// Returns the checked folder *open* (CheckedFolder), and callers do every
+// filesystem call that follows through its descriptor -- openat, fstatat,
+// unlinkat, fsync -- never by path, so nothing swapped after the check
+// (a folder replaced by a link, say) can redirect them. `.` and `..` in the
+// spelled path are removed as text first. `what` names the path in messages.
+struct CheckedFolder {
+    /// The folder the file is named in, reached by a chain of no-follow
+    /// openat() calls from "/": every later operation on the file goes
+    /// through this descriptor (openat, fstatat, unlinkat, fsync), so a
+    /// folder swapped for a symbolic link after the check cannot redirect
+    /// any of them -- the descriptor still names the folder that was checked.
+    let fd: Int32
+    /// That folder's path as walked, for messages.
+    let path: String
+    /// The file's name within it.
+    let leaf: String
+
+    var filePath: String { path == "/" ? "/" + leaf : path + "/" + leaf }
+    func close() { _ = Darwin.close(fd) }
+}
+
+func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
     var components: [String] = []
     let absolute = path.hasPrefix("/") ? path : FileManager.default.currentDirectoryPath + "/" + path
     for part in absolute.split(separator: "/", omittingEmptySubsequences: true) {
@@ -1070,78 +1087,100 @@ func requireRealFolder(_ path: String, what: String) throws -> String {
         throw CLIError("\(what) \(path) has no file name")
     }
 
-    // Walked one folder at a time. An accepted link's *target* is pushed
-    // back onto the queue and walked the same way -- not handed to
-    // realpath(), which would follow any further link inside it, including
-    // one a user owns -- so every link on the way must itself be
-    // root-only. A `..` inside a link target goes up from `current`, which
-    // only ever holds real folders reached this way, so doing it as text is
-    // exact.
+    // Walked one folder at a time, each opened *from the previous one's
+    // descriptor* with O_NOFOLLOW: what is checked is exactly what is held,
+    // with no path re-resolved later. An accepted link's target is pushed
+    // back onto the queue and walked the same way (never handed to
+    // realpath(), which would follow a further link inside it, a user's
+    // included), so every link on the way must itself be root-only. A `..`
+    // inside a link target is opened as ".." from the folder reached so
+    // far, which contains no links.
+    var dirFd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard dirFd >= 0 else {
+        throw CLIError("failed to open / to resolve \(what) \(path): \(String(cString: strerror(errno)))")
+    }
     var current = "/"
-    var remaining = components[...]
-    var linksFollowed = 0
+    func join(_ folder: String, _ name: String) -> String { folder == "/" ? "/" + name : folder + "/" + name }
     func parentOf(_ folder: String) -> String {
         guard folder != "/", let slash = folder.lastIndex(of: "/") else { return "/" }
         return slash == folder.startIndex ? "/" : String(folder[..<slash])
     }
-    while let name = remaining.popFirst() {
-        switch name {
-        case ".":
-            continue
-        case "..":
-            current = parentOf(current)
-            continue
-        default:
-            break
-        }
-        let candidate = current == "/" ? "/" + name : current + "/" + name
-        var st = stat()
-        guard lstat(candidate, &st) == 0 else {
-            throw CLIError("failed to resolve the folder of \(what) \(path): \(candidate): \(String(cString: strerror(errno)))")
-        }
-        switch st.st_mode & S_IFMT {
-        case S_IFDIR:
-            current = candidate
-        case S_IFLNK:
-            var parent = stat()
-            let rootOnly = st.st_uid == 0 && lstat(current, &parent) == 0 && parent.st_uid == 0
-                && parent.st_mode & (S_IWGRP | S_IWOTH) == 0
-            guard rootOnly else {
-                throw CLIError("\(what) \(path): the folder \(candidate) is a symbolic link; the path must be a real path with no links in it (macOS's own root-owned links, such as /tmp and /var, are accepted)")
-            }
-            linksFollowed += 1
-            guard linksFollowed <= 32 else { // the kernel's own ELOOP limit
-                throw CLIError("\(what) \(path): too many symbolic links in its folders")
-            }
-            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) + 1)
-            let length = readlink(candidate, &buffer, Int(MAXPATHLEN))
-            guard length > 0 else {
-                throw CLIError("\(what) \(path): could not read the link \(candidate): \(String(cString: strerror(errno)))")
-            }
-            let target = String(decoding: buffer[0..<length].map { UInt8(bitPattern: $0) }, as: UTF8.self)
-            if target.hasPrefix("/") {
-                current = "/"
-            }
-            remaining = (target.split(separator: "/", omittingEmptySubsequences: true).map(String.init) + remaining)[...]
-        default:
-            throw CLIError("\(what) \(path): \(candidate) is not a folder")
-        }
+    func move(to newFd: Int32, _ newPath: String) {
+        _ = Darwin.close(dirFd)
+        dirFd = newFd
+        current = newPath
     }
-    return current == "/" ? "/" + leaf : current + "/" + leaf
+
+    var remaining = components[...]
+    var linksFollowed = 0
+    do {
+        while let name = remaining.popFirst() {
+            switch name {
+            case ".":
+                continue
+            case "..":
+                let up = openat(dirFd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                guard up >= 0 else {
+                    throw CLIError("failed to resolve the folder of \(what) \(path): \(String(cString: strerror(errno)))")
+                }
+                move(to: up, parentOf(current))
+                continue
+            default:
+                break
+            }
+            let candidate = join(current, name)
+            var st = stat()
+            guard fstatat(dirFd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw CLIError("failed to resolve the folder of \(what) \(path): \(candidate): \(String(cString: strerror(errno)))")
+            }
+            switch st.st_mode & S_IFMT {
+            case S_IFDIR:
+                let next = openat(dirFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard next >= 0 else {
+                    let err = errno
+                    if err == ELOOP {
+                        throw CLIError("\(what) \(path): the folder \(candidate) became a symbolic link while it was being checked; refusing to use it")
+                    }
+                    throw CLIError("failed to open the folder \(candidate) of \(what) \(path): \(String(cString: strerror(err)))")
+                }
+                move(to: next, candidate)
+            case S_IFLNK:
+                var parent = stat()
+                let rootOnly = st.st_uid == 0 && fstat(dirFd, &parent) == 0 && parent.st_uid == 0
+                    && parent.st_mode & (S_IWGRP | S_IWOTH) == 0
+                guard rootOnly else {
+                    throw CLIError("\(what) \(path): the folder \(candidate) is a symbolic link; the path must be a real path with no links in it (macOS's own root-owned links, such as /tmp and /var, are accepted)")
+                }
+                linksFollowed += 1
+                guard linksFollowed <= 32 else { // the kernel's own ELOOP limit
+                    throw CLIError("\(what) \(path): too many symbolic links in its folders")
+                }
+                var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) + 1)
+                let length = readlinkat(dirFd, name, &buffer, Int(MAXPATHLEN))
+                guard length > 0 else {
+                    throw CLIError("\(what) \(path): could not read the link \(candidate): \(String(cString: strerror(errno)))")
+                }
+                let target = String(decoding: buffer[0..<length].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                if target.hasPrefix("/") {
+                    let root = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                    guard root >= 0 else {
+                        throw CLIError("failed to open / to resolve \(what) \(path): \(String(cString: strerror(errno)))")
+                    }
+                    move(to: root, "/")
+                }
+                remaining = (target.split(separator: "/", omittingEmptySubsequences: true).map(String.init) + remaining)[...]
+            default:
+                throw CLIError("\(what) \(path): \(candidate) is not a folder")
+            }
+        }
+    } catch {
+        _ = Darwin.close(dirFd)
+        throw error
+    }
+    return CheckedFolder(fd: dirFd, path: current, leaf: leaf)
 }
 
-// After an open: `fd` must be the file now at `realPath` (see
-// requireRealFolder) -- nothing was swapped between the folder check and
-// the open. Judged by device and inode, as the Linux tool does where
-// /proc isn't available.
-func requireOpenedAt(_ fd: Int32, realPath: String, what: String) throws {
-    var opened = stat()
-    var named = stat()
-    guard fstat(fd, &opened) == 0, lstat(realPath, &named) == 0,
-          opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
-        throw CLIError("\(what) \(realPath) was moved or replaced while it was being opened; refusing to use it")
-    }
-}
+
 
 // Opens a --dek-file with the same hardening as the Linux tool's
 // read_dek_file: O_NOFOLLOW so a symlink fails the open outright, O_NONBLOCK
@@ -1151,10 +1190,13 @@ func requireOpenedAt(_ fd: Int32, realPath: String, what: String) throws {
 // read. The file must be a regular file owned by root or this process's
 // effective user, granting no access to group or others (0400/0600).
 func openDekFile(_ spelledPath: String) throws -> Int32 {
-    // No symbolic link in the folders above it either (see requireRealFolder);
-    // O_NOFOLLOW below covers the file itself.
-    let path = try requireRealFolder(spelledPath, what: "--dek-file")
-    let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+    // No symbolic link in the folders above it either (see openRealFolder);
+    // O_NOFOLLOW below covers the file itself, opened within the checked
+    // folder so nothing can be swapped in between.
+    let folder = try openRealFolder(spelledPath, what: "--dek-file")
+    defer { folder.close() }
+    let path = spelledPath
+    let fd = openat(folder.fd, folder.leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
     guard fd >= 0 else {
         let err = errno
         if err == ELOOP {
@@ -1164,7 +1206,6 @@ func openDekFile(_ spelledPath: String) throws -> Int32 {
     }
     var ok = false
     defer { if !ok { close(fd) } }
-    try requireOpenedAt(fd, realPath: path, what: "--dek-file")
 
     var st = stat()
     guard fstat(fd, &st) == 0 else {
@@ -1186,6 +1227,7 @@ func openDekFile(_ spelledPath: String) throws -> Int32 {
     ok = true
     return fd
 }
+
 
 // The Linux and Windows tools' messages, word for word.
 //
@@ -1374,6 +1416,12 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     guard decodedLength == dekLen else {
         throw CLIError("\(flag): the DEK must decode to exactly \(dekLen) bytes, got \(decodedLength)")
     }
+    // The base64 text has served its only purpose: zero it now, before the
+    // wrap, rather than when this function returns -- as the Linux tool
+    // does. Only the decoded DEK stays, for `body`.
+    if let inputBase = input.baseAddress {
+        _ = memset_s(inputBase, input.count, 0, input.count)
+    }
     return try body(UnsafeRawBufferPointer(decoded))
 }
 
@@ -1531,6 +1579,11 @@ func requireRegularFile(_ st: stat, path: String) throws {
         guard st.st_nlink <= 1 else {
             throw CLIError("\(path) has \(st.st_nlink) hard links; refusing to overwrite it, since that would also destroy the other linked file -- remove \(path) yourself if it should be replaced")
         }
+        // A wrapped key is 125 bytes; something far bigger at the key path
+        // isn't one. The Linux tool's MAX_REPLACEABLE_KEY_FILE_LEN.
+        guard st.st_size <= off_t(maxReplaceableKeyFileSize) else {
+            throw CLIError("\(path) is \(st.st_size) bytes, far larger than any wrapped key; refusing to overwrite it")
+        }
     case S_IFLNK:
         throw CLIError("\(path) is a symbolic link; refusing to overwrite through it -- remove the link, or point <key-file-path> at a regular file")
     default:
@@ -1538,25 +1591,50 @@ func requireRegularFile(_ st: stat, path: String) throws {
     }
 }
 
+// Largest existing file --force will overwrite: 64 KiB, as on Linux.
+let maxReplaceableKeyFileSize = 64 * 1024
+
+
 // Fail-fast twin of the checks secureOverwriteAndRemoveIfExists enforces at
 // open time: with --force, refuse before any Secure Enclave or keychain
 // work if <key-file-path> exists and is a symlink or anything other than a
 // regular file. `lstat`, not `stat`, so a symlink is judged as itself, not
 // as its target. Advisory only -- the path can change between here and the
 // open -- the O_NOFOLLOW/fstat checks at open time are the guarantee.
-func refuseUnlessAbsentOrRegularFile(path: String) throws {
+func refuseUnlessAbsentOrRegularFile(_ folder: CheckedFolder, display: String) throws {
     var st = stat()
-    guard lstat(path, &st) == 0 else {
+    guard fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
         if errno == ENOENT {
             return
         }
-        throw CLIError("failed to stat \(path): \(String(cString: strerror(errno)))")
+        throw CLIError("failed to stat \(display): \(String(cString: strerror(errno)))")
     }
-    try requireRegularFile(st, path: path)
+    try requireRegularFile(st, path: display)
 }
 
-func secureOverwriteAndRemoveIfExists(path: String) throws {
-    let fd = open(path, O_WRONLY | O_NOFOLLOW | O_NONBLOCK)
+// Whether anything at all -- a dangling symlink included -- occupies the
+// key file's name in its checked folder.
+func keyFileNameIsTaken(_ folder: CheckedFolder) -> Bool {
+    var st = stat()
+    return fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0
+}
+
+// Removes `folder.leaf` -- but only while that name still refers to the
+// file open as `fd` (same device and inode): a file someone put at the name
+// in the meantime is left alone. The Linux tool's remove_created_file.
+func unlinkIfStillSame(_ folder: CheckedFolder, fd: Int32) -> Bool {
+    var opened = stat()
+    var named = stat()
+    guard fstat(fd, &opened) == 0, fstatat(folder.fd, folder.leaf, &named, AT_SYMLINK_NOFOLLOW) == 0,
+          opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
+        return false
+    }
+    return unlinkat(folder.fd, folder.leaf, 0) == 0
+}
+
+
+func secureOverwriteAndRemoveIfExists(_ folder: CheckedFolder, display path: String) throws {
+    let fd = openat(folder.fd, folder.leaf, O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     guard fd >= 0 else {
         let err = errno
         if err == ENOENT {
@@ -1567,13 +1645,15 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
         }
         if err == EACCES || err == EPERM {
             // Can't write to it -- skip the overwrite passes and go
-            // straight to trying to remove it, but still only if it is a
-            // regular file.
+            // straight to removing it, but only once it is confirmed to be a
+            // regular file (one link, within the size cap). If it can't even
+            // be examined, nothing is removed.
             var st = stat()
-            if lstat(path, &st) == 0 {
-                try requireRegularFile(st, path: path)
+            guard fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw CLIError("failed to stat \(path): \(String(cString: strerror(errno))); refusing to remove it")
             }
-            if unlink(path) != 0 && errno != ENOENT {
+            try requireRegularFile(st, path: path)
+            if unlinkat(folder.fd, folder.leaf, 0) != 0 && errno != ENOENT {
                 throw CLIError("failed to remove \(path): \(String(cString: strerror(errno)))")
             }
             return
@@ -1587,7 +1667,6 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
     // `defer`, and the unlink happens once, after the loop, on the
     // fall-through success path.
     defer { close(fd) }
-    try requireOpenedAt(fd, realPath: path, what: "the existing key file")
 
     var st = stat()
     guard fstat(fd, &st) == 0 else {
@@ -1654,8 +1733,9 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
         }
     }
 
-    guard unlink(path) == 0 else {
-        throw CLIError("failed to remove \(path) after secure overwrite: \(String(cString: strerror(errno)))")
+    // Only while the name still refers to the file just overwritten.
+    guard unlinkIfStillSame(folder, fd: fd) else {
+        throw CLIError("failed to remove \(path) after secure overwrite: it was moved or replaced, or \(String(cString: strerror(errno)))")
     }
 }
 
@@ -1674,20 +1754,14 @@ func flushToStorage(fd: Int32, context: String) throws {
 // a crash after the file's data is flushed can still lose the name that
 // points at it. A filesystem that cannot sync a directory at all (EINVAL /
 // ENOTSUP) is accepted: there is nothing further this tool can do there.
-func flushParentDirectory(of path: String) throws {
-    var dir = (path as NSString).deletingLastPathComponent
-    if dir.isEmpty { dir = "." }
-    let dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-    guard dfd >= 0 else {
-        throw CLIError("failed to open \(dir) to flush it: \(String(cString: strerror(errno)))")
-    }
-    defer { close(dfd) }
-    if fcntl(dfd, F_FULLFSYNC) == 0 { return }
-    if fsync(dfd) == 0 { return }
+func flushFolder(_ folder: CheckedFolder) throws {
+    if fcntl(folder.fd, F_FULLFSYNC) == 0 { return }
+    if fsync(folder.fd) == 0 { return }
     let err = errno
     if err == EINVAL || err == ENOTSUP { return }
-    throw CLIError("failed to flush directory \(dir) to storage: \(String(cString: strerror(err)))")
+    throw CLIError("failed to flush directory \(folder.path) to storage: \(String(cString: strerror(err)))")
 }
+
 
 // Writes `bytes` to a new file at `path` with `keyFilePermissions`, durably,
 // or leaves no file behind.
@@ -1712,12 +1786,14 @@ func flushParentDirectory(of path: String) throws {
 // the payload never sits in it under any other group -- as the Linux tool
 // does. A caller who isn't root can only give a group they belong to: the
 // kernel's rule, reported plainly, and the empty file removed.
-func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
+func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
     if force {
-        try secureOverwriteAndRemoveIfExists(path: path)
+        try secureOverwriteAndRemoveIfExists(folder, display: path)
     }
 
-    let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, keyFilePermissions)
+    // O_CREAT | O_EXCL never follows a link at the name, and openat() keeps
+    // it in the checked folder.
+    let fd = openat(folder.fd, folder.leaf, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, keyFilePermissions)
     guard fd >= 0 else {
         let err = errno
         if err == EEXIST {
@@ -1726,25 +1802,13 @@ func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool, group: (gid:
         throw CLIError("failed to open \(path) for writing: \(String(cString: strerror(err)))")
     }
 
-    var created = stat()
-    guard fstat(fd, &created) == 0 else {
-        let err = errno
-        close(fd)
-        throw CLIError("failed to stat \(path) after creating it: \(String(cString: strerror(err))); remove \(path) before retrying")
-    }
-
     var committed = false
     defer {
-        close(fd)
         if !committed {
-            var now = stat()
-            if lstat(path, &now) == 0, now.st_dev == created.st_dev, now.st_ino == created.st_ino {
-                unlink(path)
-            }
+            _ = unlinkIfStillSame(folder, fd: fd) // only the file this call created
         }
+        close(fd)
     }
-
-    try requireOpenedAt(fd, realPath: path, what: "the new key file")
 
     if let group {
         guard fchown(fd, uid_t.max, group.gid) == 0 else { // uid -1: the owner stays as it is
@@ -1759,9 +1823,10 @@ func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool, group: (gid:
         try writeAll(fd: fd, bytes: buf, context: path)
     }
     try flushToStorage(fd: fd, context: path)
-    try flushParentDirectory(of: path)
+    try flushFolder(folder)
     committed = true
 }
+
 
 // MARK: - Run
 
@@ -1829,11 +1894,12 @@ func runStatus(serviceName: String) throws {
 
 func runWrap(_ spelledArgs: WrapArgs) throws {
     // The key file's folder must be a real folder with no symbolic link in
-    // it (requireRealFolder), checked first, before any Secure Enclave or
-    // keychain work. Every filesystem call below uses the real path it
-    // returns; messages name the path as the operator spelled it.
-    var args = spelledArgs
-    args.keyFilePath = try requireRealFolder(spelledArgs.keyFilePath, what: "--key-file-path")
+    // it (openRealFolder), checked first, before any Secure Enclave or
+    // keychain work. It is held open, and every filesystem call below goes
+    // through it; messages name the path as the operator spelled it.
+    let args = spelledArgs
+    let keyFolder = try openRealFolder(spelledArgs.keyFilePath, what: "--key-file-path")
+    defer { keyFolder.close() }
 
     // Fast, friendly pre-check: fail before ever touching the Secure
     // Enclave/Keychain if the output path obviously already exists,
@@ -1841,7 +1907,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // find out at the very end. writeWrappedKeyFile's O_EXCL is the actual
     // correctness guarantee against the exists-then-create race; this is
     // purely a fail-fast convenience on top of it.
-    if !args.force && FileManager.default.fileExists(atPath: args.keyFilePath) {
+    if !args.force && keyFileNameIsTaken(keyFolder) { // a dangling symlink counts
         throw CLIError("\(args.keyFilePath) already exists; pass --force|-f to overwrite")
     }
     // Same fail-fast idea for --force: a symlink or non-regular file at the
@@ -1849,7 +1915,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // first means no Secure Enclave/keychain work is spent on a command
     // that cannot complete.
     if args.force {
-        try refuseUnlessAbsentOrRegularFile(path: args.keyFilePath)
+        try refuseUnlessAbsentOrRegularFile(keyFolder, display: args.keyFilePath)
     }
 
     // `args.serviceName` is not secret -- it's a logical identifier, not key
@@ -1892,7 +1958,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
         throw CLIError("fingerprint mismatch for service \"\(args.serviceName)\": the KEK in the keychain is \(hexString(usedFingerprint)), not \(hexString(expected)); nothing was written -- the DEK was NOT committed to that key")
     }
 
-    try writeWrappedKeyFile(path: args.keyFilePath, bytes: wrapped, force: args.force, group: group)
+    try writeWrappedKeyFile(keyFolder, display: args.keyFilePath, bytes: wrapped, force: args.force, group: group)
 
     // The Linux tool's wording for who can read it.
     let access = group.map { "owner read/write + \($0.name) read-only" } ?? "owner read/write"
