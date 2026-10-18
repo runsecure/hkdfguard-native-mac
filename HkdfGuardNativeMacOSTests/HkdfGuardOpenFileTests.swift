@@ -175,6 +175,32 @@ struct HkdfGuardOpenFileTests {
         }
     }
 
+    @Test func theDetectorsEdgeCasesMatchLinuxAndWindows() {
+        // The same cases as the Linux build's
+        // the_detector_s_edge_cases_match_the_windows_build and the Windows
+        // build's "detector:" checks, so all three agree on every one.
+        let b64 = Data(repeating: 0, count: 32).base64EncodedString() // "AAAA...A="
+        let prefix42 = String(b64.prefix(42))
+        func plain(_ s: String) -> Bool { looksLikePlaintextDek(ArraySlice(Array(s.utf8))) }
+        #expect(plain(String(repeating: " ", count: 30) + b64 + String(repeating: "\n", count: 22)), "96 bytes in all")
+        #expect(!plain(String(repeating: " ", count: 31) + b64 + String(repeating: "\n", count: 22)), "nothing over 96 bytes")
+        #expect(!plain(prefix42 + "B="), "unused trailing bits set")
+        #expect(plain(prefix42 + "E="), "trailing bits zero")
+        #expect(plain("+" + String(b64.dropFirst().prefix(41)) + "A"), "43 characters, standard alphabet")
+        #expect(!plain("+" + String(b64.dropFirst().prefix(40)) + "-A"), "mixed alphabets")
+        #expect(!plain(prefix42 + "=="), "\"==\"")
+        #expect(!plain(b64 + "="), "an extra '='")
+        #expect(!plain("\u{0B}" + b64), "vertical tab is not trimmed")
+        #expect(plain("\u{0C}" + b64 + "\u{0C}"), "form feed is")
+        #expect(!plain(""), "empty")
+        #expect(!plain(String(repeating: " ", count: 50)), "only whitespace")
+        #expect(plain(String(repeating: "F", count: 64)), "64 uppercase hex digits")
+        #expect(!plain(String(repeating: "a", count: 63) + "g"), "one character not hex")
+        #expect(!plain(String(repeating: "a", count: 32) + "\n" + String(repeating: "a", count: 32)), "whitespace inside")
+        #expect(plain(String(repeating: "_", count: 42) + "w"), "URL-safe, unpadded, canonical")
+        #expect(looksLikePlaintextDek(ArraySlice([UInt8](repeating: 0, count: 32))), "any 32 raw bytes")
+    }
+
     // MARK: - Malformed payloads
 
     @Test func rejectsAPayloadLengthFileWithAnAllZeroFingerprint() throws {

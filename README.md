@@ -352,8 +352,10 @@ reach `out` only on success; on any failure the whole declared capacity of
   (-35) or `fileTooLong` (-36).
 - **Unprotected key.** A file holding a bare 32-byte DEK instead of a
   payload — raw bytes, or base64 (padded or not, standard or URL alphabet)
-  or hex text, with optional surrounding whitespace — is reported as
-  `fileUnprotectedKey` (-37), not merely as too short. The key was stored
+  or hex text, with optional surrounding whitespace, 96 bytes at most — is
+  reported as `fileUnprotectedKey` (-37), not merely as too short. The
+  check is the Linux and Windows one, and like theirs it runs in constant
+  time in the file's contents and never decodes them. The key was stored
   unprotected: treat it as exposed and rotate it, rather than wrapping it
   now. Its bytes never reach the caller's buffer, and the library zeroes
   its own read buffer on every return.

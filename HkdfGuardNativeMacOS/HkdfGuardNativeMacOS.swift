@@ -1859,44 +1859,119 @@ private func readWrappedFile(
     return (status, status == .success ? count : 0)
 }
 
+/// Longest text form of a DEK recognised, surrounding whitespace included --
+/// the Linux and Windows limit. Every length up to it is below a payload's,
+/// so no payload can be mistaken for a plaintext key.
+private let hkdfguardMaxPlaintextTextLength = 96
+
+// Branch-free byte classification for `looksLikePlaintextDek`. Every helper
+// returns 0 or 1 and is straight-line arithmetic on UInt32 (`&-`, `&+`:
+// wrapping, never trapping), with no data-dependent branch or table lookup.
+// The Linux build's `ct` module, step for step.
+
+/// 1 if a == b, else 0 (inputs below 2^31).
+@inline(__always) private func ctEq(_ a: UInt32, _ b: UInt32) -> UInt32 {
+    ((a ^ b) &- 1) >> 31
+}
+
+/// 1 if lo <= c <= hi, else 0 (inputs below 2^31): both differences wrap
+/// negative exactly when c is inside.
+@inline(__always) private func ctInRange(_ c: UInt32, _ lo: UInt32, _ hi: UInt32) -> UInt32 {
+    (((lo &- 1) &- c) & (c &- (hi &+ 1))) >> 31 & 1
+}
+
+/// a if cond is 1, b if it is 0.
+@inline(__always) private func ctSelect(_ cond: UInt32, _ a: UInt32, _ b: UInt32) -> UInt32 {
+    b ^ ((a ^ b) & (0 &- cond))
+}
+
+/// What Rust's trim_ascii removes: space, tab, LF, form feed, CR.
+@inline(__always) private func ctIsWhitespace(_ c: UInt32) -> UInt32 {
+    ctEq(c, 0x20) | ctEq(c, 0x09) | ctEq(c, 0x0A) | ctEq(c, 0x0C) | ctEq(c, 0x0D)
+}
+
+@inline(__always) private func ctIsHex(_ c: UInt32) -> UInt32 {
+    ctInRange(c, 0x30, 0x39) | ctInRange(c, 0x61, 0x66) | ctInRange(c, 0x41, 0x46) // 0-9 a-f A-F
+}
+
+/// (member, 6-bit value) of `c` in the base64 alphabet whose 62nd and 63rd
+/// characters are `c62` and `c63`.
+@inline(__always) private func ctBase64(_ c: UInt32, _ c62: UInt32, _ c63: UInt32) -> (member: UInt32, value: UInt32) {
+    let upper = ctInRange(c, 0x41, 0x5A) // A-Z
+    let lower = ctInRange(c, 0x61, 0x7A) // a-z
+    let digit = ctInRange(c, 0x30, 0x39) // 0-9
+    let s62 = ctEq(c, c62)
+    let s63 = ctEq(c, c63)
+    let value = ((c &- 0x41) & (0 &- upper)) | ((c &- (0x61 - 26)) & (0 &- lower))
+        | ((c &+ (52 - 0x30)) & (0 &- digit)) | (62 & (0 &- s62)) | (63 & (0 &- s63))
+    return (upper | lower | digit | s62 | s63, value)
+}
+
 /// True when `bytes` look like a bare 32-byte DEK rather than a wrapped
-/// payload: exactly 32 raw bytes, or — ignoring surrounding ASCII
-/// whitespace, as the CLI's `--dek-file` accepts — the 44-character padded
-/// or 43-character unpadded base64 (standard or URL alphabet), or the
-/// 64-character hex, encoding of 32 bytes. Checked on length and alphabet
-/// only, so nothing is decoded and no further copy of a key is made.
-private func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool {
+/// payload: exactly 32 raw bytes, or -- with any surrounding whitespace an
+/// editor or `echo` adds -- the 64-digit hex (either case) or base64
+/// (standard or URL-safe, with or without its one `=` of padding) of 32
+/// bytes. The same set the Linux and Windows builds recognise: base64 is
+/// 43 characters, or 44 ending in `=`, all in one alphabet, whose last
+/// character's 2 unused bits are zero.
+///
+/// Constant-time in the contents, as on Linux and Windows: the only
+/// branches are on the length, which the file's size already gives away.
+/// Every byte is visited twice (once to find the text between the
+/// surrounding whitespace, once to test it against all three alphabets at
+/// once) and every decision is mask arithmetic, so how long this takes says
+/// nothing about where in a would-be key the first non-matching byte sits.
+/// Nothing is decoded, so the key is never reassembled.
+func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool { // internal: tested directly
     if bytes.count == hkdfguardDekLength {
         return true
     }
-
-    func isWhitespace(_ byte: UInt8) -> Bool {
-        byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
-    }
-    func isHex(_ byte: UInt8) -> Bool {
-        (0x30...0x39).contains(byte) || (0x41...0x46).contains(byte) || (0x61...0x66).contains(byte)
-    }
-    func isBase64(_ byte: UInt8) -> Bool {
-        (0x30...0x39).contains(byte) || (0x41...0x5A).contains(byte) || (0x61...0x7A).contains(byte)
-            || byte == 0x2B || byte == 0x2F || byte == 0x2D || byte == 0x5F // + / - _
-    }
-
-    guard let first = bytes.firstIndex(where: { !isWhitespace($0) }),
-          let last = bytes.lastIndex(where: { !isWhitespace($0) }) else {
+    if bytes.count > hkdfguardMaxPlaintextTextLength {
         return false
     }
-    let text = bytes[first...last]
+    let base = bytes.startIndex
 
-    switch text.count {
-    case hkdfguardDekLength * 2:
-        return text.allSatisfy(isHex)
-    case 44:
-        return text.last == 0x3D && text.dropLast().allSatisfy(isBase64) // trailing '='
-    case 43:
-        return text.allSatisfy(isBase64)
-    default:
-        return false
+    // Pass 1: the first and last non-whitespace positions.
+    var seen: UInt32 = 0, start: UInt32 = 0, end: UInt32 = 0
+    for offset in 0..<bytes.count {
+        let i = UInt32(offset)
+        let text = ctIsWhitespace(UInt32(bytes[base + offset])) ^ 1
+        start = ctSelect(text & (seen ^ 1), i, start)
+        end = ctSelect(text, i, end)
+        seen |= text
     }
+    let textLength = ((end &- start) &+ 1) & (0 &- seen)
+
+    // Pass 2: every byte between them against every alphabet, plus the
+    // values of the last two (the last may be the `=` of padding).
+    var hexOK: UInt32 = 1, stdOK: UInt32 = 1, urlOK: UInt32 = 1, padded: UInt32 = 0
+    var stdLast: UInt32 = 0, stdPrev: UInt32 = 0, urlLast: UInt32 = 0, urlPrev: UInt32 = 0
+    for offset in 0..<bytes.count {
+        let i = UInt32(offset)
+        let c = UInt32(bytes[base + offset])
+        let outside = (ctInRange(i, start, end) & seen) ^ 1
+        let isEnd = ctEq(i, end)
+        let isPrev = ctEq(i &+ 1, end)
+        let pad = isEnd & ctEq(c, 0x3D) // '='
+        let std = ctBase64(c, 0x2B, 0x2F) // + /
+        let url = ctBase64(c, 0x2D, 0x5F) // - _
+        hexOK &= ctIsHex(c) | outside
+        stdOK &= std.member | pad | outside
+        urlOK &= url.member | pad | outside
+        padded |= pad
+        stdLast = ctSelect(isEnd, std.value, stdLast)
+        stdPrev = ctSelect(isPrev, std.value, stdPrev)
+        urlLast = ctSelect(isEnd, url.value, urlLast)
+        urlPrev = ctSelect(isPrev, url.value, urlPrev)
+    }
+
+    // 43 data characters carry 258 bits: the last one's low 2 must be 0.
+    let shape = (ctEq(textLength, 43) & (padded ^ 1)) | (ctEq(textLength, 44) & padded)
+    let stdCanonical = ctEq(ctSelect(padded, stdPrev, stdLast) & 3, 0)
+    let urlCanonical = ctEq(ctSelect(padded, urlPrev, urlLast) & 3, 0)
+    let hex = hexOK & ctEq(textLength, UInt32(hkdfguardDekLength * 2))
+    let base64 = shape & ((stdOK & stdCanonical) | (urlOK & urlCanonical))
+    return seen & (hex | base64) == 1
 }
 
 /// Reads the wrapped payload stored at `path` — the 125-byte file the CLI's
