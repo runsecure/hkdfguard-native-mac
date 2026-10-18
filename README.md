@@ -166,16 +166,16 @@ and `hkdfguard_kek_fingerprint` are macOS-only; everything else is the C ABI
 shared with Linux and Windows.
 
 ```c
-int32_t hkdfguard_keychain_mode(int32_t* out_mode);          // macOS-only: 0 legacy, 1 data-protection
-int32_t hkdfguard_kek_exists(const char* service, int32_t* out_exists);
-int32_t hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int32_t* out_len); // macOS-only: 32 bytes, public
-int32_t hkdfguard_create_kek(const char* service);            // the only function that creates a KEK
-int32_t hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int32_t dek_len,
-                           uint8_t* out, int32_t* out_len);
-int32_t hkdfguard_unwrap_dek(const char* service, const uint8_t* wrapped, int32_t wrapped_len,
-                             uint8_t* out, int32_t* out_len);
-int32_t hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int32_t* out_len);
-int32_t hkdfguard_open_file(const char* path, uint8_t* out, int32_t* out_len); // reads a 125-byte payload file
+int hkdfguard_keychain_mode(int* out_mode);          // macOS-only: 0 legacy, 1 data-protection
+int hkdfguard_kek_exists(const char* service, int* out_exists);
+int hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int* out_len); // macOS-only: 32 bytes, public
+int hkdfguard_create_kek(const char* service);        // the only function that creates a KEK
+int hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int dek_len,
+                       uint8_t* out, int* out_len);
+int hkdfguard_unwrap_dek(const char* service, const uint8_t* wrapped, int wrapped_len,
+                         uint8_t* out, int* out_len);
+int hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int* out_len);
+int hkdfguard_open_file(const char* path, uint8_t* out, int* out_len); // reads a 125-byte payload file
 int hkdfguard_harden_process(void);                           // opt-in; see below
 int hkdfguard_harden_process_with_flags(unsigned int flags);
 ```
@@ -299,8 +299,8 @@ not pass through it:
 
 ```c
 uint8_t wrapped[HKDFGUARD_WRAPPED_MAX_LEN];
-int32_t wrapped_len = sizeof wrapped;
-int32_t status = hkdfguard_open_file("/etc/example/ingest.key", wrapped, &wrapped_len);
+int wrapped_len = sizeof wrapped;
+int status = hkdfguard_open_file("/etc/example/ingest.key", wrapped, &wrapped_len);
 if (status == 0)
     status = hkdfguard_unwrap_dek("com.example.ingest", wrapped, wrapped_len, dek, &dek_len);
 ```
@@ -386,7 +386,7 @@ here are defined there but never returned on macOS.
 | `-2`  | `ERR_BUFFER_TOO_SMALL` | `outputBufferTooSmall` | `*out_len` set to the required size |
 | `-3`  | `ERR_PROVIDER_UNAVAILABLE` | `enclaveUnavailable` | no Secure Enclave on this machine |
 | `-5`  | `ERR_CRYPTO_ERROR` | `encryptionFailed` | the RNG failed, the Secure Enclave refused the key agreement (wrap or unwrap), or AES-GCM sealing failed |
-| `-6`  | `ERR_INTERNAL_ERROR` | `unexpectedOutputLength` | the library produced output of an impossible length (a bug) |
+| `-6`  | `ERR_INTERNAL_ERROR` | `unexpectedOutputLength` | an internal failure the library detected: output of an impossible length, or a buffer that should exist not existing (a bug). Linux also returns it for a caught panic; a Swift runtime trap can't be caught, so this library has no force-unwrap, `try!`, `fatalError` or `precondition` on its export paths (a test enforces it), and returns -6 where Linux would have caught one |
 | `-8`  | `ERR_INVALID_SERVICE_NAME` | `invalidServiceIdentifier` | see `service` above |
 | `-10` | `ERR_PAYLOAD_MALFORMED` | `payloadMalformed` | `wrapped_len != 125` |
 | `-11` | `ERR_PAYLOAD_AUTH_FAILED` | `decryptionFailed` | the AES-GCM tag did not verify: an altered payload, or one wrapped for a different service under the same KEK |
@@ -1100,7 +1100,7 @@ status = lib.hkdfguard_create_kek(b"com.example.ingest")
 ```js
 const koffi = require("koffi");
 const lib = koffi.load("./libhkdfguard.dylib");
-const hkdfguard_create_kek = lib.func("int32_t hkdfguard_create_kek(const char *service)");
+const hkdfguard_create_kek = lib.func("int hkdfguard_create_kek(const char *service)");
 
 const status = hkdfguard_create_kek("com.example.ingest");
 ```

@@ -68,8 +68,8 @@ private let hkdfguardPayloadPointDomain = Data("HkdfGuard-P256-payload-ECDH-poin
 func wrappingKeyInfo(service: String, header: Data) -> Data { // internal: the forgery tests rebuild payloads with it
     let serviceBytes = Data(service.utf8) // validated ASCII, at most 128 bytes
     var info = hkdfguardHKDFInfoPrefix
-    info.append(UInt8(serviceBytes.count & 0xFF))
-    info.append(UInt8(serviceBytes.count >> 8))
+    info.append(UInt8(truncatingIfNeeded: serviceBytes.count))
+    info.append(UInt8(truncatingIfNeeded: serviceBytes.count >> 8))
     info.append(serviceBytes)
     info.append(header)
     return info
@@ -235,8 +235,12 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// HKDFGUARD_ERR_CRYPTO_ERROR: the RNG failed, the Secure Enclave refused
     /// the key agreement (wrap or unwrap), or AES-GCM sealing failed.
     case encryptionFailed = -5
-    /// HKDFGUARD_ERR_INTERNAL_ERROR: the library produced output of a length
-    /// it never should. Points at a bug here, not at the caller's input.
+    /// HKDFGUARD_ERR_INTERNAL_ERROR: an internal failure the library
+    /// detected itself -- output of a length it never should produce, or a
+    /// buffer that should exist not existing. Points at a bug here, not at
+    /// the caller's input. (Linux also returns it for a caught panic; a
+    /// Swift runtime trap can't be caught, so this library is written to
+    /// have none on its export paths -- see `copyOut`.)
     case unexpectedOutputLength = -6
     /// HKDFGUARD_ERR_INVALID_SERVICE_NAME
     case invalidServiceIdentifier = -8
@@ -448,6 +452,24 @@ private func secureZero(_ bytes: inout Data) {
     bytes.withUnsafeMutableBytes { raw in
         guard let base = raw.baseAddress, raw.count > 0 else { return }
         _ = memset_s(base, raw.count, 0, raw.count)
+    }
+}
+
+/// Copies the first `count` bytes of `bytes` to `out`, or reports that it
+/// couldn't. Never traps: Swift can't catch a runtime trap the way the
+/// Linux build catches a panic at every export (and Windows an exception),
+/// so a trap here would end the host process instead of returning a status.
+/// The library therefore has no force-unwrap, `try!`, `fatalError` or
+/// `precondition` on any path an export can reach (the
+/// `theLibraryHasNoTrapsOnItsExportPaths` test enforces it); a failure
+/// that "can't happen" becomes INTERNAL_ERROR (-6) instead.
+private func copyOut<Bytes: ContiguousBytes>(_ bytes: Bytes, to out: UnsafeMutablePointer<UInt8>, count: Int) -> Bool {
+    bytes.withUnsafeBytes { raw in
+        guard count > 0, count <= raw.count, let source = raw.baseAddress else {
+            return false
+        }
+        memcpy(out, source, count)
+        return true
     }
 }
 
@@ -872,12 +894,10 @@ private func wrapDekCore(
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
 
-    payload.withUnsafeBytes { raw in
-        for i in 0..<raw.count {
-            outPtr[i] = raw[i]
-        }
+    guard copyOut(payload, to: outPtr, count: hkdfguardWrappedLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
-    outLen.pointee = Int32(payload.count)
+    outLen.pointee = Int32(hkdfguardWrappedLength)
 
     return HKDFGuardStatus.success.rawValue
 }
@@ -969,7 +989,7 @@ private let auditExecutable: String = {
     var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
     let length = proc_pidpath(getpid(), &buffer, UInt32(buffer.count))
     guard length > 0 else { return auditQuote(Array("(unknown)".utf8)) }
-    return auditQuote(buffer[0..<Int(length)].map { UInt8(bitPattern: $0) })
+    return auditQuote(buffer[0..<min(Int(length), buffer.count)].map { UInt8(bitPattern: $0) })
 }()
 
 /// A double-quoted field value, exactly as Linux quotes one: printable ASCII
@@ -1418,10 +1438,10 @@ public func hkdfguard_kek_fingerprint(
     }
 
     let fingerprint = kekFingerprint(key.publicKey)
-    _ = fingerprint.withUnsafeBytes { raw in
-        memcpy(outPtr, raw.baseAddress!, fingerprint.count)
+    guard copyOut(fingerprint, to: outPtr, count: hkdfguardFingerprintLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
-    outLen.pointee = Int32(fingerprint.count)
+    outLen.pointee = Int32(hkdfguardFingerprintLength)
     return HKDFGuardStatus.success.rawValue
 }
 
@@ -1461,7 +1481,7 @@ public func hkdfguard_wrap_dek(
 
 /// The payload a successful wrap wrote to `out`, for its audit record.
 private func writtenPayload(_ status: Int32, _ outPtr: UnsafeMutablePointer<UInt8>?, _ outLen: UnsafeMutablePointer<Int32>?) -> UnsafeBufferPointer<UInt8>? {
-    guard status == HKDFGuardStatus.success.rawValue, let outPtr, let outLen else { return nil }
+    guard status == HKDFGuardStatus.success.rawValue, let outPtr, let outLen, outLen.pointee >= 0 else { return nil }
     return UnsafeBufferPointer(start: outPtr, count: Int(outLen.pointee))
 }
 
@@ -1510,8 +1530,9 @@ private func wrapDekChecked(
 
 private func generateRandomDek() -> Data? {
     var bytes = Data(count: hkdfguardDekLength)
-    let status = bytes.withUnsafeMutableBytes { raw in
-        SecRandomCopyBytes(kSecRandomDefault, hkdfguardDekLength, raw.baseAddress!)
+    let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
+        guard raw.count == hkdfguardDekLength, let base = raw.baseAddress else { return errSecParam }
+        return SecRandomCopyBytes(kSecRandomDefault, hkdfguardDekLength, base)
     }
     guard status == errSecSuccess else { return nil }
     return bytes
@@ -1542,10 +1563,13 @@ private func generateAndWrapCore(
     defer { secureZero(&dek) }
 
     return dek.withUnsafeBytes { raw -> Int32 in
-        wrapDekChecked(
+        guard let dekPtr = raw.bindMemory(to: UInt8.self).baseAddress, raw.count == hkdfguardDekLength else {
+            return HKDFGuardStatus.unexpectedOutputLength.rawValue
+        }
+        return wrapDekChecked(
             servicePtr: servicePtr,
-            dekPtr: raw.bindMemory(to: UInt8.self).baseAddress!,
-            dekLen: Int32(dek.count),
+            dekPtr: dekPtr,
+            dekLen: Int32(hkdfguardDekLength),
             outPtr: outPtr,
             outLen: outLen
         )
@@ -1701,10 +1725,10 @@ private func unwrapDekCore(
         return HKDFGuardStatus.outputBufferTooSmall.rawValue
     }
 
-    _ = plaintext.withUnsafeBytes { raw in
-        memcpy(outPtr, raw.baseAddress!, plaintext.count)
+    guard copyOut(plaintext, to: outPtr, count: hkdfguardDekLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
-    outLen.pointee = Int32(plaintext.count)
+    outLen.pointee = Int32(hkdfguardDekLength)
 
     return HKDFGuardStatus.success.rawValue
 }
@@ -1852,8 +1876,11 @@ private func readWrappedFile(
     // may change between the two, and the bytes actually read decide.
     var count = 0
     let status: HKDFGuardStatus = buffer.withUnsafeMutableBytes { raw in
+        guard let base = raw.baseAddress else {
+            return .unexpectedOutputLength
+        }
         while count < raw.count {
-            let n = read(fd, raw.baseAddress! + count, raw.count - count)
+            let n = read(fd, base + count, raw.count - count)
             let readErrno = errno // captured before anything else can run
             if n > 0 {
                 count += n
@@ -2078,8 +2105,8 @@ private func openFileCore(
         return HKDFGuardStatus.fileMalformed.rawValue
     }
 
-    buffer.withUnsafeBytes { raw in
-        _ = memcpy(outPtr, raw.baseAddress!, hkdfguardWrappedLength)
+    guard copyOut(buffer, to: outPtr, count: hkdfguardWrappedLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
     outLen.pointee = Int32(hkdfguardWrappedLength)
     return HKDFGuardStatus.success.rawValue

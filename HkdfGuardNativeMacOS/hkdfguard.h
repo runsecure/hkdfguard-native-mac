@@ -100,7 +100,7 @@ extern "C" {
 #define HKDFGUARD_ERR_PROVIDER_UNAVAILABLE (-3) /* no KEK provider could be reached at all */
 #define HKDFGUARD_ERR_PROVIDER_ERROR (-4)       /* a provider was reachable but failed to create, load, or use the KEK */
 #define HKDFGUARD_ERR_CRYPTO_ERROR (-5)         /* a cryptographic operation failed for a reason other than authentication: RNG, hash-to-curve, HKDF, or encryption */
-#define HKDFGUARD_ERR_INTERNAL_ERROR (-6)       /* an unexpected internal failure (a caught panic) */
+#define HKDFGUARD_ERR_INTERNAL_ERROR (-6)       /* an internal failure the library detected (see below) */
 /* -7 is reserved and never returned. A `service` string that isn't valid
  * UTF-8 is one more way for it to be invalid, reported as
  * HKDFGUARD_ERR_INVALID_SERVICE_NAME below. */
@@ -151,8 +151,14 @@ extern "C" {
  *   PROVIDER_UNAVAILABLE (-3)  no Secure Enclave on this machine.
  *   CRYPTO_ERROR (-5)          the RNG failed, the Secure Enclave refused the
  *                              key agreement, or AES-GCM sealing failed.
- *   INTERNAL_ERROR (-6)        the library produced output of an impossible
- *                              length (a bug here, not a caller error).
+ *   INTERNAL_ERROR (-6)        an internal failure the library detected: output
+ *                              of an impossible length, or a buffer that should
+ *                              exist not existing (a bug here, not a caller
+ *                              error). Unlike Linux, never "a caught panic": a
+ *                              Swift runtime trap can't be caught, so the
+ *                              library has none on its export paths, and a
+ *                              failure that "can't happen" is returned as -6
+ *                              rather than ending the host process.
  *   PAYLOAD_MALFORMED (-10)    wrapped_len is not 125.
  *   PAYLOAD_AUTH_FAILED (-11)  AES-GCM authentication failed: the payload or
  *                              its fingerprint was altered, or it was wrapped
@@ -329,8 +335,8 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
 
 // macOS-only. Writes 0 (legacy login keychain) or 1 (data-protection keychain) to
 // `*out_mode` -- see "Keychain mode" above.
-int32_t hkdfguard_keychain_mode(
-    int32_t* HKDFGUARD_NONNULL out_mode);
+int hkdfguard_keychain_mode(
+    int* HKDFGUARD_NONNULL out_mode);
 
 // Reports whether a Secure Enclave KEK already exists for `service`,
 // without creating one. `*out_exists` is written on every return path --
@@ -346,9 +352,9 @@ int32_t hkdfguard_keychain_mode(
 // Subject to the same latency floor and serialization as
 // hkdfguard_create_kek below; "exists" and "doesn't exist" take the same
 // time.
-int32_t hkdfguard_kek_exists(
+int hkdfguard_kek_exists(
     const char* HKDFGUARD_NONNULL service,
-    int32_t* HKDFGUARD_NONNULL out_exists);
+    int* HKDFGUARD_NONNULL out_exists);
 
 // macOS-only. Writes the 32-byte fingerprint (SHA-256 of the KEK's public key, uncompressed 0x04 || x || y) of
 // the KEK for `service` to `out` -- the same value embedded at the front of
@@ -356,10 +362,10 @@ int32_t hkdfguard_kek_exists(
 // operator record which KEK a service uses after provisioning, and confirm
 // it before retiring it. `*out_len` must be at least 32 on entry. Never
 // creates a KEK: HKDFGUARD_ERR_KEK_NOT_FOUND (-17) if none exists.
-int32_t hkdfguard_kek_fingerprint(
+int hkdfguard_kek_fingerprint(
     const char* HKDFGUARD_NONNULL service,
     uint8_t* HKDFGUARD_NONNULL out,
-    int32_t* HKDFGUARD_NONNULL out_len);
+    int* HKDFGUARD_NONNULL out_len);
 
 // Creates a Secure Enclave KEK for `service` if one doesn't already exist.
 // Idempotent, and safe under concurrent first use by several threads or
@@ -375,19 +381,19 @@ int32_t hkdfguard_kek_fingerprint(
 // per request; call once at startup and then use hkdfguard_wrap_dek /
 // hkdfguard_unwrap_dek. Argument errors (NULL pointer or invalid service
 // name) return immediately.
-int32_t hkdfguard_create_kek(
+int hkdfguard_create_kek(
     const char* HKDFGUARD_NONNULL service);
 
 // Wraps the 32-byte DEK at `dek` under the KEK for `service` and writes the
 // 125-byte payload to `out`. Never creates a KEK: expects HKDFGUARD_ERR_KEK_NOT_FOUND (-17)
 // if hkdfguard_create_kek has not been called for this service in this
 // process's keychain mode.
-int32_t hkdfguard_wrap_dek(
+int hkdfguard_wrap_dek(
     const char* HKDFGUARD_NONNULL service,
     const uint8_t* HKDFGUARD_NONNULL dek,
-    int32_t dek_len,
+    int dek_len,
     uint8_t* HKDFGUARD_NULLABLE out,
-    int32_t* HKDFGUARD_NONNULL out_len
+    int* HKDFGUARD_NONNULL out_len
 );
 
 // Unwraps a 125-byte payload produced by hkdfguard_wrap_dek or
@@ -401,12 +407,12 @@ int32_t hkdfguard_wrap_dek(
 // is zeroed before returning, so no partial or stale key material is ever
 // left in `out` -- as on Linux. (With a NULL `out_len` there is no declared
 // capacity, so nothing is written.)
-int32_t hkdfguard_unwrap_dek(
+int hkdfguard_unwrap_dek(
     const char* HKDFGUARD_NONNULL service,
     const uint8_t* HKDFGUARD_NONNULL wrapped,
-    int32_t wrapped_len,
+    int wrapped_len,
     uint8_t* HKDFGUARD_NULLABLE out,
-    int32_t* HKDFGUARD_NONNULL out_len
+    int* HKDFGUARD_NONNULL out_len
 );
 
 // Generates a fresh, cryptographically random 32-byte DEK from the OS
@@ -414,10 +420,10 @@ int32_t hkdfguard_unwrap_dek(
 // -- the caller only ever sees the wrapped form, and the library zeroes its
 // own copy before returning. For callers that want a brand-new DEK without
 // sourcing their own randomness. Never creates a KEK.
-int32_t hkdfguard_generate_and_wrap_dek(
+int hkdfguard_generate_and_wrap_dek(
     const char* HKDFGUARD_NONNULL service,
     uint8_t* HKDFGUARD_NULLABLE out,
-    int32_t* HKDFGUARD_NONNULL out_len
+    int* HKDFGUARD_NONNULL out_len
 );
 
 // Reads the wrapped payload stored at `path` -- the 125-byte file the CLI's
@@ -461,10 +467,10 @@ int32_t hkdfguard_generate_and_wrap_dek(
 // unaltered, and for this service is decided by hkdfguard_unwrap_dek (-16,
 // -11). Pin the KEK by comparing bytes 0-31 with the fingerprint recorded at
 // provisioning before unwrapping.
-int32_t hkdfguard_open_file(
+int hkdfguard_open_file(
     const char* HKDFGUARD_NONNULL path,
     uint8_t* HKDFGUARD_NULLABLE out,
-    int32_t* HKDFGUARD_NONNULL out_len
+    int* HKDFGUARD_NONNULL out_len
 );
 
 #ifdef __cplusplus

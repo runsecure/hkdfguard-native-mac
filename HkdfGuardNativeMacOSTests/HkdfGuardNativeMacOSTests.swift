@@ -1334,15 +1334,43 @@ struct HkdfGuardCrossPlatformABITests {
         return result
     }
 
-    /// Names of the functions a header declares (`int`/`int32_t name(`).
+    /// Names of the functions a header declares (`int name(`, optionally
+    /// behind an export macro such as Windows' HKDFGUARD_API).
     static func functions(in text: String) -> Set<String> {
-        let pattern = /(?m)^\s*(?:int|int32_t)\s+(hkdfguard_[a-z_]+)\s*\(/
+        let pattern = /(?m)^\s*(?:[A-Z_]+\s+)?int\s+(hkdfguard_[a-z_]+)\s*\(/
         return Set(text.matches(of: pattern).map { String($0.1) })
     }
 
     /// The status codes: HKDFGUARD_OK and every HKDFGUARD_ERR_*.
     static func statusCodes(_ all: [String: Int]) -> [String: Int] {
         all.filter { $0.key == "HKDFGUARD_OK" || $0.key.hasPrefix("HKDFGUARD_ERR_") }
+    }
+
+    @Test func theLibraryHasNoTrapsOnItsExportPaths() throws {
+        // Linux catches a panic at every export and Windows an exception,
+        // returning a status either way. A Swift runtime trap can't be
+        // caught: it ends the host process. So the library must contain no
+        // force-unwrap, `try!`, `as!`, `fatalError`, `precondition`,
+        // `preconditionFailure` or `assertionFailure` -- a failure that
+        // "can't happen" returns INTERNAL_ERROR (-6) instead (see `copyOut`).
+        // Comments and string literals are skipped; `!=` and prefix `!`
+        // (negation) are not unwraps.
+        let source = try String(
+            contentsOf: Self.macRoot.appendingPathComponent("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift"),
+            encoding: .utf8)
+        let trap = try Regex(#"(?:[\w)\]]!(?!=))|\btry!|\bas!|\bfatalError\(|\bprecondition\(|\bpreconditionFailure\(|\bassertionFailure\("#)
+        let stringLiteral = try Regex(#""(?:[^"\\]|\\.)*""#)
+        var offenders: [String] = []
+        for (number, line) in source.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            var code = String(line).replacing(stringLiteral, with: "\"\"")
+            if let comment = code.range(of: "//") {
+                code = String(code[..<comment.lowerBound])
+            }
+            if code.contains(trap) {
+                offenders.append("line \(number + 1): \(line.trimmingCharacters(in: .whitespaces))")
+            }
+        }
+        #expect(offenders.isEmpty, "a runtime trap on an export path would crash the host process:\n\(offenders.joined(separator: "\n"))")
     }
 
     @Test(.enabled(if: linuxPresent, linuxMissing))
@@ -1380,6 +1408,16 @@ struct HkdfGuardCrossPlatformABITests {
         #expect(missing.isEmpty, "declared on Linux but not macOS: \(missing.sorted())")
         let extra = mac.subtracting(linux)
         #expect(extra == Self.macOnlyFunctions, "macOS-only functions are \(extra.sorted()); the headers document \(Self.macOnlyFunctions.sorted())")
+    }
+
+    @Test func theMacHeaderUsesIntLikeLinuxAndWindows() throws {
+        // The shared decision: every function returns `int` and takes `int`
+        // lengths and `int*` out-parameters (flags: `unsigned int`), as the
+        // Linux and Windows headers declare them. `int32_t` is the same
+        // 32-bit type on every macOS target, so this is about the source a
+        // caller reads and copies, not the binary interface.
+        let mac = try Self.read(Self.macHeader)
+        #expect(!mac.contains("int32_t"), "the macOS header must declare int, not int32_t, as Linux and Windows do")
     }
 
     /// Pairs each `case name = value` in `enumBody` with the HKDFGUARD_*
