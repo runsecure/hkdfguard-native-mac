@@ -1072,7 +1072,7 @@ struct HkdfGuardCommandLineToolTests {
             "--dek-file", "/dev/null"
         ])
         #expect(result.exitCode == 2) // argument-parsing failure
-        #expect(result.stderr.contains("conflicting DEK sources"))
+        #expect(result.stderr.contains("give exactly one of --dek-stdin or --dek-file"), "\(result.stderr)")
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
@@ -1080,7 +1080,7 @@ struct HkdfGuardCommandLineToolTests {
         let keyFilePath = Self.makeTempFilePath()
         let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", "com.hkdfguard.tests.cli.missing.source"])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("missing required DEK source"))
+        #expect(result.stderr.contains("missing required --dek-stdin or --dek-file <path>"), "\(result.stderr)")
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
@@ -1161,13 +1161,13 @@ struct HkdfGuardCommandLineToolTests {
     @Test func cliRejectsMissingCommand() throws {
         let result = try Self.runCLI([])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("missing command"))
+        #expect(result.stderr.contains("missing subcommand: expected `provision`, `wrap`, `retire` or `status`"), "\(result.stderr)")
     }
 
     @Test func cliRejectsUnknownCommand() throws {
         let result = try Self.runCLI(["frobnicate", "--service-name", "com.hkdfguard.tests.cli.unknown.command"])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("unknown command"))
+        #expect(result.stderr.contains("unknown subcommand \"frobnicate\""), "\(result.stderr)")
     }
 
     @Test func cliRejectsPositionalKeyFilePath() throws {
@@ -1183,7 +1183,31 @@ struct HkdfGuardCommandLineToolTests {
     @Test func cliProvisionRejectsWrapOnlyFlags() throws {
         let result = try Self.runCLI(["provision", "--service-name", "com.hkdfguard.tests.cli.provision.extra", "--dek-stdin"])
         #expect(result.exitCode == 2)
-        #expect(result.stderr.contains("unrecognized argument"))
+        #expect(result.stderr.contains("--dek-stdin is not valid for `provision`; it belongs to `wrap`"), "\(result.stderr)")
+    }
+
+    @Test func cliRefusesEveryRepeatedFlag() throws {
+        // A repeated flag is a usage error rather than the last value
+        // winning -- the same rule and message as the Linux and Windows
+        // tools. Refused while parsing, so nothing is read or written.
+        let keyFilePath = Self.makeTempFilePath()
+        let fp = String(repeating: "ab", count: 32)
+        let svc = "com.hkdfguard.tests.cli.repeated"
+        for (args, flag) in [
+            (["wrap", "-kf", keyFilePath, "-kf", keyFilePath + ".b", "-sn", svc, "--dek-stdin"], "--key-file-path"),
+            (["wrap", "-kf", keyFilePath, "-sn", svc, "--service-name", svc + ".b", "--dek-stdin"], "--service-name"),
+            (["wrap", "-kf", keyFilePath, "-sn", svc, "--dek-stdin", "-f", "--force"], "--force"),
+            (["wrap", "-kf", keyFilePath, "-sn", svc, "--dek-stdin", "-fp", fp, "--fingerprint", fp], "--fingerprint"),
+            (["provision", "-sn", svc, "-sn", svc], "--service-name"),
+            (["status", "-sn", svc, "-sn", svc], "--service-name"),
+            (["retire", "-sn", svc, "-fp", fp, "-fp", fp], "--fingerprint"),
+            (["retire", "-sn", svc, "--corrupt", "--corrupt"], "--corrupt"),
+        ] {
+            let result = try Self.runCLI(args)
+            #expect(result.exitCode == 2, "\(args)")
+            #expect(result.stderr.contains("give \(flag) at most once"), "\(args): \(result.stderr)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
     // MARK: - Data-protection mode: the bundled CLI provisions, the entitled host unwraps

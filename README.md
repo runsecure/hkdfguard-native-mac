@@ -99,7 +99,8 @@ What this design defends against, and what it leaves to the account:
   key that never leaves this Mac's Secure Enclave.
 - A key file can be **swapped or forged** only by someone who can write it
   as its owner (or root). `hkdfguard_open_file` refuses files owned by
-  anyone else, writable by anyone else, or hard-linked (`-39`); the AEAD
+  anyone else, writable by anyone else, hard-linked, or in a folder someone
+  else can write (`-39`); the AEAD
   rejects any alteration of a genuine file; `wrap --fingerprint` and the
   fingerprint check at unwrap reject a payload for the wrong KEK.
 - Whoever **is** the owning user — or has code running as them — can wrap a
@@ -326,6 +327,17 @@ reach `out` only on success; on any failure the whole declared capacity of
   root-owned file must still be readable by the reading account: `0644`, or
   `0640` with a group the account belongs to. Otherwise it is
   `fileAccessDenied` (-33).
+- **Folders.** The same holds for every folder above the file, up to `/`,
+  as on Linux: each must be owned by root or the process's effective user,
+  and not writable by group or others unless it is sticky (`/tmp`-style,
+  where only an entry's owner can rename or remove it). Write bits are
+  ignored on a read-only volume. Otherwise someone else could rename a file
+  of their choosing over the key, and it is `fileInsecure` (-39). The folder
+  is the one the opened file actually sits in. A folder the `admin` group
+  can write, such as `/Applications`, is refused: every administrator could
+  replace the key there without root. Keep key files under a root-owned
+  folder such as `/Library/Application Support/<app>` (`0755`), or in the
+  service account's home folder.
 - **Pass a trusted, absolute path.** The function opens what it is told.
   Don't hand it paths from untrusted input (its status codes say whether a
   file exists, is readable, and its size class — a small oracle if a
@@ -380,7 +392,7 @@ here are defined there but never returned on macOS.
 | `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 146 bytes |
 | `-37` | `ERR_FILE_PLAINTEXT_KEY` | `fileUnprotectedKey` | the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
 | `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 146 bytes, but the fingerprint is all zeros or the encapsulated key is not a P-256 point |
-| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | owned by someone other than this user or root, writable by group or others, or more than one hard link |
+| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | owned by someone other than this user or root, writable by group or others, or more than one hard link; or a folder above it is owned by someone else or writable by group or others without being sticky |
 | `-96` | `ERR_MAC_ACCESS_CONTROL_CREATION_FAILED` | `accessControlCreationFailed` | refines `ERR_PROVIDER_ERROR` (-4) |
 | `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
 | `-98` | `ERR_MAC_KEYCHAIN_WRITE_FAILED` | `keychainWriteFailed` | refines -4 |

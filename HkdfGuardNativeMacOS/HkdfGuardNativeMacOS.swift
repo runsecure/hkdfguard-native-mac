@@ -283,9 +283,11 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
 
     /// HKDFGUARD_ERR_FILE_UNTRUSTED: the file is owned by someone other than
     /// this process's effective user or root, is writable by group or
-    /// others, or has more than one hard link — so a party other than its
-    /// owner could have replaced its contents or linked an older payload
-    /// into its place. Root is accepted so an administrator or MDM can
+    /// others, or has more than one hard link; or a folder above it, up to
+    /// `/`, is owned by someone else or writable by group or others without
+    /// being sticky (see `keyFileFoldersAreTrusted`) — so a party other than
+    /// its owner could have replaced its contents, renamed another file over
+    /// it, or linked an older payload into its place. Root is accepted so an administrator or MDM can
     /// deploy key files a service account reads; root can already alter
     /// anything on the machine, so this adds no new party who could tamper
     /// with the file. The CLI's `wrap` writes owner-only, 0600, one link,
@@ -1631,6 +1633,68 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
     }
 }
 
+/// Whether every folder above the open key file `fd` -- its own folder and
+/// each one up to `/` -- is one nobody untrusted can rename, replace or
+/// delete entries in: a directory owned by root or this process's
+/// effective user, and not writable by group or others unless sticky
+/// (`/tmp`-style: the kernel then lets only an entry's owner, or the
+/// folder's, rename or remove it, and the file's own owner has just been
+/// checked). Write bits are ignored on a read-only volume. Linux's
+/// `check_dir_chain_for_existing_file`, with the same rules.
+///
+/// The folder is taken from the descriptor (`F_GETPATH`), so it is where
+/// the file that will be read actually sits. Linux also checks the folder
+/// the path names the file in, which differs when the last component is a
+/// symlink; here that is refused at the open (`O_NOFOLLOW`), so the two are
+/// the same folder. As on Linux, folders that symlinks inside the path
+/// live in are not walked: someone able to retarget one could at most send
+/// the path to a different file that itself passes every check here.
+///
+/// A folder writable by the `admin` group (`/Applications`, say) fails,
+/// as a group-writable folder does on Linux: every administrator could
+/// replace the key there without root.
+func keyFileFoldersAreTrusted(_ fd: Int32) -> Bool {
+    var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    guard fcntl(fd, F_GETPATH, &pathBuf) != -1 else {
+        return false
+    }
+    let filePath = String(cString: pathBuf)
+    guard filePath.hasPrefix("/"), let lastSlash = filePath.lastIndex(of: "/") else {
+        return false
+    }
+    var folder = lastSlash == filePath.startIndex ? "/" : String(filePath[..<lastSlash])
+
+    let uid = geteuid()
+    while true {
+        var info = stat()
+        guard stat(folder, &info) == 0,
+              info.st_mode & S_IFMT == S_IFDIR,
+              info.st_uid == 0 || info.st_uid == uid else {
+            return false
+        }
+        let writable = info.st_mode & (S_IWGRP | S_IWOTH) != 0
+        let sticky = info.st_mode & S_ISVTX != 0
+        if writable && !sticky && !folderIsOnReadOnlyVolume(folder) {
+            return false
+        }
+        if folder == "/" {
+            return true
+        }
+        guard let slash = folder.lastIndex(of: "/") else { // `folder` is absolute, so never
+            return false
+        }
+        folder = slash == folder.startIndex ? "/" : String(folder[..<slash])
+    }
+}
+
+private func folderIsOnReadOnlyVolume(_ folder: String) -> Bool {
+    var fs = statfs()
+    guard statfs(folder, &fs) == 0 else {
+        return false
+    }
+    return fs.f_flags & UInt32(MNT_RDONLY) != 0
+}
+
 /// Reads at most `buffer.count` bytes of the regular file at `path` into
 /// `buffer`, returning how many were read. A file whose size already
 /// exceeds a wrapped payload is rejected from `fstat` alone, before any
@@ -1672,6 +1736,12 @@ private func readWrappedFile(
     guard info.st_uid == geteuid() || info.st_uid == 0,
           info.st_mode & (S_IWGRP | S_IWOTH) == 0,
           info.st_nlink == 1 else {
+        return (.fileInsecure, 0)
+    }
+    // And the folders that decide what the path names, as on Linux --
+    // otherwise someone else could rename a file of their choosing over the
+    // key, and the checks above would pass on whatever they put there.
+    guard keyFileFoldersAreTrusted(fd) else {
         return (.fileInsecure, 0)
     }
     guard info.st_size <= off_t(hkdfguardWrappedLength) else {

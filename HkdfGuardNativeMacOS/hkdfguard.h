@@ -426,8 +426,12 @@ int32_t hkdfguard_generate_and_wrap_dek(
 //
 // `path` is a null-terminated filesystem path. It must name a regular file
 // owned by this process's effective user or by root, writable by no one but
-// its owner, with a single hard link (HKDFGUARD_ERR_FILE_UNTRUSTED otherwise; the CLI's `wrap`
-// writes such a file). A root-owned file deployed by an administrator must
+// its owner, with a single hard link, in folders that are each -- up to / --
+// owned by root or this user and not writable by group or others unless
+// sticky (/tmp-style); write bits are ignored on a read-only volume
+// (HKDFGUARD_ERR_FILE_UNTRUSTED otherwise, as on Linux; the CLI's `wrap`
+// writes such a file). A folder the admin group can write, such as
+// /Applications, is refused. A root-owned file deployed by an administrator must
 // still be readable by the caller -- 0644, or 0640 with a shared group --
 // or it is HKDFGUARD_ERR_FILE_ACCESS_DENIED. A
 // symbolic link as its last component is refused (HKDFGUARD_ERR_FILE_IO), not followed;

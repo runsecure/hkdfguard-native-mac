@@ -369,6 +369,75 @@ struct HkdfGuardOpenFileTests {
         #expect(Self.openFile(path).status == -36)
     }
 
+    // MARK: - Folders above the file (as on Linux)
+
+    @Test func refusesAFileInAFolderGroupOrOthersCanWrite() throws {
+        // Someone who can write the folder can rename a file of their choosing
+        // over the key, whatever the key's own mode.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        #expect(Self.openFile(file.path).status == 0)
+
+        for mode in [0o775, 0o757, 0o777] {
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: dir.path)
+            let result = Self.openFile(file.path)
+            #expect(result.status == -39, "folder mode \(String(mode, radix: 8))")
+            #expect(result.zeroed, "folder mode \(String(mode, radix: 8))")
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        #expect(Self.openFile(file.path).status == 0, "a 0755 folder is trusted again")
+    }
+
+    @Test func acceptsAFileInAStickyWorldWritableFolder() throws {
+        // /tmp-style: only an entry's owner (or the folder's) can rename or
+        // remove it, and the file's owner is checked.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: dir.path)
+        #expect(Self.openFile(file.path).status == 0)
+    }
+
+    @Test func refusesAFileBelowAWritableAncestorFolder() throws {
+        // Not just the file's own folder: anyone who can write an ancestor
+        // can rename the whole subtree aside and put their own in its place.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let sub = dir.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: sub.path)
+        let file = sub.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: file)
+        #expect(Self.openFile(file.path).status == 0)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: dir.path)
+        #expect(Self.openFile(file.path).status == -39)
+        try FileManager.default.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: dir.path)
+        #expect(Self.openFile(file.path).status == 0, "a sticky ancestor protects the subtree beneath it")
+    }
+
+    @Test func checksTheFolderTheFileIsIn_notTheSpellingOfThePath() throws {
+        // A symlinked folder in the path resolves (as /tmp and /etc do); the
+        // folders checked are the ones the opened file really sits in.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let real = dir.appendingPathComponent("real", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: false)
+        let file = real.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: file)
+        let alias = dir.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: real)
+        let viaAlias = alias.appendingPathComponent("ingest.key").path
+
+        #expect(Self.openFile(viaAlias).status == 0)
+        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: real.path)
+        #expect(Self.openFile(viaAlias).status == -39, "the real folder is writable, whatever the path says")
+    }
+
     @Test func refusesAFileWithMoreThanOneHardLink() throws {
         // A second name for the same inode could have been created by anyone
         // with write access to some directory and read access to an older

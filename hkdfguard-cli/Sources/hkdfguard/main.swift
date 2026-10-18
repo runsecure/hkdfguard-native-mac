@@ -365,14 +365,36 @@ func parseServiceName(_ arg: String, _ iterator: inout IndexingIterator<[String]
     return value
 }
 
+// Stores a flag's value, refusing a second one rather than letting the last
+// win: `-kf a.key ... -kf b.key` is ambiguous about which file the operator
+// meant, and silently picking one is how the wrong key file gets written or
+// the wrong service's KEK gets used. `flag` is the flag's long name. The
+// Linux tool's set_once.
+func setOnce<T>(_ slot: inout T?, _ flag: String, _ value: T) throws {
+    guard slot == nil else {
+        throw CLIError("give \(flag) at most once")
+    }
+    slot = value
+}
+
+// The same for a flag that takes no value.
+func setOnce(_ flag: inout Bool, _ name: String) throws {
+    guard !flag else {
+        throw CLIError("give \(name) at most once")
+    }
+    flag = true
+}
+
+let subcommandList = "`provision`, `wrap`, `retire` or `status`"
+
 func parseArgs(_ arguments: [String]) throws -> Command {
     var rest = Array(arguments.dropFirst()) // skip argv[0]
     guard !rest.isEmpty else {
-        throw CLIError("missing command: expected provision or wrap")
+        throw CLIError("missing subcommand: expected \(subcommandList)")
     }
     let command = rest.removeFirst()
     switch command {
-    case "--help", "-h":
+    case "--help", "-h", "help":
         return .help
     case "provision":
         return try parseProvision(rest)
@@ -383,7 +405,7 @@ func parseArgs(_ arguments: [String]) throws -> Command {
     case "status":
         return try parseStatus(rest)
     default:
-        throw CLIError("unknown command \"\(command)\": expected provision, wrap, retire, or status")
+        throw CLIError("unknown subcommand \"\(command)\": expected \(subcommandList)")
     }
 }
 
@@ -395,9 +417,9 @@ func parseStatus(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
         default:
-            throw CLIError("status: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `status`: \(arg)")
         }
     }
     guard let serviceName else { throw CLIError("status: missing required --service-name|-sn") }
@@ -415,16 +437,16 @@ func parseRetire(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
         case "--fingerprint", "-fp":
             guard let value = iterator.next(), !value.isEmpty else {
                 throw CLIError("\(arg) requires a value")
             }
-            fingerprint = try parseFingerprintHex(value)
+            try setOnce(&fingerprint, "--fingerprint", parseFingerprintHex(value))
         case "--corrupt":
-            corrupt = true
+            try setOnce(&corrupt, "--corrupt")
         default:
-            throw CLIError("retire: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `retire`: \(arg)")
         }
     }
 
@@ -483,9 +505,11 @@ func parseProvision(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
+        case "--key-file-path", "-kf", "--dek-stdin", "--dek-file", "--force", "-f":
+            throw CLIError("\(arg) is not valid for `provision`; it belongs to `wrap`")
         default:
-            throw CLIError("provision: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `provision`: \(arg)")
         }
     }
 
@@ -496,9 +520,20 @@ func parseProvision(_ arguments: [String]) throws -> Command {
 func parseWrap(_ arguments: [String]) throws -> Command {
     var keyFilePath: String?
     var serviceName: String?
-    var dekSources: [DekSource] = []
+    var dekSource: DekSource?
     var force = false
     var expectedFingerprint: [UInt8]?
+
+    // Rejects a second DEK source rather than letting the last one win:
+    // silently ignoring one of two explicitly requested inputs is exactly
+    // the kind of ambiguity that leads to wrapping the wrong key. The Linux
+    // tool's message.
+    func setSource(_ source: DekSource) throws {
+        guard dekSource == nil else {
+            throw CLIError("give exactly one of --dek-stdin or --dek-file")
+        }
+        dekSource = source
+    }
 
     var iterator = arguments.makeIterator()
     while let arg = iterator.next() {
@@ -506,31 +541,37 @@ func parseWrap(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--force", "-f":
-            force = true
+            try setOnce(&force, "--force")
         case "--fingerprint", "-fp":
             guard let value = iterator.next(), !value.isEmpty else {
                 throw CLIError("\(arg) requires a value")
             }
-            expectedFingerprint = try parseFingerprintHex(value)
+            try setOnce(&expectedFingerprint, "--fingerprint", parseFingerprintHex(value))
         case "--key-file-path", "-kf":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a path")
+            guard let value = iterator.next() else {
+                throw CLIError("\(arg) requires a value")
             }
-            keyFilePath = value
+            guard !value.isEmpty else {
+                throw CLIError("--key-file-path must not be empty")
+            }
+            try setOnce(&keyFilePath, "--key-file-path", value)
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
         case "--generate", "-g":
             // This tool only wraps a DEK the calling pipeline already has --
             // the key its data was encrypted with. Generating one here
             // would produce a key nothing has used.
             throw CLIError("\(arg) is not supported: this tool wraps the pipeline's existing DEK; supply it with \(dekSourceFlags)")
         case "--dek-stdin":
-            dekSources.append(.stdin)
+            try setSource(.stdin)
         case "--dek-file":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a path")
+            guard let value = iterator.next() else {
+                throw CLIError("\(arg) requires a value")
             }
-            dekSources.append(.file(value))
+            guard !value.isEmpty else {
+                throw CLIError("--dek-file must not be empty")
+            }
+            try setSource(.file(value))
         case "--dek", "-d":
             // Rejected explicitly, with the reason, rather than falling
             // through to a generic "unrecognized argument" -- anyone
@@ -543,24 +584,21 @@ func parseWrap(_ arguments: [String]) throws -> Command {
                 // than leaving the caller to guess what went wrong.
                 throw CLIError("wrap: unexpected argument \"\(arg)\" -- the key file path is given with --key-file-path|-kf <path>")
             }
-            throw CLIError("wrap: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `wrap`: \(arg)")
         }
     }
 
     guard let keyFilePath else { throw CLIError("wrap: missing required --key-file-path|-kf") }
     guard let serviceName else { throw CLIError("wrap: missing required --service-name|-sn") }
-    guard !dekSources.isEmpty else {
-        throw CLIError("wrap: missing required DEK source: one of \(dekSourceFlags)")
-    }
-    guard dekSources.count == 1 else {
-        throw CLIError("wrap: conflicting DEK sources (\(dekSources.map(\.flag).joined(separator: ", "))): give exactly one of \(dekSourceFlags)")
+    guard let dekSource else {
+        throw CLIError("wrap: missing required --dek-stdin or --dek-file <path>")
     }
 
     return .wrap(
         WrapArgs(
             keyFilePath: keyFilePath,
             serviceName: serviceName,
-            dekSource: dekSources[0],
+            dekSource: dekSource,
             force: force,
             expectedFingerprint: expectedFingerprint
         )
