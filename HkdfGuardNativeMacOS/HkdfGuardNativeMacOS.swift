@@ -18,64 +18,127 @@ private let hkdfguardDekLength = 32
 /// wrapped payload — see `kekFingerprint` below.
 private let hkdfguardFingerprintLength = 32
 
-/// The HPKE (RFC 9180) ciphersuite every payload is sealed with, and the one
-/// byte that names it in the payload: DHKEM(P-256, HKDF-SHA256),
-/// HKDF-SHA256, AES-256-GCM, base mode. The byte is the hook for a future
-/// suite (a post-quantum hybrid KEM, say) to be recognised at parse time
-/// rather than by a new file format; this build implements exactly one.
-private let hkdfguardCiphersuite = HPKE.Ciphersuite.P256_SHA256_AES_GCM_256
+/// The one byte that names the payload's construction (see "Wrap" below):
+/// ECDH(KEK, hashed per-payload point) -> HKDF-SHA512 -> AES-256-GCM, the
+/// Linux and Windows libraries' construction. The hook for a future one to
+/// be recognised at parse time; this build implements exactly one.
 private let hkdfguardSuiteId: UInt8 = 0x01
 private let hkdfguardSuiteIdLength = 1
 
-/// Length of the suite's encapsulated key: an uncompressed X9.63 P-256
-/// point, 0x04 || x || y.
-private let hkdfguardEncapsulatedKeyLength = 65
+/// The per-payload random salt: it selects the payload's ECDH point (see
+/// `payloadECDHPoint`) and is HKDF's salt. Linux's SALT_LEN.
+private let hkdfguardSaltLength = 32
 
-/// AES-GCM tag length, as fixed by the suite's AEAD. HPKE derives the nonce
-/// from the key schedule, so none is stored.
+/// The AES-GCM nonce, random per payload. Linux's NONCE_LEN.
+private let hkdfguardNonceLength = 12
+
+/// AES-GCM tag length.
 private let hkdfguardGCMTagLength = 16
 
 /// The exact length of every wrapped payload:
-///   fingerprint || suite id || encapsulated key || ciphertext (DEK length) || tag
-/// = 32 + 1 + 65 + 32 + 16 = 146 bytes. Known up front, so both wrap and
+///   fingerprint || suite id || salt || nonce || ciphertext (DEK length) || tag
+/// = 32 + 1 + 32 + 12 + 32 + 16 = 125 bytes. Known up front, so both wrap and
 /// unwrap can reject a wrong-sized buffer before any keychain or Secure
 /// Enclave work.
 private let hkdfguardWrappedLength =
-    hkdfguardFingerprintLength + hkdfguardSuiteIdLength + hkdfguardEncapsulatedKeyLength
+    hkdfguardFingerprintLength + hkdfguardSuiteIdLength + hkdfguardSaltLength + hkdfguardNonceLength
     + hkdfguardDekLength + hkdfguardGCMTagLength
 
-/// Offsets of each field within a payload.
+/// Offsets of each field within a payload. Everything before the
+/// ciphertext is the header, authenticated as a whole (see `wrapDekCore`).
 private let hkdfguardSuiteIdOffset = hkdfguardFingerprintLength
-private let hkdfguardEncapsulatedKeyOffset = hkdfguardSuiteIdOffset + hkdfguardSuiteIdLength
-private let hkdfguardCiphertextOffset = hkdfguardEncapsulatedKeyOffset + hkdfguardEncapsulatedKeyLength
+private let hkdfguardSaltOffset = hkdfguardSuiteIdOffset + hkdfguardSuiteIdLength
+private let hkdfguardNonceOffset = hkdfguardSaltOffset + hkdfguardSaltLength
+private let hkdfguardCiphertextOffset = hkdfguardNonceOffset + hkdfguardNonceLength
+private let hkdfguardHeaderLength = hkdfguardCiphertextOffset
 private let hkdfguardCiphertextLength = hkdfguardDekLength + hkdfguardGCMTagLength
 
-/// Label at the front of the HPKE `info` string, binding every derived key
-/// to this scheme so it can never be reused as a key for anything else.
-/// Platform-neutral on purpose: the sibling Linux and Windows libraries
-/// share this payload format, so they must derive with the same `info`.
-private let hkdfguardInfoLabel = Data("com.hkdfguard.hpke.v1".utf8)
+/// HKDF `info` prefix and the salt-to-point hash's domain, byte for byte
+/// the Linux library's (HKDF_INFO_PREFIX, PAYLOAD_POINT_DOMAIN). Payloads
+/// are host-only, so nothing requires the labels to match; matching keeps
+/// the three implementations reviewable as one design.
+private let hkdfguardHKDFInfoPrefix = Data("hkdfguard-wrap-v1:".utf8)
+private let hkdfguardPayloadPointDomain = Data("HkdfGuard-P256-payload-ECDH-point-v1:".utf8)
 
-/// The HPKE `info` for `service`: label || 0x00 || service. Folded into the
-/// key schedule, so a payload sealed for one service cannot be opened under
-/// another even when (by misuse) both resolve to the same KEK. The service
-/// is validated ASCII (letters, digits, '.') before it gets here, so the
-/// 0x00 separator is unambiguous.
-private func hpkeInfo(service: String) -> Data {
-    var info = hkdfguardInfoLabel
-    info.append(0)
-    info.append(contentsOf: service.utf8)
+/// HKDF `info` for one payload: prefix || len(service) as u16 little-endian
+/// || service || header. The length prefix keeps the concatenation
+/// unambiguous, so no two distinct (service, header) pairs give the same
+/// `info`; the header binds the fingerprint, suite, salt and nonce into the
+/// key itself. Linux's `derive_wrapping_key`.
+func wrappingKeyInfo(service: String, header: Data) -> Data { // internal: the forgery tests rebuild payloads with it
+    let serviceBytes = Data(service.utf8) // validated ASCII, at most 128 bytes
+    var info = hkdfguardHKDFInfoPrefix
+    info.append(UInt8(serviceBytes.count & 0xFF))
+    info.append(UInt8(serviceBytes.count >> 8))
+    info.append(serviceBytes)
+    info.append(header)
     return info
 }
 
-/// The AEAD's additional authenticated data: the payload's own header,
-/// fingerprint || suite id -- every byte that precedes the encapsulated key.
-/// The tag therefore covers the suite byte the parser dispatches on as well
-/// as the fingerprint, so neither can be rewritten without failing the open.
-private func hpkeAAD(fingerprint: Data) -> Data {
-    var aad = fingerprint
-    aad.append(hkdfguardSuiteId)
-    return aad
+/// Hashes `salt` to a P-256 point: the first `X = SHA-256(domain || salt ||
+/// counter)` that is a valid x-coordinate, with the even-Y point (compressed
+/// 0x02 || X). Linux's `payload_ecdh_point`, byte for byte.
+///
+/// Why: the wrapping key comes from `ECDH(KEK_priv, H)`. Nobody knows the
+/// discrete log of a hash output, so computing it takes the KEK's private
+/// key, which never leaves the Secure Enclave -- only this host can create
+/// a payload, as well as open one. An ephemeral sender key (HPKE base mode,
+/// ECIES) would let anyone holding the KEK's *public* key derive the same
+/// secret and mint a payload carrying a DEK of their choosing. One point
+/// per payload, rather than one fixed point, makes the shared secret unique
+/// to the payload: capturing it once opens that payload, not the service's
+/// whole history.
+///
+/// Roughly half of all candidates are on the curve, so 255 failures has
+/// probability 2^-255. Not constant-time, and need not be: the salt is
+/// public. P-256 has cofactor 1, so any point that decompresses is in the
+/// prime-order group. CryptoKit validates the point while decompressing.
+func payloadECDHPoint(salt: Data) -> P256.KeyAgreement.PublicKey? {
+    for counter in UInt8(0)..<UInt8.max {
+        var hasher = SHA256()
+        hasher.update(data: hkdfguardPayloadPointDomain)
+        hasher.update(data: salt)
+        hasher.update(data: [counter])
+        var compressed = Data([0x02])
+        compressed.append(contentsOf: hasher.finalize())
+        if let point = try? P256.KeyAgreement.PublicKey(compressedRepresentation: compressed) {
+            return point
+        }
+    }
+    return nil
+}
+
+/// The AES-256 wrapping key for one payload: the Secure Enclave computes
+/// `ECDH(KEK_priv, payloadECDHPoint(salt))`, and HKDF-SHA512 (salt = the
+/// payload salt, `info` = `wrappingKeyInfo`) turns it into 32 bytes. The raw
+/// shared secret stays inside CryptoKit's `SharedSecret` and never becomes
+/// a buffer here. Throws if the enclave refuses (CRYPTO_ERROR); nil only if
+/// no point exists for the salt.
+private func deriveWrappingKey(
+    enclaveKey: SecureEnclave.P256.KeyAgreement.PrivateKey,
+    service: String,
+    header: Data
+) throws -> SymmetricKey? {
+    let salt = header[hkdfguardSaltOffset..<hkdfguardNonceOffset]
+    guard let point = payloadECDHPoint(salt: Data(salt)) else {
+        return nil
+    }
+    let shared = try enclaveKey.sharedSecretFromKeyAgreement(with: point)
+    return shared.hkdfDerivedSymmetricKey(
+        using: SHA512.self,
+        salt: salt,
+        sharedInfo: wrappingKeyInfo(service: service, header: header),
+        outputByteCount: 32
+    )
+}
+
+private func randomBytes(_ count: Int) -> Data? {
+    var bytes = Data(count: count)
+    let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
+        guard let base = raw.baseAddress else { return errSecParam }
+        return SecRandomCopyBytes(kSecRandomDefault, count, base)
+    }
+    return status == errSecSuccess ? bytes : nil
 }
 
 // MARK: - Keychain mode (hybrid)
@@ -169,7 +232,8 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     case outputBufferTooSmall = -2
     /// HKDFGUARD_ERR_PROVIDER_UNAVAILABLE: no Secure Enclave on this machine.
     case enclaveUnavailable = -3
-    /// HKDFGUARD_ERR_CRYPTO_ERROR: the RNG or HPKE sealing failed.
+    /// HKDFGUARD_ERR_CRYPTO_ERROR: the RNG failed, the Secure Enclave refused
+    /// the key agreement (wrap or unwrap), or AES-GCM sealing failed.
     case encryptionFailed = -5
     /// HKDFGUARD_ERR_INTERNAL_ERROR: the library produced output of a length
     /// it never should. Points at a bug here, not at the caller's input.
@@ -277,8 +341,7 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     case fileUnprotectedKey = -37
 
     /// HKDFGUARD_ERR_FILE_MALFORMED: exactly the payload's length, but not a
-    /// payload: its encapsulated key is not a valid P-256 point, or its KEK
-    /// fingerprint is all zeros.
+    /// payload: its KEK fingerprint is all zeros.
     case fileMalformed = -38
 
     /// HKDFGUARD_ERR_FILE_UNTRUSTED: the file is owned by someone other than
@@ -471,7 +534,7 @@ private func validServiceName(service: String) -> Bool {
 /// Service names are case-insensitive (`"Com.Example.App"` and
 /// `"com.example.app"` resolve to the same KEK); the returned string is
 /// the one normalized form that `validServiceName` re-checks downstream,
-/// the keychain query/store calls use, and the HPKE `info` is built from. Returns `nil` when the name is invalid — the
+/// the keychain query/store calls use, and the HKDF `info` is built from. Returns `nil` when the name is invalid — the
 /// caller maps that to `invalidServiceIdentifier`.
 ///
 /// The terminator is looked for in at most 129 bytes (`strnlen`), as on
@@ -713,39 +776,43 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
 }
 
 /// Computes the "fingerprint" embedded at the front of every wrapped
-/// payload: a SHA-256 hash of the KEK's public key raw representation.
+/// payload: a SHA-256 hash of the KEK's public key, uncompressed X9.63
+/// (0x04 || x || y) -- the encoding Linux and Windows hash.
 /// Not a secret value — the public key it hashes isn't secret either —
 /// so the explicit equality check against it in `hkdfguard_unwrap_dek`
 /// exists purely to fail fast, cheaply, on "this payload wasn't wrapped
 /// under the KEK I just resolved for this service" *before* spending any
-/// effort on ECDH/AES-GCM. It is also folded into the AES-GCM AAD (see
-/// `wrapDekCore`/`hkdfguard_unwrap_dek`) alongside `service`, so the tag
-/// itself authenticates it too.
-private func kekFingerprint(publicKeyRaw: Data) -> Data {
-    Data(SHA256.hash(data: publicKeyRaw))
+/// effort on ECDH/AES-GCM. It is also in the authenticated header (see
+/// `wrapDekCore`), so the derived key and the tag commit to it too.
+func kekFingerprint(_ publicKey: P256.KeyAgreement.PublicKey) -> Data {
+    Data(SHA256.hash(data: publicKey.x963Representation))
 }
 
 // MARK: - Wrap (seal) a DEK under the Secure Enclave KEK
 //
 // Wrapped format: [KEK fingerprint, 32-byte SHA-256 of the KEK's public key]
 //                  [suite id, 1 byte: 0x01]
-//                  [HPKE encapsulated key, 65 bytes: X9.63 P-256 point]
+//                  [salt, 32 random bytes]
+//                  [nonce, 12 random bytes]
 //                  [AES-256-GCM ciphertext || 16-byte tag, 48 bytes]
 //
-// Sealing is HPKE (RFC 9180) in base mode, one message per context: CryptoKit
-// generates the ephemeral key pair, runs the key schedule (DHKEM(P-256),
-// HKDF-SHA256) and the AEAD, and derives the nonce, so this file holds no
-// KDF or nonce handling of its own. `info` binds the scheme label and the
-// service; the payload header (fingerprint || suite id) is the AEAD's
-// additional authenticated data.
-// Base mode authenticates nothing about the sender: anyone holding the KEK's
-// public key can produce a valid payload (see "Sender authentication" in the
-// README for the Auth-mode design that would change that).
+// The Linux and Windows construction: the Secure Enclave computes
+// Z = ECDH(KEK_priv, H(salt)), where H hashes the salt to a P-256 point
+// (`payloadECDHPoint`); HKDF-SHA512 turns Z into the AES-256 key
+// (`deriveWrappingKey`); AES-256-GCM seals the DEK. Wrapping needs the
+// KEK's private key as much as unwrapping does, so only this host -- not
+// anyone who has seen the public key -- can create a payload.
+//
+// The header (fingerprint || suite id || salt || nonce: every byte before
+// the ciphertext) is bound twice, as on Linux: into the key, through HKDF's
+// `info` with the service name, and into the tag, as the AEAD's additional
+// authenticated data. Neither the fingerprint nor the suite byte can be
+// rewritten, and a payload sealed for one service cannot be opened under
+// another even when (by misuse) both resolve to the same KEK.
 //
 // The fingerprint identifies *which* KEK this payload was wrapped under —
 // checked against the current KEK's own public key by hkdfguard_unwrap_dek
-// before any key agreement is attempted (see `kekFingerprint`), and covered
-// by the AEAD tag too, so tampering with it fails both checks independently.
+// before any key agreement is attempted (see `kekFingerprint`).
 
 /// `@_cdecl` entry points below.
 private func wrapDekCore(
@@ -760,41 +827,52 @@ private func wrapDekCore(
         return getStatus
     }
 
-    let fingerprint = kekFingerprint(publicKeyRaw: enclaveKey.publicKey.rawRepresentation)
-
-    let encapsulated: Data
-    let ciphertext: Data
-    do {
-        var sender = try HPKE.Sender(
-            recipientKey: enclaveKey.publicKey,
-            ciphersuite: hkdfguardCiphersuite,
-            info: hpkeInfo(service: service)
-        )
-        ciphertext = try sender.seal(
-            UnsafeRawBufferPointer(start: dekPtr, count: Int(dekLen)),
-            authenticating: hpkeAAD(fingerprint: fingerprint)
-        )
-        encapsulated = sender.encapsulatedKey
-    } catch {
-        return HKDFGuardStatus.encryptionFailed.rawValue
+    guard let salt = randomBytes(hkdfguardSaltLength),
+          let nonceBytes = randomBytes(hkdfguardNonceLength),
+          let nonce = try? AES.GCM.Nonce(data: nonceBytes) else {
+        return HKDFGuardStatus.encryptionFailed.rawValue // the RNG failed
     }
 
-    guard encapsulated.count == hkdfguardEncapsulatedKeyLength,
-          ciphertext.count == hkdfguardCiphertextLength else {
+    var header = kekFingerprint(enclaveKey.publicKey)
+    header.append(hkdfguardSuiteId)
+    header.append(salt)
+    header.append(nonceBytes)
+    guard header.count == hkdfguardHeaderLength else {
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
 
-    var payload = Data(capacity: hkdfguardWrappedLength)
-    payload.append(fingerprint)
-    payload.append(hkdfguardSuiteId)
-    payload.append(encapsulated)
-    payload.append(ciphertext)
+    let sealed: AES.GCM.SealedBox
+    do {
+        guard let key = try deriveWrappingKey(enclaveKey: enclaveKey, service: service, header: header) else {
+            return HKDFGuardStatus.encryptionFailed.rawValue // no point for this salt (probability 2^-255)
+        }
+        // Sealed straight from the caller's buffer: no copy of the DEK is made.
+        sealed = try AES.GCM.seal(
+            UnsafeRawBufferPointer(start: dekPtr, count: Int(dekLen)),
+            using: key,
+            nonce: nonce,
+            authenticating: header
+        )
+    } catch {
+        return HKDFGuardStatus.encryptionFailed.rawValue // the enclave refused the key agreement, or sealing failed
+    }
+
+    guard sealed.ciphertext.count == hkdfguardDekLength,
+          sealed.tag.count == hkdfguardGCMTagLength else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
+    }
+
+    var payload = header
+    payload.append(sealed.ciphertext)
+    payload.append(sealed.tag)
     guard payload.count == hkdfguardWrappedLength else {
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
 
-    _ = payload.withUnsafeBytes { raw in
-        memcpy(outPtr, raw.baseAddress!, payload.count)
+    payload.withUnsafeBytes { raw in
+        for i in 0..<raw.count {
+            outPtr[i] = raw[i]
+        }
     }
     outLen.pointee = Int32(payload.count)
 
@@ -935,7 +1013,7 @@ func auditKekCreated(service: String, mode: KeychainMode) {
 }
 
 /// A DEK was wrapped (`op` is wrap or generateAndWrap) or unwrapped
-/// (`unwrap`). `payload` is the 146-byte payload produced or consumed:
+/// (`unwrap`). `payload` is the 125-byte payload produced or consumed:
 /// public bytes, the first 32 of which are the KEK fingerprint.
 func auditDekOperation(_ op: AuditOp, service: String, payload: UnsafeBufferPointer<UInt8>) {
     let unwrap = op == .unwrap
@@ -1336,7 +1414,7 @@ public func hkdfguard_kek_fingerprint(
         return status
     }
 
-    let fingerprint = kekFingerprint(publicKeyRaw: key.publicKey.rawRepresentation)
+    let fingerprint = kekFingerprint(key.publicKey)
     _ = fingerprint.withUnsafeBytes { raw in
         memcpy(outPtr, raw.baseAddress!, fingerprint.count)
     }
@@ -1394,8 +1472,8 @@ private func writtenPayload(_ status: Int32, _ outPtr: UnsafeMutablePointer<UInt
 /// - An invalid service: -8.
 /// - NULL `out` with a positive capacity (somewhere declared, nowhere to
 ///   write): -1.
-/// - A capacity under 146 -- including the 0 of a size probe, which may pass
-///   a NULL `out`: -2 with `*out_len` = 146. The payload size is a constant,
+/// - A capacity under 125 -- including the 0 of a size probe, which may pass
+///   a NULL `out`: -2 with `*out_len` = 125. The payload size is a constant,
 ///   so no ciphertext is ever produced for a caller who can't receive it.
 private func wrapDekChecked(
     servicePtr: UnsafePointer<CChar>?,
@@ -1548,10 +1626,12 @@ private func unwrapDekCore(
         return HKDFGuardStatus.payloadMalformed.rawValue
     }
 
-    let storedFingerprint = Data(bytes: wrappedPtr, count: hkdfguardFingerprintLength)
+    let header = Data(bytes: wrappedPtr, count: hkdfguardHeaderLength)
+    let storedFingerprint = header.prefix(hkdfguardFingerprintLength)
     let suiteId = wrappedPtr[hkdfguardSuiteIdOffset]
-    let encapsulated = Data(bytes: wrappedPtr + hkdfguardEncapsulatedKeyOffset, count: hkdfguardEncapsulatedKeyLength)
-    let ciphertext = Data(bytes: wrappedPtr + hkdfguardCiphertextOffset, count: hkdfguardCiphertextLength)
+    let nonceBytes = Data(bytes: wrappedPtr + hkdfguardNonceOffset, count: hkdfguardNonceLength)
+    let ciphertext = Data(bytes: wrappedPtr + hkdfguardCiphertextOffset, count: hkdfguardDekLength)
+    let tag = Data(bytes: wrappedPtr + hkdfguardCiphertextOffset + hkdfguardDekLength, count: hkdfguardGCMTagLength)
 
     // A payload of a suite this build does not implement is reported as
     // such, before the keychain is consulted: it is a version or build
@@ -1573,24 +1653,35 @@ private func unwrapDekCore(
         // is a fast, specific "wrong/stale KEK" signal that fails ahead of
         // the AEAD tag check below, which also covers this same fingerprint
         // (it is in the AAD) and would catch a tampered one anyway.
-        let currentFingerprint = kekFingerprint(publicKeyRaw: enclaveKey.publicKey.rawRepresentation)
+        let currentFingerprint = kekFingerprint(enclaveKey.publicKey)
         guard currentFingerprint == storedFingerprint else {
             return HKDFGuardStatus.fingerprintMismatch.rawValue
         }
 
-        // HPKE base mode: the Secure Enclave performs its half of the key
-        // agreement inside Recipient.init; the key schedule and AEAD open
-        // follow. Any failure -- an encapsulated key that is not a point on
-        // the curve, a locked enclave, a tag that does not verify -- is one
-        // outcome: the payload cannot be opened under this KEK.
+        // The fixed-length fields always form a box; failing that is a bug.
+        guard let nonce = try? AES.GCM.Nonce(data: nonceBytes),
+              let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag) else {
+            return HKDFGuardStatus.unexpectedOutputLength.rawValue
+        }
+
+        // Re-derive the payload's key -- the Secure Enclave's ECDH against
+        // the point its salt hashes to, then HKDF over the same header and
+        // service -- and open. The two failures are kept apart, as on Linux:
+        // the enclave refusing the key agreement (locked, unavailable) is a
+        // CRYPTO_ERROR about this machine, not a verdict on the payload;
+        // only a tag that doesn't verify is PAYLOAD_AUTH_FAILED (tampered,
+        // or sealed for a different service).
+        let key: SymmetricKey
         do {
-            var recipient = try HPKE.Recipient(
-                privateKey: enclaveKey,
-                ciphersuite: hkdfguardCiphersuite,
-                info: hpkeInfo(service: service),
-                encapsulatedKey: encapsulated
-            )
-            plaintext = try recipient.open(ciphertext, authenticating: hpkeAAD(fingerprint: currentFingerprint))
+            guard let derived = try deriveWrappingKey(enclaveKey: enclaveKey, service: service, header: header) else {
+                return HKDFGuardStatus.encryptionFailed.rawValue // no point for this salt (probability 2^-255)
+            }
+            key = derived
+        } catch {
+            return HKDFGuardStatus.encryptionFailed.rawValue
+        }
+        do {
+            plaintext = try AES.GCM.open(box, using: key, authenticating: header)
         } catch {
             return HKDFGuardStatus.decryptionFailed.rawValue
         }
@@ -1808,12 +1899,12 @@ private func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool {
     }
 }
 
-/// Reads the wrapped payload stored at `path` — the 146-byte file the CLI's
+/// Reads the wrapped payload stored at `path` — the 125-byte file the CLI's
 /// `wrap` writes — validates it, and copies it to `out`, ready for
 /// `hkdfguard_unwrap_dek`. Never touches the keychain or the Secure
 /// Enclave, and never unwraps anything.
 ///
-/// `*outLen` is the capacity on entry. It is written only with 146: on
+/// `*outLen` is the capacity on entry. It is written only with 125: on
 /// success, and on `outputBufferTooSmall` (the required size, reported
 /// before the file is opened). Every other failure leaves it as the caller
 /// set it, as on Linux and as wrap and unwrap do. File contents are
@@ -1844,7 +1935,7 @@ private func openFileCore(
 ) -> Int32 {
     // Argument checks in Linux's open_file_impl order, before the file is
     // opened. As on Linux (and as wrap and unwrap do), `*out_len` is written
-    // only on success (146) and on buffer-too-small (the size to retry
+    // only on success (125) and on buffer-too-small (the size to retry
     // with); every other failure leaves it as the caller set it.
     guard let outLen else {
         return HKDFGuardStatus.invalidInputLength.rawValue
@@ -1890,21 +1981,16 @@ private func openFileCore(
 
     // Structural checks only -- authenticity is the AEAD's job at unwrap.
     // A SHA-256 fingerprint of all zeros does not occur in practice (checked
-    // first, so an all-zero file is "malformed", not "newer suite"); the
-    // suite byte must be one this build implements; and the encapsulated
-    // key must be a point on P-256 (checked in its X9.63 form, which
-    // CryptoKit validates -- `PublicKey(rawRepresentation:)` would accept
-    // any 64 bytes) for any unwrap to succeed.
+    // first, so an all-zero file is "malformed", not "newer suite"), and the
+    // suite byte must be one this build implements. The salt, nonce and
+    // ciphertext are random-looking by design; nothing more can be checked
+    // without the KEK.
     let fingerprint = buffer[0..<hkdfguardFingerprintLength]
     guard fingerprint.contains(where: { $0 != 0 }) else {
         return HKDFGuardStatus.fileMalformed.rawValue
     }
     guard buffer[hkdfguardSuiteIdOffset] == hkdfguardSuiteId else {
         return HKDFGuardStatus.unsupportedCiphersuite.rawValue
-    }
-    let encapsulated = buffer[hkdfguardEncapsulatedKeyOffset..<hkdfguardCiphertextOffset]
-    guard (try? P256.KeyAgreement.PublicKey(x963Representation: encapsulated)) != nil else {
-        return HKDFGuardStatus.fileMalformed.rawValue
     }
 
     buffer.withUnsafeBytes { raw in

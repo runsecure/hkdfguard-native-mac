@@ -765,7 +765,7 @@ func retireKEK(service: String, expectedFingerprint: [UInt8]) throws {
     guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: item.blob) else {
         throw CLIError("the KEK item for service \"\(service)\" could not be reconstructed when re-read for deletion; nothing was deleted -- inspect it again before retiring")
     }
-    let itemFingerprint = Array(SHA256.hash(data: key.publicKey.rawRepresentation))
+    let itemFingerprint = Array(SHA256.hash(data: key.publicKey.x963Representation)) // the library's kekFingerprint: SHA-256 of 0x04 || x || y
     guard itemFingerprint == expectedFingerprint else {
         throw CLIError("the KEK item for service \"\(service)\" changed between checks (now \(hexString(itemFingerprint))); nothing was deleted")
     }

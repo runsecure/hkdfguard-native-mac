@@ -25,7 +25,7 @@ import CryptoKit
 @Suite
 struct HkdfGuardOpenFileTests {
 
-    private static let wrappedLength = 146 // 32 fingerprint + 1 suite + 65 enc + 32 ct + 16 tag
+    private static let wrappedLength = 125 // 32 fingerprint + 1 suite + 32 salt + 12 nonce + 32 ct + 16 tag
 
     /// A fresh, empty directory for one test; removed by the caller's defer.
     private static func makeTempDirectory() throws -> URL {
@@ -40,14 +40,13 @@ struct HkdfGuardOpenFileTests {
     }
 
     /// A payload that passes every structural check: a non-zero fingerprint,
-    /// the supported suite byte, a real P-256 encapsulated key (X9.63), and
-    /// random ciphertext/tag bytes. It would fail the AEAD at unwrap, which
-    /// is not `hkdfguard_open_file`'s concern.
+    /// the supported suite byte, and random salt, nonce, ciphertext and tag.
+    /// It would fail the AEAD at unwrap, which is not `hkdfguard_open_file`'s
+    /// concern.
     private static func structurallyValidPayload() -> [UInt8] {
         var payload = (0..<32).map { _ in UInt8.random(in: 1 ... .max) }
         payload.append(0x01) // suite id
-        payload += Array(P256.KeyAgreement.PrivateKey().publicKey.x963Representation)
-        payload += (0..<(32 + 16)).map { _ in UInt8.random(in: .min ... .max) }
+        payload += (0..<(32 + 12 + 32 + 16)).map { _ in UInt8.random(in: .min ... .max) }
         return payload
     }
 
@@ -191,28 +190,18 @@ struct HkdfGuardOpenFileTests {
         #expect(result.zeroed)
     }
 
-    @Test func rejectsAPayloadLengthFileWhoseEncapsulatedKeyIsNotOnTheCurve() throws {
+    @Test func acceptsAnyBytesAfterTheHeader() throws {
+        // Salt, nonce and ciphertext are random by design: with a good
+        // fingerprint and suite byte, all-zero or all-0xFF bodies are
+        // structurally fine. Only unwrap, with the KEK, can judge them.
         let dir = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let file = dir.appendingPathComponent("bad.point")
-        var payload = Self.structurallyValidPayload()
-        payload.replaceSubrange(33..<98, with: [UInt8](repeating: 0xFF, count: 65))
-        try Self.write(payload, to: file)
-
-        #expect(Self.openFile(file.path).status == -38)
-    }
-
-    @Test func rejectsAnEncapsulatedKeyWithACompressedPrefix() throws {
-        // 65 bytes with a 0x02/0x03 prefix is not an uncompressed point, and
-        // this reader accepts only that form.
-        let dir = try Self.makeTempDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        for prefix: UInt8 in [0x02, 0x03, 0x00] {
-            let file = dir.appendingPathComponent("prefix.\(prefix)")
+        for fill: UInt8 in [0x00, 0xFF] {
+            let file = dir.appendingPathComponent("body.\(fill)")
             var payload = Self.structurallyValidPayload()
-            payload[33] = prefix
+            payload.replaceSubrange(33..<Self.wrappedLength, with: [UInt8](repeating: fill, count: Self.wrappedLength - 33))
             try Self.write(payload, to: file)
-            #expect(Self.openFile(file.path).status == -38, "prefix \(prefix)")
+            #expect(Self.openFile(file.path).status == 0, "fill \(fill)")
         }
     }
 
@@ -244,7 +233,7 @@ struct HkdfGuardOpenFileTests {
     // MARK: - Path and file type
 
     @Test func aSizeProbeWithANullOutReportsTheSizeWithoutOpeningTheFile() {
-        // As on Linux: `out = NULL, *out_len = 0` is -2 with 146, answered
+        // As on Linux: `out = NULL, *out_len = 0` is -2 with 125, answered
         // before the path is opened -- so even a missing file gives the size.
         var len: Int32 = 0
         #expect(hkdfguard_open_file(pathPtr: "/nonexistent/hkdfguard/probe.key", outPtr: nil, outLen: &len) == -2)

@@ -7,7 +7,7 @@ so one consumer and one pipeline work on every platform. They do **not**
 share payload bytes, and nothing requires them to: a KEK is bound to the
 Secure Enclave of the machine that created it and never leaves it, so a
 wrapped key file is only ever read on the machine that wrote it. The macOS
-payload is HPKE (RFC 9180), described below.
+payload construction is the same as theirs, described below.
 
 `HkdfGuardNativeMacOS` wraps and unwraps 32-byte Data Encryption
 Keys (DEKs) under a per-service Key Encryption Key (KEK) that lives in the
@@ -30,112 +30,116 @@ creates a KEK; every wrap/unwrap function requires one to already exist and
 fails with `kekNotFound` (-17) otherwise. Nothing is ever created "on first
 use".
 
-Wrapping is **HPKE** (RFC 9180, base mode) with the ciphersuite
-DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM, as implemented by
-CryptoKit:
+Wrapping is the same construction as the Linux and Windows libraries:
+**ECDH against a hashed per-payload point, HKDF-SHA512, AES-256-GCM**, with
+CryptoKit doing every primitive:
 
-1. HPKE generates a fresh ephemeral P-256 key pair and encapsulates a shared
-   secret to the service's KEK public key (discarding the ephemeral private
-   key after the call).
-2. The HPKE key schedule derives the AEAD key and nonce from that secret and
-   an `info` string of the scheme label and the service name
-   (`com.hkdfguard.hpke.v1` ‖ `0x00` ‖ service).
-3. AES-256-GCM seals the DEK, with the payload header — KEK fingerprint ‖
-   suite id — as additional authenticated data.
+1. A fresh random 32-byte **salt** is hashed to a P-256 point `H`:
+   the first `SHA-256("HkdfGuard-P256-payload-ECDH-point-v1:" ‖ salt ‖ counter)`
+   that is a valid x-coordinate, taken with even Y (the Linux library's
+   hash, byte for byte).
+2. The **Secure Enclave** computes `Z = ECDH(KEK_priv, H)`.
+3. **HKDF-SHA512** turns `Z` into the 32-byte AES key, with the salt as
+   HKDF's salt and an `info` of `"hkdfguard-wrap-v1:"` ‖ the service name's
+   length (u16, little-endian) ‖ the service name ‖ the payload header.
+4. **AES-256-GCM** seals the DEK under a fresh random 12-byte nonce, with
+   the payload header as additional authenticated data.
 
-Unwrapping reverses this, with the Secure Enclave performing its side of the
-key agreement. Each wrap uses a fresh ephemeral key, so the derived key is
-single-use — two wraps of the same DEK never produce the same bytes — and a
-payload wrapped for one service can never be opened under another. The
-library holds no KDF or nonce handling of its own; the construction is the
-RFC's as implemented by CryptoKit. (RFC 9180's Appendix A publishes vectors
-for DHKEM(P-256) with AES-128-GCM and for AES-256-GCM with P-521, but not
-for this exact P-256 + AES-256-GCM suite; the suite's security rests on the
-RFC's analysis and Apple's implementation, not on a vector check here.)
+Unwrapping reverses this: the salt in the payload gives the same point, the
+Secure Enclave the same `Z`. Every wrap draws a new salt and nonce, so two
+wraps of the same DEK never produce the same bytes, and a payload wrapped
+for one service can never be opened under another.
+
+### Why a hashed point: only this Mac can create a payload
+
+Nobody knows the private key of a point that came out of a hash, so `Z` can
+only be computed with the KEK's private key, which never leaves the Secure
+Enclave. Creating a payload therefore needs the enclave as much as opening
+one does. Knowing the KEK's **public** key is not enough.
+
+That is the difference from ordinary public-key encryption (ECIES, HPKE base
+mode), where the sender picks an ephemeral key `e` and computes `e · KEK_pub`.
+Anyone holding the public key can do that, and could therefore write a key
+file carrying a DEK of their choosing that `unwrap` accepts. The public key
+isn't secret, and once it has been seen it can't be made secret again, so
+with that design the key file's permissions would be the only thing standing
+in the way.
+
+Each payload gets its own point, rather than one fixed point per service,
+so `Z` is unique to the payload: if one `Z` is ever captured (from memory,
+say), it opens that one payload, not the service's history, and still lets
+nobody create a new one.
 
 ## Wrapped payload format
 
-Always exactly **146 bytes**:
+Always exactly **125 bytes**:
 
 ```
-[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key          ]
-[  1-byte ciphersuite id — 0x01                                       ]
-[ 65-byte HPKE encapsulated key — X9.63 P-256 point, 0x04 || x || y   ]
-[ 32-byte AES-256-GCM ciphertext || 16-byte tag                       ]
+[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key, 0x04 || x || y ]
+[  1-byte suite id — 0x01                                                  ]
+[ 32-byte random salt                                                       ]
+[ 12-byte random AES-GCM nonce                                              ]
+[ 32-byte AES-256-GCM ciphertext || 16-byte tag                             ]
 ```
 
-The fingerprint identifies *which* KEK a payload was wrapped under. On
+The **header** is every byte before the ciphertext. It is bound twice, as on
+Linux: into the derived key (HKDF `info`, with the service name) and into
+the tag (AES-GCM additional data). No header byte can be changed without the
+open failing.
+
+The fingerprint identifies *which* KEK a payload was wrapped under. It hashes
+the uncompressed public key (`0x04 || x || y`), as Linux and Windows do. On
 unwrap it is compared to the current KEK's public key **before** any key
 agreement or decryption is attempted, so "wrong or rotated KEK" is reported
 as `fingerprintMismatch` (-16) rather than as a generic decryption failure.
-It is also in the AEAD's additional authenticated data (the whole header,
-fingerprint ‖ suite id, is), so tampering with it — or with the suite
-byte — fails the tag check as well. Pipelines and consumers pin a KEK by comparing
-these 32 bytes with the fingerprint recorded at provisioning.
+Pipelines and consumers pin a KEK by comparing these 32 bytes with the
+fingerprint recorded at provisioning.
 
-The **suite id** names the HPKE ciphersuite the rest of the payload was
-sealed with. This build implements exactly one, `0x01`; any other value is
-`unsupportedCiphersuite` (-12), reported before the keychain is consulted.
-The byte exists so a future suite — a post-quantum hybrid KEM, once the
-Secure Enclave can hold its key — is a parse-time dispatch, not a new file
-format: the key schedule, AEAD, `info`, AAD, and parser stay as they are
-and only the KEM changes.
+The **suite id** names the construction above. This build implements exactly
+one, `0x01`; any other value is `unsupportedCiphersuite` (-12), reported
+before the keychain is consulted, so a future construction is a parse-time
+dispatch rather than a new file format.
 
-### Sender authentication — the trust boundary
+Unwrap failures are kept apart: the Secure Enclave refusing the key
+agreement (locked, unavailable) is `encryptionFailed` (-5, CRYPTO_ERROR), a
+fact about this machine; only a tag that doesn't verify is
+`decryptionFailed` (-11, PAYLOAD_AUTH_FAILED): the payload was altered, or
+sealed for a different service.
 
-Base-mode HPKE, like any public-key encryption, authenticates nothing about
-*who* wrapped a payload: anyone holding a KEK's public key can produce one
-that unwraps. **This is a deliberate decision, not a gap.** The deployment
-model is that the pipeline hands the plaintext DEK to the CLI *on the
-machine*, which wraps it as the same user who will later unwrap it. In that
-model a sender key would live on the same machine as the same user, so
-HPKE's Auth mode (sender-authenticated encryption, which CryptoKit supports
-with the Secure Enclave recipient key) would add a check the file's owner
-could always pass themselves. It is therefore not used.
-
-What this design defends against, and what it leaves to the account:
+### The trust boundary
 
 - A key file can be **read** by anyone, safely: it is ciphertext under a
   key that never leaves this Mac's Secure Enclave.
-- A key file can be **swapped or forged** only by someone who can write it
-  as its owner (or root). `hkdfguard_open_file` refuses files owned by
-  anyone else, writable by anyone else, hard-linked, or in a folder someone
-  else can write (`-39`); the AEAD
-  rejects any alteration of a genuine file; `wrap --fingerprint` and the
-  fingerprint check at unwrap reject a payload for the wrong KEK.
+- A key file can be **created** only by code that can use the KEK — the
+  service's account, through the Secure Enclave. Someone who can merely
+  write files (a configuration push, a backup restore, a process that once
+  saw the public key) cannot forge one.
+- A key file can be **swapped** for another genuine one only by someone who
+  can write it as its owner (or root). `hkdfguard_open_file` refuses files
+  owned by anyone else, writable by anyone else, hard-linked, or in a folder
+  someone else can write (`-39`); the AEAD rejects any alteration of a
+  genuine file; `wrap --fingerprint` and the fingerprint check at unwrap
+  reject a payload for the wrong KEK.
 - Whoever **is** the owning user — or has code running as them — can wrap a
   DEK of their choosing, or put back an older genuine file. That is the
   user account's boundary, the same one the login keychain already draws,
   and it is where the protection stops.
 
-Were the deployment model ever to change so the pipeline wrapped off the
-machine with a key of its own, Auth mode plus a pinned sender key is the
-mechanism, and the suite byte leaves room for it; nothing in the current
-format precludes it.
-
-There is no in-band format version. **A change of payload format is
-signalled by adopting a new service name** (and therefore a new KEK).
-
 ### Payload formats are per-platform
 
 The macOS, Linux, and Windows libraries share one C ABI: the function names
 and signatures, the status codes, the `HKDFGUARD_*` flags, and what every
-call does. The wrapped payload is not shared. Each platform has its own
-format and size: here, the 146-byte HPKE layout above; on Linux, ECDH
-against a per-payload hashed point, HKDF-SHA512, and AES-256-GCM, with a
-version byte, 132–276 bytes. That's why `HKDFGUARD_WRAPPED_MAX_LEN` has the
-same name everywhere but a per-platform value (146 here). A payload is only
-opened on the Mac whose Secure Enclave KEK wrapped it, so the formats never
-need to interoperate:
+call does. They also share the construction above. The payload **layout**
+is not shared: Linux adds a version byte, a provider tag and a key id
+(132–276 bytes), and this library's is the fixed 125 bytes above. That's why
+`HKDFGUARD_WRAPPED_MAX_LEN` has the same name everywhere but a per-platform
+value (125 here). A payload is only opened on the Mac whose Secure Enclave
+KEK wrapped it, so the layouts never need to interoperate:
 
 - Treat a payload as opaque bytes. Size buffers with
   `HKDFGUARD_WRAPPED_MAX_LEN` or a size probe, and never parse one.
 - Moving a service to another platform means re-wrapping its DEKs there,
   under that host's KEK. A payload never moves between platforms.
-- The platforms also differ in **who can create a payload**. Here, as
-  described above, anyone holding the KEK's public key can, and the
-  boundary is the key file's ownership. Linux deliberately uses a scheme
-  where only the KEK holder can (see its README).
 
 ## Service names
 
@@ -170,15 +174,15 @@ int32_t hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int32_t dek_
 int32_t hkdfguard_unwrap_dek(const char* service, const uint8_t* wrapped, int32_t wrapped_len,
                              uint8_t* out, int32_t* out_len);
 int32_t hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int32_t* out_len);
-int32_t hkdfguard_open_file(const char* path, uint8_t* out, int32_t* out_len); // reads a 146-byte payload file
+int32_t hkdfguard_open_file(const char* path, uint8_t* out, int32_t* out_len); // reads a 125-byte payload file
 int hkdfguard_harden_process(void);                           // opt-in; see below
 int hkdfguard_harden_process_with_flags(unsigned int flags);
 ```
 
 `*out_len` is the buffer capacity on entry and, on return, either the bytes
-written or — on `outputBufferTooSmall` — the required size (146 for wrap,
+written or — on `outputBufferTooSmall` — the required size (125 for wrap,
 32 for unwrap). Both wrap and unwrap check the capacity, and unwrap checks
-`wrapped_len == 146`, **before** touching the keychain or the enclave, so a
+`wrapped_len == 125`, **before** touching the keychain or the enclave, so a
 sizing call costs nothing and a DEK is never decrypted for a caller who
 cannot receive it. If `hkdfguard_unwrap_dek` or `hkdfguard_open_file` fails
 for any reason, every byte of the `out` capacity declared on entry is zeroed,
@@ -271,7 +275,7 @@ event=1002 op=hkdfguard_wrap_dek result=OK service="com.example.ingest" provider
 The fields identify the caller (`uid`, `euid`, `pid`, `exe`) and the service
 by name, and every field is logged public, so nothing appears as
 `<private>`. Wrap and unwrap records also carry the KEK's fingerprint and a
-SHA-256 of the 146-byte payload. Both are public, and the same payload hashes
+SHA-256 of the 125-byte payload. Both are public, and the same payload hashes
 the same in its wrap record and in every unwrap record, which ties each
 unwrap back to the wrap that made it (`shasum -a 256 <file>` hashes a key
 file for comparison). The creation record (1000) also names the keychain
@@ -287,7 +291,7 @@ evidence.
 
 ### Reading a wrapped key file: `hkdfguard_open_file`
 
-Reads the 146-byte payload that the CLI's `wrap` writes, validates it, and
+Reads the 125-byte payload that the CLI's `wrap` writes, validates it, and
 copies it to `out`, ready for `hkdfguard_unwrap_dek`. It never touches the
 keychain or the Secure Enclave and never unwraps, so the plaintext DEK does
 not pass through it:
@@ -300,8 +304,8 @@ if (status == 0)
     status = hkdfguard_unwrap_dek("com.example.ingest", wrapped, wrapped_len, dek, &dek_len);
 ```
 
-`*out_len` is the capacity on entry (at least 146). It is set to 146 — the
-bytes read — on success, and to 146 on `outputBufferTooSmall` (checked
+`*out_len` is the capacity on entry (at least 125). It is set to 125 — the
+bytes read — on success, and to 125 on `outputBufferTooSmall` (checked
 before the file is opened). Every other failure leaves it as the caller set
 it, as on Linux and as wrap and unwrap do. The file's bytes
 reach `out` only on success; on any failure the whole declared capacity of
@@ -344,7 +348,7 @@ reach `out` only on success; on any failure the whole declared capacity of
   privileged process is pointed at arbitrary files), and don't use relative
   paths, which resolve against a working directory the caller may not
   control. Keep the file in a directory only its owner can write.
-- **Length.** Anything other than exactly 146 bytes is `fileTooShort`
+- **Length.** Anything other than exactly 125 bytes is `fileTooShort`
   (-35) or `fileTooLong` (-36).
 - **Unprotected key.** A file holding a bare 32-byte DEK instead of a
   payload — raw bytes, or base64 (padded or not, standard or URL alphabet)
@@ -353,9 +357,8 @@ reach `out` only on success; on any failure the whole declared capacity of
   unprotected: treat it as exposed and rotate it, rather than wrapping it
   now. Its bytes never reach the caller's buffer, and the library zeroes
   its own read buffer on every return.
-- **Malformed.** A 146-byte file whose KEK fingerprint is all zeros, or
-  whose encapsulated key is not a valid P-256 point, is `fileMalformed`
-  (-38); one whose suite byte is not `0x01` is `unsupportedCiphersuite`
+- **Malformed.** A 125-byte file whose KEK fingerprint is all zeros is
+  `fileMalformed` (-38); one whose suite byte is not `0x01` is `unsupportedCiphersuite`
   (-12). These are structural checks only: whether the payload is genuine,
   unaltered, and for this service is decided by `hkdfguard_unwrap_dek`
   (`-16`, `-11`). Reading the file proves nothing about it — pin the KEK by
@@ -375,11 +378,11 @@ here are defined there but never returned on macOS.
 | `-1`  | `ERR_INVALID_ARGUMENT` | `invalidInputLength` | `dek_len != 32`, a NULL buffer/length pointer, or a NULL or empty `path` |
 | `-2`  | `ERR_BUFFER_TOO_SMALL` | `outputBufferTooSmall` | `*out_len` set to the required size |
 | `-3`  | `ERR_PROVIDER_UNAVAILABLE` | `enclaveUnavailable` | no Secure Enclave on this machine |
-| `-5`  | `ERR_CRYPTO_ERROR` | `encryptionFailed` | the RNG or HPKE sealing failed |
+| `-5`  | `ERR_CRYPTO_ERROR` | `encryptionFailed` | the RNG failed, the Secure Enclave refused the key agreement (wrap or unwrap), or AES-GCM sealing failed |
 | `-6`  | `ERR_INTERNAL_ERROR` | `unexpectedOutputLength` | the library produced output of an impossible length (a bug) |
 | `-8`  | `ERR_INVALID_SERVICE_NAME` | `invalidServiceIdentifier` | see `service` above |
-| `-10` | `ERR_PAYLOAD_MALFORMED` | `payloadMalformed` | `wrapped_len != 146` |
-| `-11` | `ERR_PAYLOAD_AUTH_FAILED` | `decryptionFailed` | the HPKE open failed: altered payload or encapsulated key, or wrapped for a different service under the same KEK |
+| `-10` | `ERR_PAYLOAD_MALFORMED` | `payloadMalformed` | `wrapped_len != 125` |
+| `-11` | `ERR_PAYLOAD_AUTH_FAILED` | `decryptionFailed` | the AES-GCM tag did not verify: an altered payload, or one wrapped for a different service under the same KEK |
 | `-12` | `ERR_PAYLOAD_UNSUPPORTED` | `unsupportedCiphersuite` | the payload's suite byte is not one this build implements; a newer or different build wrote it. Not tampering |
 | `-16` | `ERR_KEK_FINGERPRINT_MISMATCH` | `fingerprintMismatch` | payload was wrapped under a different KEK |
 | `-17` | `ERR_KEK_NOT_FOUND` | `kekNotFound` | no KEK for this service in this process's keychain mode; call `hkdfguard_create_kek` |
@@ -388,10 +391,10 @@ here are defined there but never returned on macOS.
 | `-32` | `ERR_FILE_NOT_FOUND` | `fileNotFound` | no file at the path, or a path component is not a directory (`hkdfguard_open_file` only, as are `-33` to `-39`) |
 | `-33` | `ERR_FILE_ACCESS_DENIED` | `fileAccessDenied` | this process may not read the file or a directory on its path |
 | `-34` | `ERR_FILE_IO` | `fileIO` | a symbolic link (refused, never followed), directory, FIFO, socket, or device; or `open`/`fstat`/`read` failed |
-| `-35` | `ERR_FILE_TOO_SHORT` | `fileTooShort` | fewer than 146 bytes, and not a plaintext DEK |
-| `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 146 bytes |
+| `-35` | `ERR_FILE_TOO_SHORT` | `fileTooShort` | fewer than 125 bytes, and not a plaintext DEK |
+| `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 125 bytes |
 | `-37` | `ERR_FILE_PLAINTEXT_KEY` | `fileUnprotectedKey` | the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
-| `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 146 bytes, but the fingerprint is all zeros or the encapsulated key is not a P-256 point |
+| `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 125 bytes, but the fingerprint is all zeros |
 | `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | owned by someone other than this user or root, writable by group or others, or more than one hard link; or a folder above it is owned by someone else or writable by group or others without being sticky |
 | `-96` | `ERR_MAC_ACCESS_CONTROL_CREATION_FAILED` | `accessControlCreationFailed` | refines `ERR_PROVIDER_ERROR` (-4) |
 | `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
@@ -540,7 +543,7 @@ hkdfguard retire --service-name|-sn <name> \
   exclusive.
 - **`wrap`** wraps the pipeline's existing 32-byte DEK — base64, read from
   **stdin** (`--dek-stdin`) or a **file** (`--dek-file`), exactly one of the
-  two — under the already-provisioned KEK and writes the 146-byte payload to
+  two — under the already-provisioned KEK and writes the 125-byte payload to
   `<path>`. It never creates a KEK (an unprovisioned service is an error
   naming the `provision` command) and never generates a DEK. There is
   deliberately no `--dek <base64>` argument: an argv value is visible to
@@ -648,7 +651,7 @@ hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 All library targets build from the single `HkdfGuardNativeMacOS.swift`.
 Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). The
 dylib, both CLI builds, the test bundle, and the test host target
-**macOS 14.0+** (HPKE in CryptoKit needs 14); the framework target uses the
+**macOS 14.0+**; the framework target uses the
 SDK's recommended deployment target.
 
 Supporting scripts: `build-dist.sh` (signed, notarized build artifacts,
@@ -1168,7 +1171,7 @@ Three Swift Testing suites:
 - **`HkdfGuardOpenFileTests`** covers `hkdfguard_open_file` without the
   enclave: exact-length success, too short/too long, plaintext DEKs in
   every accepted encoding (`-37`, never copied out) versus short text that
-  is not a key, malformed payloads (off-curve encapsulated key, zero
+  is not a key, malformed payloads (zero
   fingerprint), unknown suite bytes (-12), missing and unreadable files, symlink/directory/FIFO
   refusal, ownership rules (group/world-writable and multiply-linked files
   refused; 0600/0644/0400 and root-owned files accepted), buffer sizing
