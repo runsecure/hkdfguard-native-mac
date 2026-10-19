@@ -456,6 +456,121 @@ struct HkdfGuardOpenFileTests {
         #expect(Self.openFile(viaAlias).status == -39, "the real folder is writable, whatever the path says")
     }
 
+    @Test func checksEveryFolderEvenOneWhoseNameStartsWithACombiningMark() throws {
+        // A name starting with U+0301 fuses with the "/" before it into one
+        // Swift Character; a walk that split the path at "/" characters
+        // would skip that slash, and with it the writable folder above.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let sub = dir.appendingPathComponent("\u{301}sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: sub.path)
+        let file = sub.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: file)
+        #expect(Self.openFile(file.path).status == 0)
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: dir.path)
+        #expect(Self.openFile(file.path).status == -39, "the writable folder above the odd name is checked")
+    }
+
+    // MARK: - Access control lists
+
+    /// Adds one ACE with /bin/chmod +a, e.g. "everyone allow write".
+    private static func addACE(_ ace: String, to path: String) throws {
+        let chmod = Process()
+        chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        chmod.arguments = ["+a", ace, path]
+        try chmod.run()
+        chmod.waitUntilExit()
+        try #require(chmod.terminationStatus == 0, "chmod +a \(ace)")
+    }
+
+    @Test func refusesAKeyFileWhoseACLLetsOthersChangeIt() throws {
+        // Mode 0600 says owner-only; an allow entry says otherwise, and the
+        // kernel honours the entry.
+        for ace in ["everyone allow write", "everyone allow append", "everyone allow delete",
+                    "group:staff allow writesecurity", "everyone allow chown"] {
+            let dir = try Self.makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let file = dir.appendingPathComponent("ingest.key")
+            try Self.write(Self.structurallyValidPayload(), to: file)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            try Self.addACE(ace, to: file.path)
+            let result = Self.openFile(file.path)
+            #expect(result.status == -39, "\(ace)")
+            #expect(result.zeroed, "\(ace)")
+        }
+    }
+
+    @Test func refusesAFileInAFolderWhoseACLLetsOthersAddOrRemoveEntries() throws {
+        for ace in ["everyone allow add_file", "everyone allow add_subdirectory",
+                    "everyone allow delete_child", "group:staff allow add_file,delete_child"] {
+            let dir = try Self.makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let sub = dir.appendingPathComponent("sub", isDirectory: true)
+            try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: false)
+            let file = sub.appendingPathComponent("ingest.key")
+            try Self.write(Self.structurallyValidPayload(), to: file)
+            #expect(Self.openFile(file.path).status == 0)
+
+            // On an ancestor, not just the file's own folder.
+            try Self.addACE(ace, to: dir.path)
+            #expect(Self.openFile(file.path).status == -39, "\(ace)")
+        }
+    }
+
+    @Test func acceptsACLsThatOnlyDenyOrOnlyGrantReadingOrGrantThisUser() throws {
+        // The standard "everyone deny delete" on home folders must pass, as
+        // must entries that grant only reading, or grant only the owner.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: file)
+        let me = try #require(getpwuid(geteuid())).pointee.pw_name.map { String(cString: $0) } ?? ""
+        try #require(!me.isEmpty)
+
+        try Self.addACE("everyone deny delete", to: dir.path)
+        try Self.addACE("everyone allow list,search", to: dir.path)
+        try Self.addACE("user:\(me) allow add_file,delete_child", to: dir.path)
+        try Self.addACE("everyone deny write,delete", to: file.path)
+        try Self.addACE("everyone allow read", to: file.path)
+        try Self.addACE("user:\(me) allow write,delete", to: file.path)
+        #expect(Self.openFile(file.path).status == 0)
+    }
+
+    // MARK: - Volumes
+
+    @Test(.timeLimit(.minutes(1)))
+    func refusesAFileOnAVolumeThatIgnoresOwnership() throws {
+        // A disk image a user attaches mounts "noowners": every file on it
+        // reports whoever asks as its owner, so owner checks prove nothing.
+        let dir = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let image = dir.appendingPathComponent("t.dmg").path
+        let mount = dir.appendingPathComponent("mnt").path
+
+        func hdiutil(_ args: [String]) throws -> Int32 {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            p.arguments = args + ["-quiet"]
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus
+        }
+        try #require(try hdiutil(["create", "-size", "2m", "-fs", "HFS+", "-volname", "hkgtest", image]) == 0)
+        try #require(try hdiutil(["attach", "-nobrowse", "-mountpoint", mount, image]) == 0)
+        defer { _ = try? hdiutil(["detach", mount, "-force"]) }
+
+        var fs = statfs()
+        try #require(statfs(mount, &fs) == 0)
+        try #require(fs.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) != 0, "the image should mount noowners")
+
+        let file = URL(fileURLWithPath: mount).appendingPathComponent("ingest.key")
+        try Self.write(Self.structurallyValidPayload(), to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        #expect(Self.openFile(file.path).status == -39)
+    }
+
     @Test func acceptsAFileWithMoreThanOneHardLinkAsOnLinuxAndWindows() throws {
         // A second name only matters if it could put an older payload where
         // the service looks, and that takes an entry in the key's own folder

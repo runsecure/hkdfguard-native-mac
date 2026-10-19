@@ -118,8 +118,8 @@ extern "C" {
 /* KEK */
 #define HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH (-16) /* the payload was wrapped under a different KEK than `service` resolves to now */
 #define HKDFGUARD_ERR_KEK_NOT_FOUND (-17)       /* no KEK exists yet for this service; call hkdfguard_create_kek first */
-#define HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18)   /* the keychain would not say whether the KEK exists: locked, no UI session to prompt in, ACL denial or declined prompt, or a missing entitlement. A KEK very likely DOES exist: do not create a replacement or delete anything */
-#define HKDFGUARD_ERR_KEK_INVALID (-19)         /* a keychain item exists for this service but can't be reconstructed into a usable key -- a corrupt or foreign entry; never "healed" by generating a replacement */
+#define HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18)   /* the keychain would not say whether the KEK exists: locked, no UI session to prompt in, ACL denial or declined prompt, a missing entitlement, or a Secure Enclave that won't load keys in this session (keybag locked). A KEK very likely DOES exist: do not create a replacement or delete anything */
+#define HKDFGUARD_ERR_KEK_INVALID (-19)         /* a keychain item exists for this service but can't be reconstructed into a usable key although the Secure Enclave works in this session -- a corrupt or foreign entry; never "healed" by generating a replacement */
 #define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED (-20) /* hkdfguard_harden_process could not disable core dumps or ptrace access, or (with HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) the process can still be debugged by its own user */
 /* -21..-31 reserved. */
 
@@ -131,7 +131,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_LONG (-36)       /* key file is longer than a wrapped DEK, or than its own header declares */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-37)  /* key file looks like an UNWRAPPED DEK (32 raw bytes, or its base64 or hex): treat as a key exposure */
 #define HKDFGUARD_ERR_FILE_MALFORMED (-38)      /* key file is the right length but not a well-formed wrapped DEK */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by another user or writable by group/others: someone else could have replaced it */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED (-39)      /* key file, or a directory deciding what its path names, is owned by another user, writable by group/others (by mode or ACL), or on a volume ignoring ownership: someone else could have replaced it */
 /* -40..-63 reserved for future common codes. */
 
 /* Windows-specific (-64..-79). Not returned on macOS. */
@@ -251,7 +251,12 @@ extern "C" {
 //       host that dlopens this library). Items are stored in the login
 //       keychain, protected by its lock and a per-item ACL keyed to the
 //       creating binary's signature; other identities get an interactive
-//       prompt, or, headless, HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18).
+//       prompt, or, headless, HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18). The
+//       ACL identifies the process's MAIN EXECUTABLE, never this library or
+//       the calling script: approving `python3`, `node`, `java` or `dotnet`
+//       approves every program that interpreter runs as the same user.
+//       Prefer data-protection mode, or a service shipped as its own signed
+//       executable (see the README's "What the legacy-mode ACL checks").
 //
 // The two keychains are disjoint, so the process that provisions a
 // service's KEK and every process that unwraps under it MUST run in the
@@ -346,8 +351,12 @@ int hkdfguard_keychain_mode(
 // HKDFGUARD_ERR_KEK_INVALID (-19) here means an item exists under this service but
 // could not be reconstructed into a usable key -- distinct from "no key
 // yet" (0, *out_exists = 0). Treat it as an error to investigate, not as
-// "safe to create a new one". HKDFGUARD_ERR_KEK_ACCESS_DENIED (-18) means the
-// keychain would not answer; a key may well exist.
+// "safe to create a new one". It is reported only after a throwaway key
+// made under the same policy loads: when the enclave won't load keys in this
+// session (keybag locked, e.g. over SSH after `security unlock-keychain`), a
+// healthy KEK fails the same way, and that is HKDFGUARD_ERR_KEK_ACCESS_DENIED
+// (-18) instead. -18 means the keychain or enclave would not answer; a key
+// may well exist.
 //
 // Subject to the same latency floor and serialization as
 // hkdfguard_create_kek below; "exists" and "doesn't exist" take the same
@@ -362,6 +371,11 @@ int hkdfguard_kek_exists(
 // operator record which KEK a service uses after provisioning, and confirm
 // it before retiring it. `*out_len` must be at least 32 on entry. Never
 // creates a KEK: HKDFGUARD_ERR_KEK_NOT_FOUND (-17) if none exists.
+//
+// A setup call, like hkdfguard_kek_exists: whether it finds a KEK answers
+// the same question, so it is held to the same 1000 ms floor and serialized
+// with the other setup calls (see hkdfguard_create_kek). The size probe
+// (*out_len < 32) and argument errors return immediately.
 int hkdfguard_kek_fingerprint(
     const char* HKDFGUARD_NONNULL service,
     uint8_t* HKDFGUARD_NONNULL out,
@@ -373,7 +387,7 @@ int hkdfguard_kek_fingerprint(
 // all return 0 provided the resulting key can be reconstructed. The only
 // function in this library that creates a key.
 //
-// Deliberately slow: this and hkdfguard_kek_exists are setup calls, meant
+// Deliberately slow: this, hkdfguard_kek_exists and hkdfguard_kek_fingerprint are setup calls, meant
 // to run once per application startup, and each takes at least 1000 ms of
 // wall-clock time whatever its outcome (fixed on macOS; the Linux and
 // Windows builds default to the same and let an administrator tune it),
@@ -438,9 +452,15 @@ int hkdfguard_generate_and_wrap_dek(
 // owned by this process's effective user or by root, writable by no one but
 // its owner, in folders that are each -- up to / --
 // owned by root or this user and not writable by group or others unless
-// sticky (/tmp-style); write bits are ignored on a read-only volume
-// (HKDFGUARD_ERR_FILE_UNTRUSTED otherwise, as on Linux; the CLI's `wrap`
-// writes such a file). A folder the admin group can write, such as
+// sticky (/tmp-style); write bits are ignored only on the sealed system
+// volume (HKDFGUARD_ERR_FILE_UNTRUSTED otherwise, as on Linux; the CLI's
+// `wrap` writes such a file). Also HKDFGUARD_ERR_FILE_UNTRUSTED: an access
+// control list allowing anyone but this user or root to modify the file, or
+// to add or remove entries in one of those folders (deny entries, and
+// entries granting only reading, are fine); or the file or a folder on a
+// volume mounted with ownership ignored (disk images and removable media),
+// where owner checks prove nothing. The folders are walked by descriptor
+// through "..", not by re-reading the path. A folder the admin group can write, such as
 // /Applications, is refused. A root-owned file deployed by an administrator must
 // still be readable by the caller -- 0644, or 0640 with a shared group --
 // or it is HKDFGUARD_ERR_FILE_ACCESS_DENIED. A
@@ -456,6 +476,25 @@ int hkdfguard_generate_and_wrap_dek(
 // the file (exists, readable, size class), so a privileged process that
 // opened attacker-chosen paths would leak that much about them. Store the
 // file in a directory only its owner can write.
+//
+// Symbolic links to folders partway along the path are followed, and are
+// not themselves checked: the checks above apply to the folders the file
+// really sits in. Whoever can change such a link (anyone who can write the
+// folder holding it) chooses which folder the path names, and so -- among
+// folders that pass the checks, such as another of this user's -- which of
+// this user's genuine key files is read: an older one for the same service
+// (replay, below), or another service's (refused at unwrap,
+// HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH). Use a path whose only symbolic
+// links are the root-owned system ones (/tmp, /var, /etc).
+//
+// Replay: a genuine payload stays genuine. It records neither when it was
+// made nor whether it is the latest, so whoever can write the key file as
+// its owner (or root) can put back an OLDER payload wrapped under the same
+// KEK, and it opens and unwraps normally, to the older DEK; neither this
+// function nor hkdfguard_unwrap_dek can tell. Wrapping a new DEK does not
+// revoke the old payload; only retiring the KEK does. If reuse of an older
+// DEK would matter, record which payload is current (its SHA-256, say)
+// somewhere the file's writer can't change.
 //
 // `*out_len` is the capacity of `out` on entry (at least 125). It is
 // written with 125 -- the number of bytes read -- on success, and with 125

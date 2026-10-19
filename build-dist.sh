@@ -41,6 +41,18 @@
 # timestamp server: this script needs network access to complete.
 set -euo pipefail
 
+# This script signs what every machine will trust; don't let the caller's
+# environment decide which codesign/xcodebuild/swift/security/curl it runs.
+# PATH is pinned to the system folders. TOOLCHAINS (an alternate Swift
+# toolchain for xcrun's shims) is cleared: nothing here needs it.
+# DEVELOPER_DIR is left alone -- it is how a particular Xcode is chosen --
+# but the folder in use is printed, so a build log always shows which
+# toolchain built and signed the release.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+unset TOOLCHAINS
+echo "==> Developer tools: ${DEVELOPER_DIR:-$(xcode-select -p)}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
 CLI_PKG="$ROOT/hkdfguard-cli"
@@ -176,6 +188,31 @@ assert_arch() {
 # on its first match, the tool then dies of SIGPIPE writing the rest of its
 # output, and `set -o pipefail` reports that as a failed pipeline -- a
 # false failure (or, for a negated check, a false pass).
+# The binary's LC_RPATH list must be exactly the one given: nothing may be
+# searched for the dylib before (or besides) the directory the binary is in.
+assert_only_rpath() {
+    local file="$1" expected="$2" rpaths
+    rpaths="$(otool -l "$file" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}')"
+    [ "$rpaths" = "$expected" ] \
+        || fail "$file must have exactly one rpath, $expected; found: $(tr '\n' ' ' <<<"$rpaths")"
+}
+
+# Asserts `file`'s signature carries exactly the given top-level
+# entitlements -- none at all when no keys are given. An allowlist, not a
+# list of known-bad keys: get-task-allow (debugger attach),
+# cs.disable-library-validation, cs.allow-dyld-environment-variables, or
+# anything else added later fails the build, since each would undo part of
+# what the hardened runtime and the signature checks promise.
+assert_entitlements() {
+    local file="$1" actual expected
+    shift
+    actual="$(codesign -d --entitlements - "$file" 2>/dev/null \
+        | awk '/^\t\[Key\] /{sub(/^\t\[Key\] /, ""); print}' | sort)"
+    expected="$(printf '%s\n' "$@" | sed '/^$/d' | sort)"
+    [ "$actual" = "$expected" ] \
+        || fail "$file: entitlements are [$(tr '\n' ' ' <<<"$actual")], expected [$(tr '\n' ' ' <<<"$expected")]"
+}
+
 assert_signed() {
     local file="$1" info
     codesign --verify --strict --verbose=1 "$file" \
@@ -348,16 +385,22 @@ build_arch() {
     # install_name is the relocatable "@rpath/<name>.dylib", so the CLI
     # only needs an rpath that resolves relative to itself:
     # @executable_path, i.e. "the directory this binary lives in".
+    #
+    # And ONLY that rpath. SwiftPM also records the toolchain's own
+    # directories (/usr/lib/swift and a path inside /Applications/Xcode.app),
+    # and dyld searches rpaths in order: an rpath under /Applications --
+    # writable by the admin group -- ahead of @executable_path would let an
+    # admin who isn't root plant a (Team-signed) libhkdfguard.dylib that a
+    # root `hkdfguard` loads in preference to the root-only installed copy.
+    # Every rpath other than @executable_path is removed, and the result is
+    # asserted to be exactly that one.
     local cli="$out/hkdfguard"
-    install_name_tool -delete_rpath "$dylib_dir" "$cli"
+    local rpath
+    while read -r rpath; do
+        [ -n "$rpath" ] && install_name_tool -delete_rpath "$rpath" "$cli"
+    done < <(otool -l "$cli" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}')
     install_name_tool -add_rpath "@executable_path" "$cli"
-    local rpaths
-    rpaths="$(otool -l "$cli" | grep -A2 LC_RPATH || true)"
-    if grep -q "path $dylib_dir" <<<"$rpaths"; then
-        fail "$cli still carries the absolute build rpath $dylib_dir"
-    fi
-    grep -q 'path @executable_path' <<<"$rpaths" \
-        || fail "$cli lacks the @executable_path rpath"
+    assert_only_rpath "$cli" "@executable_path"
 
     echo "==> Signing (hardened runtime, timestamped) with: $SIGN_IDENTITY"
     # install_name_tool invalidated the CLI's linker signature; and the
@@ -373,6 +416,8 @@ build_arch() {
     assert_signed "$cli"
     assert_identity "$out/$DYLIB_NAME"
     assert_identity "$cli"
+    assert_entitlements "$out/$DYLIB_NAME"
+    assert_entitlements "$cli"
     local links
     links="$(otool -L "$cli")"
     grep -q "@rpath/$DYLIB_NAME" <<<"$links" \
@@ -473,6 +518,16 @@ build_app() {
     # same team, so the embedded copy must carry the app's Team ID.
     info="$(codesign -dv "$embedded_dylib" 2>&1)"
     grep -q "^TeamIdentifier=$TEAM_ID\$" <<<"$info" || fail "$embedded_dylib: not signed by team $TEAM_ID"
+
+    # The app's own keychain identity and nothing more. A development
+    # export is debuggable by design (get-task-allow) and never packaged:
+    # build-pkg.sh accepts only the developer-id set.
+    local app_entitlements=(com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups)
+    if [ "$APP_EXPORT" != "developer-id" ]; then
+        app_entitlements+=(com.apple.security.get-task-allow)
+    fi
+    assert_entitlements "$exe" "${app_entitlements[@]}"
+    assert_entitlements "$embedded_dylib"
 
     assert_arch "$exe" arm64
     assert_arch "$embedded_dylib" arm64

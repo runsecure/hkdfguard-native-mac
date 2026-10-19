@@ -555,6 +555,40 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(Self.kekExists(service: service).status == -19)
     }
 
+    @Test func anUnloadableBlobIsCorruptOnlyIfTheEnclaveProbeWorks() {
+        // A locked keybag (SSH after `security unlock-keychain`) makes a
+        // healthy KEK fail to load just like a corrupt one. Only a failure
+        // that a throwaway probe key survives is reported as corrupt (-19);
+        // otherwise it is access-denied (-18), so no one is pointed at
+        // deleting a KEK that is fine. The probe is injected here, since a
+        // locked keybag can't be produced in-process.
+        let garbage = Data((0..<48).map { UInt8($0) })
+        var probed = 0
+        func probe(_ usable: Bool) -> () -> Bool { { probed += 1; return usable } }
+
+        guard case .corrupt = HkdfGuardNativeMacOS.reconstructKEK(garbage, enclaveIsUsable: probe(true)) else {
+            Issue.record("a blob the working enclave rejects is corrupt"); return
+        }
+        guard case .enclaveRefused = HkdfGuardNativeMacOS.reconstructKEK(garbage, enclaveIsUsable: probe(false)) else {
+            Issue.record("when the probe fails too, the blob's failure proves nothing"); return
+        }
+        #expect(probed == 2)
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, "needs a Secure Enclave"))
+    func theEnclaveProbeWorksHereAndAHealthyKEKNeverRunsIt() throws {
+        let usable = HkdfGuardNativeMacOS.secureEnclaveIsUsableNow()
+        #expect(usable)
+
+        let key = try SecureEnclave.P256.KeyAgreement.PrivateKey()
+        var probed = false
+        guard case .key = HkdfGuardNativeMacOS.reconstructKEK(key.dataRepresentation,
+                                                              enclaveIsUsable: { probed = true; return true }) else {
+            Issue.record("a fresh enclave key reconstructs"); return
+        }
+        #expect(!probed, "the probe runs only after a blob fails to load")
+    }
+
     // MARK: - wrap/unwrap require an already-created KEK
 
     @Test func wrapFailsWithKekNotFoundWhenNoKekWasCreated() {
@@ -906,7 +940,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     }
 
     @Test func theExportedSetupCallsPayTheFloor() {
-        // Through the C entry points, both setup calls are gated -- "doesn't
+        // Through the C entry points, every setup call is gated -- "doesn't
         // exist" included -- while argument errors return before the gate.
         let floor = Duration.milliseconds(300)
         setupMinDelayOverrideForTests.withLock { $0 = floor }
@@ -915,9 +949,22 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         let service = "com.hkdfguard.tests.floor.\(UInt64.random(in: .min ... .max))"
         defer { Self.deleteKEK(service: service) }
 
+        var fp = [UInt8](repeating: 0, count: 32)
+        var fpLen: Int32 = 32
+        var fpStatus: Int32 = 0
+        func fingerprint(_ name: String, capacity: Int32 = 32) -> Int32 {
+            fpLen = capacity
+            return fp.withUnsafeMutableBufferPointer {
+                hkdfguard_kek_fingerprint(servicePtr: name, outPtr: $0.baseAddress, outLen: &fpLen)
+            }
+        }
+
         var probe: (status: Int32, exists: Bool) = (-1, true)
         var created: Int32 = -1
-        var elapsed = clock.measure { probe = Self.kekExists(service: service) }
+        var elapsed = clock.measure { fpStatus = fingerprint(service) }
+        #expect(fpStatus == -17)
+        #expect(elapsed >= floor, "kek_fingerprint for a missing KEK took \(elapsed)")
+        elapsed = clock.measure { probe = Self.kekExists(service: service) }
         #expect(probe.status == 0 && !probe.exists)
         #expect(elapsed >= floor, "kek_exists for a missing KEK took \(elapsed)")
         elapsed = clock.measure { created = Self.createKEK(service: service) }
@@ -926,6 +973,9 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         elapsed = clock.measure { probe = Self.kekExists(service: service) }
         #expect(probe.status == 0 && probe.exists)
         #expect(elapsed >= floor, "kek_exists for an existing KEK took \(elapsed)")
+        elapsed = clock.measure { fpStatus = fingerprint(service) }
+        #expect(fpStatus == 0)
+        #expect(elapsed >= floor, "kek_fingerprint for an existing KEK took \(elapsed)")
 
         var exists: Int32 = -1
         var codes: [Int32] = []
@@ -935,9 +985,11 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
                 hkdfguard_kek_exists(servicePtr: "com.hkdfguard.tests.floor", outExists: nil),
                 hkdfguard_create_kek(servicePtr: "bad_name"),
                 hkdfguard_create_kek(servicePtr: nil),
+                fingerprint("bad_name"),
+                fingerprint(service, capacity: 0), // the size probe
             ]
         }
-        #expect(codes == [-8, -1, -8, -8])
+        #expect(codes == [-8, -1, -8, -8, -8, -2])
         #expect(elapsed < floor, "argument errors must not pay the floor; took \(elapsed)")
     }
 

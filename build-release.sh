@@ -20,6 +20,15 @@
 # Everything else -- signing checks, notarization, stapling, smoke tests --
 # is build-dist.sh's and build-pkg.sh's; this only supplies their inputs.
 set -euo pipefail
+
+# This script drives the release signing (through build-dist.sh and
+# build-pkg.sh) and runs sudo; don't let the caller's environment decide
+# which security/sudo/installer it runs. PATH is pinned to the system
+# folders and TOOLCHAINS cleared, as in build-dist.sh, which also prints
+# the developer tools folder in use.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+unset TOOLCHAINS
 cd "$(dirname "$0")"
 
 fail() { echo "error: $*" >&2; exit 1; }

@@ -366,15 +366,30 @@ func printUsage() {
     )
 }
 
-// `--service-name|-sn <name>`, shared by both commands' parsers.
-func parseServiceName(_ arg: String, _ iterator: inout IndexingIterator<[String]>) throws -> String {
+// The value after a flag that takes one: present, non-empty, and not
+// starting with "-". Without that last rule a forgotten value swallows the
+// next flag: `wrap -kf --force ...` would write a key file named "--force"
+// and silently drop --force. Flags themselves (-sn, -kf, -g, ...) are
+// unaffected; only what is consumed as a value is checked. No legitimate
+// value starts with "-": service names, groups and fingerprints can't, and
+// a path can be written ./-name. `longName` is the flag's long form, for
+// the messages.
+func flagValue(_ arg: String, _ longName: String, _ iterator: inout IndexingIterator<[String]>) throws -> String {
     guard let value = iterator.next() else {
         throw CLIError("\(arg) requires a value")
     }
     guard !value.isEmpty else {
-        throw CLIError("--service-name must not be empty")
+        throw CLIError("\(longName) must not be empty")
+    }
+    guard !value.hasPrefix("-") else {
+        throw CLIError("\(arg) requires a value, but the next argument is \"\(value)\"; a value can't start with \"-\" (write a path like that as ./\(value))")
     }
     return value
+}
+
+// `--service-name|-sn <name>`, shared by every command's parser.
+func parseServiceName(_ arg: String, _ iterator: inout IndexingIterator<[String]>) throws -> String {
+    try flagValue(arg, "--service-name", &iterator)
 }
 
 // Stores a flag's value, refusing a second one rather than letting the last
@@ -451,9 +466,7 @@ func parseRetire(_ arguments: [String]) throws -> Command {
         case "--service-name", "-sn":
             try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
         case "--fingerprint", "-fp":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a value")
-            }
+            let value = try flagValue(arg, "--fingerprint", &iterator)
             try setOnce(&fingerprint, "--fingerprint", parseFingerprintHex(value))
         case "--corrupt":
             try setOnce(&corrupt, "--corrupt")
@@ -556,37 +569,20 @@ func parseWrap(_ arguments: [String]) throws -> Command {
         case "--force", "-f":
             try setOnce(&force, "--force")
         case "--fingerprint", "-fp":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a value")
-            }
+            let value = try flagValue(arg, "--fingerprint", &iterator)
             try setOnce(&expectedFingerprint, "--fingerprint", parseFingerprintHex(value))
         case "--key-file-path", "-kf":
-            guard let value = iterator.next() else {
-                throw CLIError("\(arg) requires a value")
-            }
-            guard !value.isEmpty else {
-                throw CLIError("--key-file-path must not be empty")
-            }
+            let value = try flagValue(arg, "--key-file-path", &iterator)
             try setOnce(&keyFilePath, "--key-file-path", value)
         case "--service-name", "-sn":
             try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
         case "--group", "-g":
-            guard let value = iterator.next() else {
-                throw CLIError("\(arg) requires a value")
-            }
-            guard !value.isEmpty else {
-                throw CLIError("--group must not be empty")
-            }
+            let value = try flagValue(arg, "--group", &iterator)
             try setOnce(&groupName, "--group", value)
         case "--dek-stdin":
             try setSource(.stdin)
         case "--dek-file":
-            guard let value = iterator.next() else {
-                throw CLIError("\(arg) requires a value")
-            }
-            guard !value.isEmpty else {
-                throw CLIError("--dek-file must not be empty")
-            }
+            let value = try flagValue(arg, "--dek-file", &iterator)
             try setSource(.file(value))
         case "--dek", "-d":
             // Rejected explicitly, with the reason, rather than falling
@@ -873,8 +869,9 @@ struct KEKItem {
     // The blob is the SEP-wrapped key credential; don't leave this process's
     // copy of it lying around once retire is done with it.
     mutating func scrub() {
-        _ = blob.withUnsafeMutableBytes { raw in
-            raw.initializeMemory(as: UInt8.self, repeating: 0)
+        blob.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress, raw.count > 0 else { return }
+            _ = memset_s(base, raw.count, 0, raw.count) // never elided as a dead store, unlike a plain fill
         }
     }
 }
@@ -1075,7 +1072,19 @@ struct CheckedFolder {
 
 func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
     var components: [String] = []
-    let absolute = path.hasPrefix("/") ? path : FileManager.default.currentDirectoryPath + "/" + path
+    // A relative path is resolved against the current folder, taken from
+    // getcwd() directly: FileManager's currentDirectoryPath returns "" when
+    // the folder no longer exists, which would make "out.key" into "/out.key".
+    let absolute: String
+    if path.hasPrefix("/") {
+        absolute = path
+    } else {
+        guard let cwd = getcwd(nil, 0) else {
+            throw CLIError("\(what) \(path) is relative, but the current folder can't be determined: \(String(cString: strerror(errno))) -- give an absolute path")
+        }
+        defer { free(cwd) }
+        absolute = String(cString: cwd) + "/" + path
+    }
     for part in absolute.split(separator: "/", omittingEmptySubsequences: true) {
         switch part {
         case ".": continue
@@ -1223,6 +1232,12 @@ func openDekFile(_ spelledPath: String) throws -> Int32 {
     let offending = st.st_mode & forbidGroupOtherAccess
     guard offending == 0 else {
         throw CLIError("--dek-file \(path) permissions are too broad (mode \(String(st.st_mode & 0o7777, radix: 8)); bits \(String(offending, radix: 8)) must be clear)")
+    }
+    // Mode bits aren't the whole story on macOS: an access control list can
+    // grant read to anyone regardless of a 0600 mode. Refuse any ACL at all.
+    if let acl = acl_get_fd(fd) {
+        acl_free(UnsafeMutableRawPointer(acl))
+        throw CLIError("--dek-file \(path) has an access control list, which can grant access beyond its mode bits; remove it (chmod -N \(path)) or use a file without one")
     }
     ok = true
     return fd
@@ -1786,6 +1801,23 @@ func flushFolder(_ folder: CheckedFolder) throws {
 // the payload never sits in it under any other group -- as the Linux tool
 // does. A caller who isn't root can only give a group they belong to: the
 // kernel's rule, reported plainly, and the empty file removed.
+// Removes the file's access control list, if it has one, and confirms it is
+// gone. acl_set_fd with an empty ACL clears the extended ACL on APFS/HFS+;
+// the re-read is the guarantee, whatever the call did.
+func stripACL(fd: Int32, path: String) throws {
+    if let existing = acl_get_fd(fd) {
+        acl_free(UnsafeMutableRawPointer(existing))
+        if let empty = acl_init(0) {
+            defer { acl_free(UnsafeMutableRawPointer(empty)) }
+            _ = acl_set_fd(fd, empty)
+        }
+        if let still = acl_get_fd(fd) {
+            acl_free(UnsafeMutableRawPointer(still))
+            throw CLIError("\(path) inherited an access control list from its folder that could not be removed; the file's permissions would not be what was asked for -- use a folder without an inheritable ACL (ls -lde shows it; chmod -N removes it)")
+        }
+    }
+}
+
 func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
     if force {
         try secureOverwriteAndRemoveIfExists(folder, display: path)
@@ -1818,6 +1850,12 @@ func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [
     guard fchmod(fd, group == nil ? keyFilePermissions : keyFileGroupPermissions) == 0 else {
         throw CLIError("failed to set permissions on \(path): \(String(cString: strerror(errno)))")
     }
+    // A folder with an inheritable access control entry passes it to the new
+    // file, and neither the 0600 at creation nor fchmod touches it -- so the
+    // file could be readable (or deletable) by principals the mode doesn't
+    // show. Strip any ACL before a byte is written, and confirm it's gone;
+    // if it can't be, nothing is written and the empty file is removed.
+    try stripACL(fd: fd, path: path)
 
     try bytes.withUnsafeBufferPointer { buf in
         try writeAll(fd: fd, bytes: buf, context: path)

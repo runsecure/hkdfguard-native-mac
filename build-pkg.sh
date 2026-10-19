@@ -112,6 +112,22 @@ trap 'rm -rf "$STAGE"' EXIT
 # Input: the dist/ build
 # ---------------------------------------------------------------------------
 
+# Asserts `file`'s signature carries exactly the given top-level
+# entitlements -- none at all when no keys are given. An allowlist, not a
+# list of known-bad keys: get-task-allow (debugger attach),
+# cs.disable-library-validation, cs.allow-dyld-environment-variables, or
+# anything else added later fails the build, since each would undo part of
+# what the hardened runtime and the signature checks promise.
+assert_entitlements() {
+    local file="$1" actual expected
+    shift
+    actual="$(codesign -d --entitlements - "$file" 2>/dev/null \
+        | awk '/^\t\[Key\] /{sub(/^\t\[Key\] /, ""); print}' | sort)"
+    expected="$(printf '%s\n' "$@" | sed '/^$/d' | sort)"
+    [ "$actual" = "$expected" ] \
+        || fail "$file: entitlements are [$(tr '\n' ' ' <<<"$actual")], expected [$(tr '\n' ' ' <<<"$expected")]"
+}
+
 echo "==> Checking dist/ input"
 for f in "$DYLIB_NAME" "$HEADER_NAME" "$CLI_NAME" SHA256SUMS; do
     [ -f "$LIB_DIR/$f" ] || fail "missing $LIB_DIR/$f -- run build-dist.sh first"
@@ -128,11 +144,31 @@ for f in "$LIB_DIR/$DYLIB_NAME" "$LIB_DIR/$CLI_NAME" "$APP_SRC"; do
     # Hardened runtime: library validation and no DYLD_* overrides, as
     # build-dist.sh signed it. Re-checked here in case dist/ was touched.
     grep -q 'flags=0x10000(runtime)' <<<"$info" || fail "$f: hardened runtime flag missing"
+    if [ "$f" = "$LIB_DIR/$CLI_NAME" ]; then
+        # The bare CLI must look for its dylib in its own folder and nowhere
+        # else: any other rpath (a toolchain path under /Applications, say,
+        # which the admin group can write) would be searched first.
+        rpaths="$(otool -l "$f" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}')"
+        [ "$rpaths" = "@executable_path" ] \
+            || fail "$f must have exactly one rpath, @executable_path; found: $(tr '\n' ' ' <<<"$rpaths")"
+    fi
     if [ "$UNSIGNED" != 1 ]; then
         grep -q '^Authority=Developer ID Application:' <<<"$info" \
             || fail "$f: not Developer ID signed -- package only a HKDFGUARD_RELEASE=1 build"
     fi
 done
+# No debug entitlements in anything shipped: the bare dylib and CLI and the
+# app's embedded dylib carry none; the app only its keychain identity
+# (build-dist.sh adds get-task-allow to a development export, which a
+# signed package must never contain).
+assert_entitlements "$LIB_DIR/$DYLIB_NAME"
+assert_entitlements "$LIB_DIR/$CLI_NAME"
+assert_entitlements "$APP_SRC/Contents/Frameworks/$DYLIB_NAME"
+app_entitlements=(com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups)
+if [ "$UNSIGNED" = 1 ] && codesign -d --entitlements - "$APP_SRC" 2>/dev/null | grep -q 'get-task-allow'; then
+    app_entitlements+=(com.apple.security.get-task-allow) # a local layout test of a development build only
+fi
+assert_entitlements "$APP_SRC/Contents/MacOS/$CLI_NAME" "${app_entitlements[@]}"
 if [ "$UNSIGNED" != 1 ]; then
     # The bare dylib and CLI can't carry a stapled ticket; check that Apple's
     # ticket service publishes theirs, as build-dist.sh does, rather than

@@ -287,7 +287,10 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// headless-daemon case), the item's ACL denied this process or the user
     /// declined the access prompt (`errSecAuthFailed`, `errSecUserCanceled`),
     /// or this process lacks a required entitlement
-    /// (`errSecMissingEntitlement`). Deliberately distinct from
+    /// (`errSecMissingEntitlement`). Also: the keychain handed the item over
+    /// but the Secure Enclave won't load keys in this session (keybag
+    /// locked, e.g. SSH after `security unlock-keychain`), proven by a
+    /// throwaway probe key failing too. Deliberately distinct from
     /// `kekNotFound`/`kekCorrupted`: a key very likely *does* exist, and
     /// treating this as "no key" or "corrupt key" would invite a caller to
     /// create a replacement or an operator to delete a healthy one.
@@ -295,7 +298,8 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
 
     /// HKDFGUARD_ERR_KEK_INVALID: a keychain item exists under this service,
     /// but its stored data representation could not be reconstructed into a
-    /// usable Secure Enclave key — a corrupt or foreign entry. Deliberately
+    /// usable Secure Enclave key — a corrupt or foreign entry — while the
+    /// enclave demonstrably works in this session. Deliberately
     /// never "healed" by generating a replacement: that would silently
     /// orphan whatever the original key protected.
     case kekCorrupted = -19
@@ -612,11 +616,55 @@ private func loadKEKDataRepresentation(service: String, mode: KeychainMode) -> K
     }
 }
 
+/// What a stored KEK blob turned out to be.
+enum KEKReconstruction {
+    case key(SecureEnclave.P256.KeyAgreement.PrivateKey)
+    /// Not a usable key for this device, though the enclave works:
+    /// `HKDFGuardStatus.kekCorrupted`.
+    case corrupt
+    /// The enclave would not load even a key made just now under the same
+    /// policy, so this blob's failure says nothing about the blob: reported
+    /// as `HKDFGuardStatus.keychainAccessDenied` (a KEK very likely exists).
+    case enclaveRefused
+}
+
 /// Reconstructs a Secure Enclave key from a keychain item's stored data.
-/// `nil` means the item is present but is not (or is no longer) a usable
-/// key for this device — `HKDFGuardStatus.kekCorrupted`.
-private func reconstructKEK(_ data: Data) -> SecureEnclave.P256.KeyAgreement.PrivateKey? {
-    try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data)
+///
+/// A blob can fail to load for two very different reasons: it is not (or
+/// no longer) a key for this device, or this session's keybag is locked --
+/// an SSH login after `security unlock-keychain`, say, where the keychain
+/// hands the item over but the enclave refuses keys bound to "when
+/// unlocked". Reporting the second as corrupt would point an operator at
+/// deleting a healthy KEK, and every DEK under it with it. So on failure
+/// the enclave is probed, and only a failure the probe survives is corrupt.
+func reconstructKEK(
+    _ data: Data,
+    enclaveIsUsable: () -> Bool = secureEnclaveIsUsableNow
+) -> KEKReconstruction {
+    if let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data) {
+        return .key(key)
+    }
+    return enclaveIsUsable() ? .corrupt : .enclaveRefused
+}
+
+/// Whether the Secure Enclave and this user's keybag can use keys in this
+/// session: a throwaway key is created under the KEK's own access policy,
+/// reconstructed from its data representation exactly as a stored KEK is,
+/// and used once. Nothing is stored. Only run when a stored blob has
+/// already failed to load, so a healthy KEK never pays for it.
+func secureEnclaveIsUsableNow() -> Bool {
+    guard SecureEnclave.isAvailable,
+          let access = makeAccessControl(),
+          let probe = try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access) else {
+        return false
+    }
+    var blob = probe.dataRepresentation
+    defer { secureZero(&blob) }
+    guard let reloaded = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) else {
+        return false
+    }
+    let peer = P256.KeyAgreement.PrivateKey().publicKey
+    return (try? reloaded.sharedSecretFromKeyAgreement(with: peer)) != nil
 }
 
 @discardableResult
@@ -650,11 +698,16 @@ func kekExists(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (
         return (HKDFGuardStatus.keychainAccessDenied.rawValue, false)
     case .failed:
         return (HKDFGuardStatus.keychainReadFailed.rawValue, false)
-    case .found(let existing):
-        guard reconstructKEK(existing) != nil else {
+    case .found(var existing):
+        defer { secureZero(&existing) } // the SEP-wrapped blob is the credential: don't leave this copy behind
+        switch reconstructKEK(existing) {
+        case .key:
+            return (HKDFGuardStatus.success.rawValue, true)
+        case .corrupt:
             return (HKDFGuardStatus.kekCorrupted.rawValue, false)
+        case .enclaveRefused:
+            return (HKDFGuardStatus.keychainAccessDenied.rawValue, false)
         }
-        return (HKDFGuardStatus.success.rawValue, true)
     }
 }
 
@@ -679,13 +732,18 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
     // process simply can't see, and generating a replacement on top of it
     // would orphan whatever that key protects.
     switch loadKEKDataRepresentation(service: service, mode: mode) {
-    case .found(let existing):
-        guard reconstructKEK(existing) != nil else {
-            // Item exists but cannot be reconstructed.
-            // Do NOT generate a replacement key.
+    case .found(var existing):
+        defer { secureZero(&existing) } // the SEP-wrapped blob is the credential: don't leave this copy behind
+        // An item that can't be reconstructed is never replaced, whichever
+        // the reason.
+        switch reconstructKEK(existing) {
+        case .key:
+            return HKDFGuardStatus.success.rawValue
+        case .corrupt:
             return HKDFGuardStatus.kekCorrupted.rawValue
+        case .enclaveRefused:
+            return HKDFGuardStatus.keychainAccessDenied.rawValue
         }
-        return HKDFGuardStatus.success.rawValue
     case .accessDenied:
         return HKDFGuardStatus.keychainAccessDenied.rawValue
     case .failed:
@@ -730,12 +788,20 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
 
         // Verify store/reload/reconstruct succeeds.
         switch loadKEKDataRepresentation(service: service, mode: mode) {
-        case .found(let stored) where reconstructKEK(stored) != nil:
-            auditKekCreated(service: service, mode: mode)
-            return HKDFGuardStatus.success.rawValue
+        case .found(var stored):
+            defer { secureZero(&stored) }
+            switch reconstructKEK(stored) {
+            case .key:
+                auditKekCreated(service: service, mode: mode)
+                return HKDFGuardStatus.success.rawValue
+            case .corrupt:
+                return HKDFGuardStatus.kekVerificationFailed.rawValue
+            case .enclaveRefused:
+                return HKDFGuardStatus.keychainAccessDenied.rawValue
+            }
         case .accessDenied:
             return HKDFGuardStatus.keychainAccessDenied.rawValue
-        case .found, .notFound, .failed:
+        case .notFound, .failed:
             return HKDFGuardStatus.kekVerificationFailed.rawValue
         }
 
@@ -746,11 +812,16 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
         // process, its item's ACL may deny this one — that is
         // keychainAccessDenied, not a corrupt item.
         switch loadKEKDataRepresentation(service: service, mode: mode) {
-        case .found(let existing):
-            guard reconstructKEK(existing) != nil else {
+        case .found(var existing):
+            defer { secureZero(&existing) }
+            switch reconstructKEK(existing) {
+            case .key:
+                return HKDFGuardStatus.success.rawValue
+            case .corrupt:
                 return HKDFGuardStatus.kekCorrupted.rawValue
+            case .enclaveRefused:
+                return HKDFGuardStatus.keychainAccessDenied.rawValue
             }
-            return HKDFGuardStatus.success.rawValue
         case .accessDenied:
             return HKDFGuardStatus.keychainAccessDenied.rawValue
         case .notFound, .failed:
@@ -792,11 +863,16 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
         return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
     case .failed:
         return (HKDFGuardStatus.keychainReadFailed.rawValue, nil)
-    case .found(let existing):
-        guard let key = reconstructKEK(existing) else {
+    case .found(var existing):
+        defer { secureZero(&existing) } // best effort: `key` keeps CryptoKit's own copy
+        switch reconstructKEK(existing) {
+        case .key(let key):
+            return (HKDFGuardStatus.success.rawValue, key)
+        case .corrupt:
             return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+        case .enclaveRefused:
+            return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
         }
-        return (HKDFGuardStatus.success.rawValue, key)
     }
 }
 
@@ -1128,14 +1204,14 @@ func auditSetupCallsExceeded(floorMs: Int64) {
     auditEmit(
         .warning, .setupCallsExceeded,
         fields: "calls=\(calls) setup_min_delay_ms=\(floorMs)",
-        message: "more than \(calls) hkdfguard_create_kek / hkdfguard_kek_exists calls in this process; these are meant to run once per application startup, and each costs a Secure Enclave round trip plus at least \(floorMs) ms -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
+        message: "more than \(calls) hkdfguard_create_kek / hkdfguard_kek_exists / hkdfguard_kek_fingerprint calls in this process; these are meant to run once per application startup, and each costs a Secure Enclave round trip plus at least \(floorMs) ms -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
     )
 }
 
 // MARK: - Setup gate
 
 /// The least wall-clock time each setup call (`hkdfguard_create_kek`,
-/// `hkdfguard_kek_exists`) takes, whatever its outcome -- the Linux and
+/// `hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`) takes, whatever its outcome -- the Linux and
 /// Windows default. Fixed on macOS: there is no policy file or
 /// administrator setting to tune it (Linux reads
 /// `startup_behavior.setup_min_delay_ms`, Windows
@@ -1413,7 +1489,11 @@ public func hkdfguard_kek_exists(
 /// `service` currently resolves to -- the same value embedded at the front
 /// of every payload wrapped under it. Public-key material only, so safe to
 /// expose; lets an operator pin which KEK a service uses and confirm it
-/// before retiring it. Never creates a KEK.
+/// before retiring it. Never creates a KEK. A setup call: held to
+/// `setupMinDelay` and serialized (see `gatedSetup`) like
+/// `hkdfguard_kek_exists`, since "found" vs `kekNotFound` answers the same
+/// question -- which services have a KEK -- and would otherwise let it be
+/// asked as fast as the keychain answers.
 @_cdecl("hkdfguard_kek_fingerprint")
 public func hkdfguard_kek_fingerprint(
     servicePtr: UnsafePointer<CChar>?,
@@ -1431,13 +1511,17 @@ public func hkdfguard_kek_fingerprint(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    let (status, maybeKey) = getKEK(service: service)
-    guard let key = maybeKey else {
+    // The key itself stays inside the gate; only its public fingerprint
+    // leaves it.
+    let (status, maybeFingerprint) = gatedSetup { () -> (Int32, Data?) in
+        let (status, maybeKey) = getKEK(service: service)
+        return (status, maybeKey.map { kekFingerprint($0.publicKey) })
+    }
+    guard let fingerprint = maybeFingerprint else {
         auditOperationFailed(.kekFingerprint, service: service, code: status)
         return status
     }
 
-    let fingerprint = kekFingerprint(key.publicKey)
     guard copyOut(fingerprint, to: outPtr, count: hkdfguardFingerprintLength) else {
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
@@ -1778,48 +1862,137 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
 /// as a group-writable folder does on Linux: every administrator could
 /// replace the key there without root.
 func keyFileFoldersAreTrusted(folderFd: Int32) -> Bool {
-    // The folder's own path, from its descriptor. Reliable for a folder, as
-    // it is not for a file: a file with several hard links has several
-    // names, and F_GETPATH reports whichever was looked up last -- not
-    // necessarily the one it was opened by. A folder has exactly one.
-    var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-    guard fcntl(folderFd, F_GETPATH, &pathBuf) != -1 else {
+    // Walked by descriptor, from the key file's own folder up through
+    // openat(fd, "..") until a folder is its own parent (/): no path string
+    // is decoded, split or looked up again, so neither an odd folder name
+    // (one starting with a combining mark fuses with the "/" before it in a
+    // Swift String, and its parent would be skipped) nor a folder renamed
+    // mid-walk can make a folder be skipped or judged in its stead.
+    var current = dup(folderFd)
+    guard current >= 0 else {
         return false
     }
-    var folder = String(cString: pathBuf)
-    guard folder.hasPrefix("/") else {
-        return false
-    }
+    defer { close(current) }
 
     let uid = geteuid()
-    while true {
+    for _ in 0..<Int(MAXPATHLEN) { // a path has at most this many folders
         var info = stat()
-        guard stat(folder, &info) == 0,
+        guard fstat(current, &info) == 0,
               info.st_mode & S_IFMT == S_IFDIR,
-              info.st_uid == 0 || info.st_uid == uid else {
+              info.st_uid == 0 || info.st_uid == uid,
+              !onVolumeIgnoringOwnership(current),
+              !aclGrantsOthersAChange(fd: current, isFolder: true) else {
             return false
         }
         let writable = info.st_mode & (S_IWGRP | S_IWOTH) != 0
         let sticky = info.st_mode & S_ISVTX != 0
-        if writable && !sticky && !folderIsOnReadOnlyVolume(folder) {
+        if writable && !sticky && !onSealedSystemVolume(current) {
             return false
         }
-        if folder == "/" {
+
+        let parent = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard parent >= 0 else {
+            return false
+        }
+        var parentInfo = stat()
+        guard fstat(parent, &parentInfo) == 0 else {
+            close(parent)
+            return false
+        }
+        if parentInfo.st_dev == info.st_dev && parentInfo.st_ino == info.st_ino {
+            close(parent) // "/" is its own parent: the whole chain passed
             return true
         }
-        guard let slash = folder.lastIndex(of: "/") else { // `folder` is absolute, so never
-            return false
-        }
-        folder = slash == folder.startIndex ? "/" : String(folder[..<slash])
+        close(current)
+        current = parent
     }
+    return false
 }
 
-private func folderIsOnReadOnlyVolume(_ folder: String) -> Bool {
+/// Whether `fd` is on a volume mounted with ownership ignored (the default
+/// for disk images and removable media a user mounts). There the kernel
+/// reports every file and folder as owned by whoever asks, so the owner
+/// checks above would pass for anything on it, whoever wrote it.
+private func onVolumeIgnoringOwnership(_ fd: Int32) -> Bool {
     var fs = statfs()
-    guard statfs(folder, &fs) == 0 else {
+    guard fstatfs(fd, &fs) == 0 else {
+        return true // can't tell: treat as untrusted
+    }
+    return fs.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) != 0
+}
+
+/// Whether `fd` is on the sealed, read-only system volume, the one place
+/// write bits on a folder can be ignored: nothing on it can change. Any
+/// other read-only volume -- a disk image someone built and mounted, say --
+/// gets no exemption, since whoever built it chose its contents.
+private func onSealedSystemVolume(_ fd: Int32) -> Bool {
+    var fs = statfs()
+    guard fstatfs(fd, &fs) == 0 else {
         return false
     }
-    return fs.f_flags & UInt32(MNT_RDONLY) != 0
+    let required = UInt32(MNT_RDONLY) | UInt32(MNT_ROOTFS)
+    return fs.f_flags & required == required
+}
+
+/// Whether the access control list on `fd` grants anyone other than root or
+/// this user a right that could change what the key path reads. Mode bits
+/// alone miss this: on macOS an ACL can grant write to anyone regardless of
+/// a 0600 or 0755 mode.
+///
+/// For a file: writing or appending its data, deleting it, or changing its
+/// permissions, owner, ACL or attributes. For a folder: adding, removing or
+/// renaming entries (add_file, add_subdirectory, delete_child), and changing
+/// its permissions, owner or ACL. Deny entries only take rights away, so
+/// only allow entries count -- the standard "everyone deny delete" on home
+/// folders passes. Entries for root or this user are harmless. An ACL that
+/// can't be read, or an entry whose principal can't be resolved, counts as
+/// granting (fail closed).
+private func aclGrantsOthersAChange(fd: Int32, isFolder: Bool) -> Bool {
+    guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+        return errno != ENOENT // no ACL at all; any other failure fails closed
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+
+    let risky: [acl_perm_t] = isFolder
+        ? [ACL_ADD_FILE, ACL_ADD_SUBDIRECTORY, ACL_DELETE_CHILD, ACL_DELETE,
+           ACL_WRITE_SECURITY, ACL_CHANGE_OWNER]
+        : [ACL_WRITE_DATA, ACL_APPEND_DATA, ACL_DELETE, ACL_WRITE_ATTRIBUTES,
+           ACL_WRITE_EXTATTRIBUTES, ACL_WRITE_SECURITY, ACL_CHANGE_OWNER]
+    let uid = geteuid()
+
+    var entry: acl_entry_t?
+    var which = ACL_FIRST_ENTRY.rawValue
+    while acl_get_entry(acl, Int32(which), &entry) == 0, let current = entry {
+        which = ACL_NEXT_ENTRY.rawValue
+        var tag = ACL_UNDEFINED_TAG
+        guard acl_get_tag_type(current, &tag) == 0 else {
+            return true
+        }
+        guard tag == ACL_EXTENDED_ALLOW else {
+            continue // deny entries can only take rights away
+        }
+        var permset: acl_permset_t?
+        guard acl_get_permset(current, &permset) == 0, let perms = permset else {
+            return true
+        }
+        guard risky.contains(where: { acl_get_perm_np(perms, $0) == 1 }) else {
+            continue // grants only reading or listing
+        }
+        // Who is granted it: harmless if root or this user, else refuse.
+        guard let qualifier = acl_get_qualifier(current) else {
+            return true
+        }
+        defer { acl_free(qualifier) }
+        var id: id_t = 0
+        var type: Int32 = 0
+        let resolved = qualifier.withMemoryRebound(to: UInt8.self, capacity: 16) {
+            mbr_uuid_to_id($0, &id, &type) == 0
+        }
+        guard resolved, type == ID_TYPE_UID, id == 0 || id == uid else {
+            return true
+        }
+    }
+    return false
 }
 
 /// Reads at most `buffer.count` bytes of the regular file at `path` into
@@ -1893,7 +2066,11 @@ private func readWrappedFile(
     // just opened within, which `keyFileFoldersAreTrusted` below limits to
     // the owner and root.
     guard info.st_uid == geteuid() || info.st_uid == 0,
-          info.st_mode & (S_IWGRP | S_IWOTH) == 0 else {
+          info.st_mode & (S_IWGRP | S_IWOTH) == 0,
+          // On a volume ignoring ownership, st_uid above is whoever asked.
+          !onVolumeIgnoringOwnership(fd),
+          // Nor may an ACL let anyone else rewrite, replace or re-permission it.
+          !aclGrantsOthersAChange(fd: fd, isFolder: false) else {
         return (.fileInsecure, 0)
     }
     // And the folders that decide what the path names, as on Linux --

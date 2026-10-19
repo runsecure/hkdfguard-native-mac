@@ -750,6 +750,40 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.exitCode == 2 && result.stderr.contains("-g is not valid for `provision`; it belongs to `wrap`"), "\(result.stderr)")
     }
 
+    @Test func cliRefusesAFlagValueThatStartsWithADash() throws {
+        // A forgotten value must not swallow the next flag: `-kf --force`
+        // would otherwise write a key file named "--force" and drop --force.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hkdfguard.cli.dashvalue.\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let keyFilePath = dir.appendingPathComponent("out.key").path
+        let service = "com.hkdfguard.tests.cli.dash.value"
+        let fp = String(repeating: "ab", count: 32)
+
+        let cases: [[String]] = [
+            ["wrap", "-kf", "--force", "-sn", service, "--dek-stdin"],
+            ["wrap", "-kf", keyFilePath, "-sn", "-g", "--dek-stdin"],
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-g", "-f"],
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-file", "-fp", fp],
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "--fingerprint", "-f"],
+            ["provision", "--service-name", "-h"],
+            ["status", "-sn", "-sn"],
+            ["retire", "-sn", service, "-fp", "--corrupt"],
+        ]
+        for argv in cases {
+            let result = try Self.runCLI(argv)
+            #expect(result.exitCode == 2, "\(argv): \(result.stderr)")
+            #expect(result.stderr.contains("requires a value, but the next argument is"), "\(argv): \(result.stderr)")
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty, "nothing was written")
+        #expect(!FileManager.default.fileExists(atPath: "--force"))
+
+        // Flags themselves are unaffected, short or long, in any order.
+        let ok = try Self.runCLI(["status", "-sn", service])
+        #expect(!ok.stderr.contains("requires a value"), "\(ok.stderr)")
+    }
+
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
     func cliGroupWritesTheFile0640WithThatGroup() throws {
         guard let group = Self.eligibleGroup() else {
@@ -1253,6 +1287,78 @@ struct HkdfGuardCommandLineToolTests {
         let result = try Self.wrapWithDekFile(FileManager.default.temporaryDirectory.path)
         #expect(result.exitCode == 1)
         #expect(result.stderr.contains("is not a regular file"), "stderr: \(result.stderr)")
+    }
+
+    /// Gives `path` an access control entry with chmod(1), the way an
+    /// administrator would: `chmod +a "<ace>" <path>`.
+    private static func addACE(_ ace: String, to path: String) throws {
+        let result = try run(URL(fileURLWithPath: "/bin/chmod"), ["+a", ace, path])
+        try #require(result.exitCode == 0, "chmod +a failed: \(result.stderr)")
+    }
+
+    /// Whether `path` carries an access control list (its `ls -l` mode would
+    /// end in `+`).
+    private static func hasACL(_ path: String) -> Bool {
+        guard let acl = acl_get_file(path, ACL_TYPE_EXTENDED) else { return false }
+        acl_free(UnsafeMutableRawPointer(acl))
+        return true
+    }
+
+    @Test func cliDekFileRefusesAFileWithAnAccessControlList() throws {
+        // Mode 0600, but an ACL grants read to everyone: the mode-bit check
+        // alone would accept it. Refused before the library is reached, so
+        // no KEK is needed.
+        let dekFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: dekFilePath) }
+        try Self.writeDekFile(Self.base64Stdin(Self.randomDEK()), to: dekFilePath)
+        try Self.addACE("group:everyone allow read", to: dekFilePath)
+        try #require(Self.hasACL(dekFilePath))
+
+        let result = try Self.wrapWithDekFile(dekFilePath)
+        #expect(result.exitCode == 1)
+        #expect(result.stderr.contains("has an access control list"), "stderr: \(result.stderr)")
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliWrapStripsAnACLInheritedFromTheKeyFilesFolder() throws {
+        // A folder with an inheritable ACE passes it to every new file, and
+        // neither the 0600 at creation nor fchmod removes it. The written key
+        // file must carry no ACL, so "owner read/write" is true.
+        let service = "com.hkdfguard.tests.cli.acl.inherit"
+        defer { Self.deleteKEK(service: service) }
+        try Self.provision(service: service)
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard-acl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Self.addACE("group:everyone allow read,file_inherit", to: dir.path)
+        let keyFilePath = dir.appendingPathComponent("wrapped.key").path
+
+        let result = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"], stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(result.exitCode == 0, "\(result.stderr)")
+        #expect(!Self.hasACL(keyFilePath), "the inherited ACL must be stripped")
+        let mode = (try FileManager.default.attributesOfItem(atPath: keyFilePath)[.posixPermissions] as? NSNumber)?.intValue
+        #expect(mode == 0o600)
+    }
+
+    @Test func cliRefusesARelativeKeyPathWhenTheCurrentFolderIsGone() throws {
+        // With the current folder deleted, FileManager's currentDirectoryPath
+        // is "", which would turn "out.key" into "/out.key" -- at the root of
+        // the filesystem, as root under sudo. The CLI must refuse instead.
+        // The CLI is started through a shell that deletes its own cwd first.
+        try Self.toolsBuilt.get() // started directly below, not through runCLI, so build it here
+        let gone = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard-gone-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: gone, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: gone) }
+
+        let result = try Self.run(
+            URL(fileURLWithPath: "/bin/sh"),
+            ["-c", "cd \"$1\" && rmdir \"$1\" && exec \"$2\" wrap -kf out.key -sn com.hkdfguard.tests.cli.gone.cwd --dek-stdin", "sh", gone.path, Self.cliExecutablePath],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(result.exitCode == 1)
+        #expect(result.stderr.contains("current folder can't be determined"), "stderr: \(result.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: "/out.key"), "nothing may be created at the filesystem root")
     }
 
     @Test func cliDekFileRefusesGroupOrOtherAccess() throws {

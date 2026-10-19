@@ -258,7 +258,7 @@ Console.app shows the same records live.
 | 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
 | 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
 | 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
-| 2007 | warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls (each held to at least 1000 ms; see [Concurrency](#concurrency)). Logged once per process. |
+| 2007 | warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` / `hkdfguard_kek_fingerprint` calls (each held to at least 1000 ms; see [Concurrency](#concurrency)). Logged once per process. |
 
 The unified log has no "warning" level, so Linux's info / warning / error
 are `default` / `error` / `fault` here. `default` is the level the log keeps
@@ -339,9 +339,24 @@ reach `out` only on success; on any failure the whole declared capacity of
   as on Linux: each must be owned by root or the process's effective user,
   and not writable by group or others unless it is sticky (`/tmp`-style,
   where only an entry's owner can rename or remove it). Write bits are
-  ignored on a read-only volume. Otherwise someone else could rename a file
-  of their choosing over the key, and it is `fileInsecure` (-39). The folder
-  is the one the opened file actually sits in. A folder the `admin` group
+  ignored only on the sealed system volume, which nothing can change; any
+  other read-only volume, such as a mounted disk image, is checked like the
+  rest. Otherwise someone else could rename a file of their choosing over
+  the key, and it is `fileInsecure` (-39). The folders are walked from the
+  one the opened file actually sits in, by descriptor through each `..`,
+  never by re-reading the path's spelling.
+- **Access control lists.** Mode bits are not the whole story on macOS: an
+  ACL entry can grant write to anyone, whatever the mode. The file is
+  `fileInsecure` (-39) if its ACL allows anyone but this user or root to
+  write, append, delete it, or change its attributes, permissions, owner or
+  ACL; a folder in the chain is, if its ACL allows anyone else to add,
+  remove or rename entries in it, or change its permissions, owner or ACL.
+  Deny entries, such as the `everyone deny delete` on every home folder,
+  and entries that grant only reading or listing, are fine.
+- **Volumes.** A file or folder on a volume mounted with ownership ignored
+  (`noowners`, the default for disk images and removable media a user
+  mounts) is `fileInsecure` (-39): there every item reports whoever asks as
+  its owner, so the owner checks above would prove nothing. A folder the `admin` group
   can write, such as `/Applications`, is refused: every administrator could
   replace the key there without root. Keep key files under a root-owned
   folder such as `/Library/Application Support/<app>` (`0755`), or in the
@@ -352,6 +367,26 @@ reach `out` only on success; on any failure the whole declared capacity of
   privileged process is pointed at arbitrary files), and don't use relative
   paths, which resolve against a working directory the caller may not
   control. Keep the file in a directory only its owner can write.
+- **Symbolic links to folders in the path.** A link to a folder
+  partway along the path is followed, and is not itself checked: the
+  checks above apply to the folders the file really sits in. So whoever
+  can change that link — anyone who can write the folder holding it —
+  decides which folder the path names. If they point it at another folder
+  that passes the checks (one of this user's own, say), they choose which
+  of this user's genuine key files is read: an older one for the same
+  service (see **Replay**), or another service's, which unwrap refuses as
+  a fingerprint mismatch (-16). Use a path whose only symbolic links are
+  the root-owned system ones (`/tmp`, `/var`, `/etc`).
+- **Replay.** A genuine payload is genuine forever. Nothing in it records
+  when it was made or whether it is the latest, so someone who can write
+  the key file as its owner (or as root) can put back an *older* payload
+  wrapped under the same KEK, and it opens and unwraps normally, giving
+  the older DEK. Neither this function nor unwrap can tell. Wrapping a new
+  DEK doesn't revoke the old payload: only retiring the KEK does
+  (`hkdfguard retire`, then provision a new KEK and wrap again), since
+  every payload under the old KEK then fails to unwrap. If an older DEK
+  being reused would matter, record which payload is current somewhere
+  the file's writer can't change, such as its SHA-256.
 - **Length.** Anything other than exactly 125 bytes is `fileTooShort`
   (-35) or `fileTooLong` (-36).
 - **Unprotected key.** A file holding a bare 32-byte DEK instead of a
@@ -393,8 +428,8 @@ here are defined there but never returned on macOS.
 | `-12` | `ERR_PAYLOAD_UNSUPPORTED` | `unsupportedCiphersuite` | the payload's suite byte is not one this build implements; a newer or different build wrote it. Not tampering |
 | `-16` | `ERR_KEK_FINGERPRINT_MISMATCH` | `fingerprintMismatch` | payload was wrapped under a different KEK |
 | `-17` | `ERR_KEK_NOT_FOUND` | `kekNotFound` | no KEK for this service in this process's keychain mode; call `hkdfguard_create_kek` |
-| `-18` | `ERR_KEK_ACCESS_DENIED` | `keychainAccessDenied` | locked keychain / no UI session / ACL denial / declined prompt / missing entitlement. **A key likely exists**; don't create or delete anything |
-| `-19` | `ERR_KEK_INVALID` | `kekCorrupted` | an item exists but can't be reconstructed into a key; never auto-replaced |
+| `-18` | `ERR_KEK_ACCESS_DENIED` | `keychainAccessDenied` | locked keychain / no UI session / ACL denial / declined prompt / missing entitlement / Secure Enclave won't load keys in this session (keybag locked, e.g. SSH after `security unlock-keychain`). **A key likely exists**; don't create or delete anything |
+| `-19` | `ERR_KEK_INVALID` | `kekCorrupted` | an item exists but can't be reconstructed into a key, and a throwaway probe key shows the enclave works in this session; never auto-replaced |
 | `-32` | `ERR_FILE_NOT_FOUND` | `fileNotFound` | no file at the path, or a path component is not a directory (`hkdfguard_open_file` only, as are `-33` to `-39`) |
 | `-33` | `ERR_FILE_ACCESS_DENIED` | `fileAccessDenied` | this process may not read the file or a directory on its path |
 | `-34` | `ERR_FILE_IO` | `fileIO` | a directory, FIFO, socket, or device; or `open`/`fstat`/`read` failed |
@@ -402,7 +437,7 @@ here are defined there but never returned on macOS.
 | `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 125 bytes |
 | `-37` | `ERR_FILE_PLAINTEXT_KEY` | `fileUnprotectedKey` | the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
 | `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 125 bytes, but the fingerprint is all zeros |
-| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | a symbolic link (refused, never followed); owned by someone other than this user or root, or writable by group or others; or a folder above it is owned by someone else or writable by group or others without being sticky |
+| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | a symbolic link (refused, never followed); owned by someone other than this user or root, or writable by group or others; or an ACL lets someone else change it; or it is on a volume that ignores ownership; or a folder above it is owned by someone else, writable by group or others without being sticky, or has an ACL letting someone else add or remove entries |
 | `-96` | `ERR_MAC_ACCESS_CONTROL_CREATION_FAILED` | `accessControlCreationFailed` | refines `ERR_PROVIDER_ERROR` (-4) |
 | `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
 | `-98` | `ERR_MAC_KEYCHAIN_WRITE_FAILED` | `keychainWriteFailed` | refines -4 |
@@ -434,6 +469,47 @@ defeat this disjointness for any call made with `mode: .legacy` from inside
 an entitled process. Covered by `dataProtectionModeStoresItemsOnlyInTheDataProtectionKeychain`
 (see Tests), which asserts a data-protection item is invisible to an
 explicit legacy-mode query from the same process.
+
+### What the legacy-mode ACL checks, and what it doesn't
+
+A legacy-mode item's ACL lists the programs allowed to use it without a
+prompt: the one that created it, plus any an operator approved with
+"Always Allow". "Program" means the **main executable of the process**
+that asks, identified by its code signature. That has three consequences:
+
+- **The library and the calling code are never checked.** The ACL sees the
+  process's executable, not `libhkdfguard.dylib` and not whatever script,
+  assembly or jar made the call.
+- **An interpreter is one program, whatever it runs.** For a consumer
+  launched as `python3 app.py`, `node app.js`, `java -jar app.jar` or
+  `dotnet App.dll`, the approved program is the shared interpreter. Every
+  other script that interpreter runs as the same user then passes the same
+  ACL, with no prompt, including one someone else dropped into that
+  user's home folder. The approval amounts to "this user, through this
+  interpreter", not "this application".
+- **What identifies the program is its signature.** A Developer ID
+  signed executable is matched by its Team and identifier, so rebuilds and
+  updates keep the approval; an ad-hoc or unsigned one by its hash, so
+  every rebuild prompts again.
+
+So for a service written in an interpreted or managed language:
+
+- **Prefer data-protection mode**: package the service as a Team-signed
+  app bundle carrying the `keychain-access-groups` entitlement and a
+  provisioning profile (an interpreter embedded in a signed bundle
+  qualifies). There, securityd decides from that bundle's signed identity,
+  and a script run by a stock interpreter can't present it.
+- **Otherwise, ship it as its own signed executable** (a .NET apphost or
+  single-file publish, a PyInstaller or Nuitka binary), so the approval
+  covers that program alone. See [Consuming this library](#consuming-this-library).
+- **Never approve a shared interpreter** (`/usr/bin/python3`, a Homebrew
+  `node`, `dotnet`) for a production KEK unless every program that
+  interpreter may run as that user is equally trusted.
+
+Either way the user account remains the boundary (see
+[The trust boundary](#the-trust-boundary)): code running as the service's
+user can also read its files and, unless the process runs with the
+hardened runtime, attach a debugger to it.
 
 ## Access policy and headless use
 
@@ -575,7 +651,8 @@ hkdfguard retire --service-name|-sn <name> \
     or device is refused without blocking -- owned by root or by the user
     running the CLI, and grant no access to group or others (mode `0400` or
     `0600`). Every check is made on the opened descriptor, so it describes
-    the file that is read.
+    the file that is read. A file carrying an access control list is
+    refused too, whatever its mode bits: an ACL can grant read to anyone.
   - *No symbolic link above a path (same as the Linux tool).* Neither
     `--key-file-path` nor `--dek-file` may be reached through a symlinked
     folder: whoever could plant one where the operator writes could redirect
@@ -600,7 +677,11 @@ hkdfguard retire --service-name|-sn <name> \
     if the lock is refused), are never held as a string, and are zeroed on
     every exit path.
   - *Output file.* Created with POSIX `0600` permissions set at creation
-    (owner read/write, nothing for anyone else), then the file and its
+    (owner read/write, nothing for anyone else). Any access control list the
+    folder would pass on to a new file is stripped before the payload is
+    written -- a folder's inheritable ACE would otherwise make the file
+    readable by principals the mode doesn't show -- and if it can't be
+    stripped nothing is written. Then the file and its
     directory entry are flushed to the storage device (`F_FULLFSYNC`)
     before `wrap` exits `0`, so a pipeline may safely discard its plaintext
     DEK at that point. On any failure after creation the partial file is
@@ -635,6 +716,9 @@ hkdfguard retire --service-name|-sn <name> \
 
 Exit codes: `0` success, `1` runtime failure, `2` argument error (usage
 printed). Nothing persistent is touched until every argument is validated.
+Each flag may be given once, and a flag's value may not start with `-`:
+`wrap -kf --force ...` is an argument error, not a key file named
+`--force`. Write a path that starts with `-` as `./-name`.
 
 The CLI ships in two builds of the same source, and the build decides the
 keychain mode:
@@ -856,7 +940,7 @@ PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"
 # The checksum goes in the release notes -- outside the asset, so replacing
 # the package cannot also replace the value it is checked against.
 {
-  echo "Install with: sudo installer -pkg $PKG -target /"
+  echo "Install with the checks in the README's \"Installing\" section."
   echo
   echo "SHA-256 (verify with \`shasum -a 256 -c\`):"
   echo '```'
@@ -872,9 +956,13 @@ gh release create "$VERSION" "dist/$PKG" \
   --notes-file dist/release-notes.md
 ```
 
-`build-pkg.sh` refuses anything but a `HKDFGUARD_RELEASE=1` build. Beyond
-the checksum, every machine checks the package's own Developer ID Installer
-signature and stapled notarization ticket when it installs. Confirm the tag
+`build-pkg.sh` refuses anything but a `HKDFGUARD_RELEASE=1` build. The
+package carries a Developer ID Installer signature and a stapled
+notarization ticket, but nothing forces a machine to check them: Finder
+and MDM tools do, while `sudo installer -pkg` installs an unsigned or
+re-signed package without a word. That is why the
+[install commands](#installing) check the checksum, the signing Team and
+Gatekeeper's verdict themselves, and stop on any failure. Confirm the tag
 before pushing it or running `gh release create` — a release, unlike a
 local build, is visible and hard to fully retract once someone has pulled
 it.
@@ -943,17 +1031,29 @@ Python, or Java runtime under Rosetta cannot load the arm64 dylib.
 
 ### Installing
 
-Check the package against the release notes, then install it:
+`sudo installer -pkg` checks nothing on its own: it installs an unsigned
+package, or one re-signed by anyone, without a warning. So check the
+package first, and install only if every check passes:
 
 ```sh
+set -e
 VERSION=v0.9.0
+TEAM_ID=MFW3T8R8J3                        # the Team that signs this project's releases
+EXPECTED=<the SHA-256 from the release notes>
 PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"
+
 gh release download "$VERSION" --pattern "$PKG"
-shasum -a 256 "$PKG"                      # must match the release notes
-pkgutil --check-signature "$PKG"          # Developer ID Installer: <Name> (<TEAMID>); notarized
+echo "$EXPECTED  $PKG" | shasum -a 256 -c                             # the bytes released
+pkgutil --check-signature "$PKG" | grep -q "Developer ID Installer: .* ($TEAM_ID)$"  # signed by that Team
+spctl --assess --type install -v "$PKG"                               # Gatekeeper: notarized, not revoked
 sudo installer -pkg "$PKG" -target /
-pkgutil --pkg-info com.hkdfguard.native      # the receipt, with the installed version
+pkgutil --pkg-info com.hkdfguard.native   # the receipt, with the installed version
 ```
+
+Each check exits non-zero on failure, and `set -e` stops before
+`installer` runs. Take `EXPECTED` from the release notes, not from a
+`.sha256` file downloaded beside the package: whoever could replace the
+package could replace that too.
 
 Double-clicking the package in Finder works too. For a fleet, upload the
 package to your MDM (Jamf, Intune, Kandji, …) and scope the policy to Apple
@@ -1015,23 +1115,144 @@ a path or search folder from an environment variable or config file. A
 hardened consumer also re-checks what the package guarantees before loading:
 resolve the path with `realpath` and confirm it is still exactly the path
 above, then check that every folder from `/` down and the dylib itself are
-owned by root and not group- or world-writable. It can also verify the
-dylib's code signature against the expected Team ID
-(`SecStaticCodeCreateWithPath` + `SecStaticCodeCheckValidity`): a `dotnet`,
-`python`, or `java` host has no library validation of its own.
+owned by root and not group- or world-writable, and that the dylib's code
+signature satisfies this requirement:
 
-For C#, route the `DllImport` name to that path with a resolver, so the
-existing `[DllImport("hkdfguard")]` declarations stay unchanged:
+```
+identifier "libhkdfguard" and anchor apple generic
+  and certificate 1[field.1.2.840.113635.100.6.2.6] exists
+  and certificate leaf[field.1.2.840.113635.100.6.1.13] exists
+  and certificate leaf[subject.OU] = "MFW3T8R8J3"
+```
+
+That is: Apple-issued Developer ID Application signature, from the Team
+that signs this project's releases, on the library itself. A fork signs
+with its own Team ID. Checking validity with no requirement proves only
+that *someone's* valid signature is there, which anyone with any Apple
+certificate could supply. A `dotnet`, `python`, or `java` host has no
+library validation of its own, so this check is the only one that runs.
+
+**C#.** Route the `DllImport` name to the checked path with a resolver, so
+the existing `[DllImport("hkdfguard")]` declarations stay unchanged:
 
 ```csharp
 NativeLibrary.SetDllImportResolver(typeof(HkdfGuardInterop).Assembly, (name, assembly, searchPath) =>
     name == "hkdfguard"
-        ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath()) // the fixed path; checks above
+        ? NativeLibrary.Load(HkdfGuardInstall.ResolveVerifiedPath())
         : IntPtr.Zero);
 ```
 
-Other languages load the same absolute path in place of the
-`./libhkdfguard.dylib` used in the examples below.
+`HkdfGuardInstall` makes the three checks above and throws if any fails;
+it never falls back to another location:
+
+```csharp
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public static class HkdfGuardInstall
+{
+    public const string LibraryPath = "/Library/Application Support/HkdfGuard/v1/libhkdfguard.dylib";
+
+    public const string CodeRequirement =
+        "identifier \"libhkdfguard\" and anchor apple generic" +
+        " and certificate 1[field.1.2.840.113635.100.6.2.6] exists" +     // Developer ID CA
+        " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" + // Developer ID Application
+        " and certificate leaf[subject.OU] = \"MFW3T8R8J3\"";            // the publisher's Team ID
+
+    public static string ResolveVerifiedPath()
+    {
+        // 1. No symlink anywhere in the path: it resolves to itself.
+        var resolved = RealPath(LibraryPath);
+        if (resolved != LibraryPath)
+            throw new InvalidOperationException($"{LibraryPath} resolves to {resolved}; refusing to load it");
+
+        // 2. The dylib and every folder above it: root-owned, not a
+        //    symlink, not group- or world-writable.
+        for (var p = LibraryPath; ; p = Path.GetDirectoryName(p)!)
+        {
+            var (uid, mode) = LStat(p);
+            if (uid != 0 || (mode & 0x12) != 0 || (mode & 0xF000) == 0xA000) // S_IWGRP|S_IWOTH, S_IFLNK
+                throw new InvalidOperationException($"{p} is not root-owned and writable by root alone; refusing to load the library");
+            if (p == "/") break;
+        }
+
+        // 3. The code signature, against the requirement above.
+        CheckSignature(LibraryPath, CodeRequirement);
+        return LibraryPath;
+    }
+
+    [DllImport("libc", SetLastError = true)] private static extern IntPtr realpath(string path, IntPtr resolved);
+    [DllImport("libc")] private static extern void free(IntPtr p);
+    [DllImport("libc", SetLastError = true)] private static extern int lstat(string path, byte[] buf);
+
+    private static string RealPath(string path)
+    {
+        var p = realpath(path, IntPtr.Zero);
+        if (p == IntPtr.Zero)
+            throw new FileNotFoundException($"{path}: errno {Marshal.GetLastPInvokeError()}");
+        try { return Marshal.PtrToStringUTF8(p)!; } finally { free(p); }
+    }
+
+    // macOS arm64 struct stat: 144 bytes; st_mode is a uint16 at offset 4,
+    // st_uid a uint32 at offset 16.
+    private static (uint uid, int mode) LStat(string path)
+    {
+        var buf = new byte[144];
+        if (lstat(path, buf) != 0)
+            throw new IOException($"{path}: errno {Marshal.GetLastPInvokeError()}");
+        return (BitConverter.ToUInt32(buf, 16), BitConverter.ToUInt16(buf, 4));
+    }
+
+    private const string CF = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+    private const string Sec = "/System/Library/Frameworks/Security.framework/Security";
+    private const uint kCFStringEncodingUTF8 = 0x08000100;
+    private const uint kSecCSCheckAllArchitectures = 1 << 0;
+    private const uint kSecCSCheckNestedCode = 1 << 3;
+    private const uint kSecCSStrictValidate = 1 << 4;
+
+    [DllImport(CF)] private static extern IntPtr CFStringCreateWithCString(IntPtr alloc, string s, uint encoding);
+    [DllImport(CF)] private static extern IntPtr CFURLCreateWithFileSystemPath(IntPtr alloc, IntPtr path, long style, byte isDir);
+    [DllImport(CF)] private static extern void CFRelease(IntPtr cf);
+    [DllImport(Sec)] private static extern int SecStaticCodeCreateWithPath(IntPtr url, uint flags, out IntPtr code);
+    [DllImport(Sec)] private static extern int SecRequirementCreateWithString(IntPtr text, uint flags, out IntPtr req);
+    [DllImport(Sec)] private static extern int SecStaticCodeCheckValidity(IntPtr code, uint flags, IntPtr req);
+
+    private static void CheckSignature(string path, string requirement)
+    {
+        IntPtr cfPath = IntPtr.Zero, url = IntPtr.Zero, cfReq = IntPtr.Zero, code = IntPtr.Zero, req = IntPtr.Zero;
+        try
+        {
+            cfPath = CFStringCreateWithCString(IntPtr.Zero, path, kCFStringEncodingUTF8);
+            url = CFURLCreateWithFileSystemPath(IntPtr.Zero, cfPath, 0 /* POSIX */, 0);
+            cfReq = CFStringCreateWithCString(IntPtr.Zero, requirement, kCFStringEncodingUTF8);
+            int status = SecStaticCodeCreateWithPath(url, 0, out code);
+            if (status == 0) status = SecRequirementCreateWithString(cfReq, 0, out req);
+            if (status == 0) status = SecStaticCodeCheckValidity(code,
+                kSecCSCheckAllArchitectures | kSecCSStrictValidate | kSecCSCheckNestedCode, req);
+            if (status != 0)
+                throw new InvalidOperationException($"{path} failed its code-signature check (OSStatus {status}); refusing to load it");
+        }
+        finally
+        {
+            foreach (var cf in new[] { req, code, cfReq, url, cfPath })
+                if (cf != IntPtr.Zero) CFRelease(cf);
+        }
+    }
+}
+```
+
+**Other languages.** Python, Node and Java make the same checks before
+loading; the signature check can run `/usr/bin/codesign` with the
+requirement (it exits non-zero if the requirement isn't met):
+
+```sh
+/usr/bin/codesign --verify --strict -R='=identifier "libhkdfguard" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "MFW3T8R8J3"' \
+    "/Library/Application Support/HkdfGuard/v1/libhkdfguard.dylib"
+```
+
+The Python example below shows all three checks; the Node and Java
+examples load the same absolute path, after the same checks.
 
 ## Consuming this library
 
@@ -1081,11 +1302,36 @@ prompt at all. It is not required.
 **Python** (`ctypes`, standard library):
 
 ```python
-import ctypes
+import ctypes, os, stat, subprocess
 
-lib = ctypes.CDLL("./libhkdfguard.dylib")
+HKDFGUARD_DYLIB = "/Library/Application Support/HkdfGuard/v1/libhkdfguard.dylib"
+HKDFGUARD_REQUIREMENT = (
+    'identifier "libhkdfguard" and anchor apple generic'
+    ' and certificate 1[field.1.2.840.113635.100.6.2.6] exists'
+    ' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+    ' and certificate leaf[subject.OU] = "MFW3T8R8J3"'
+)
+
+def load_hkdfguard():
+    """Loads the installed library after re-checking what the package guarantees."""
+    if os.path.realpath(HKDFGUARD_DYLIB) != HKDFGUARD_DYLIB:
+        raise RuntimeError(f"{HKDFGUARD_DYLIB} is reached through a symlink")
+    p = HKDFGUARD_DYLIB
+    while True:
+        st = os.lstat(p)
+        if st.st_uid != 0 or st.st_mode & 0o022 or stat.S_ISLNK(st.st_mode):
+            raise RuntimeError(f"{p} is not root-owned and writable by root alone")
+        if p == "/":
+            break
+        p = os.path.dirname(p)
+    subprocess.run(["/usr/bin/codesign", "--verify", "--strict",
+                    "-R", "=" + HKDFGUARD_REQUIREMENT, HKDFGUARD_DYLIB],
+                   check=True, capture_output=True)
+    return ctypes.CDLL(HKDFGUARD_DYLIB)
+
+lib = load_hkdfguard()
 lib.hkdfguard_create_kek.argtypes = [ctypes.c_char_p]
-lib.hkdfguard_create_kek.restype = ctypes.c_int32
+lib.hkdfguard_create_kek.restype = ctypes.c_int
 
 status = lib.hkdfguard_create_kek(b"com.example.ingest")
 ```
@@ -1094,7 +1340,8 @@ status = lib.hkdfguard_create_kek(b"com.example.ingest")
 
 ```js
 const koffi = require("koffi");
-const lib = koffi.load("./libhkdfguard.dylib");
+// After the path, owner and signature checks above:
+const lib = koffi.load("/Library/Application Support/HkdfGuard/v1/libhkdfguard.dylib");
 const hkdfguard_create_kek = lib.func("int hkdfguard_create_kek(const char *service)");
 
 const status = hkdfguard_create_kek("com.example.ingest");
@@ -1104,24 +1351,33 @@ const status = hkdfguard_create_kek("com.example.ingest");
 
 ```java
 public interface HkdfGuard extends Library {
-    HkdfGuard INSTANCE = Native.load("./libhkdfguard.dylib", HkdfGuard.class);
+    // After the path, owner and signature checks above:
+    HkdfGuard INSTANCE = Native.load("/Library/Application Support/HkdfGuard/v1/libhkdfguard.dylib", HkdfGuard.class);
     int hkdfguard_create_kek(String service);
 }
 
 int status = HkdfGuard.INSTANCE.hkdfguard_create_kek("com.example.ingest");
 ```
 
-**Go** (`cgo`, needs the header at build time):
+**Go** (`cgo`, built against the installed header and library):
 
 ```go
 /*
-#cgo LDFLAGS: -L${SRCDIR} -lhkdfguard
+#cgo CFLAGS: "-I/Library/Application Support/HkdfGuard/v1"
+#cgo LDFLAGS: "-L/Library/Application Support/HkdfGuard/v1" -lhkdfguard "-Wl,-rpath,/Library/Application Support/HkdfGuard/v1"
 #include "hkdfguard.h"
 */
 import "C"
 
 status := C.hkdfguard_create_kek(C.CString("com.example.ingest"))
 ```
+
+The binary's only search path for the library is then the root-owned
+install folder (check with `otool -l`: one `LC_RPATH`). dyld loads the
+library at launch, before any of the program's code runs, so the program
+can't check the signature first; the root-owned folder chain is what
+protects it. Run the `codesign` check above when deploying, or load the
+library with `dlopen` after the checks instead of linking it.
 
 (A `cgo`-free option exists too: [`purego`](https://github.com/ebitengine/purego)
 `dlopen`s the dylib and calls it by symbol name, like the other
@@ -1167,14 +1423,18 @@ name; the ABI's major version is carried by the install folder
 
 ## Concurrency
 
-- `hkdfguard_create_kek` and `hkdfguard_kek_exists` are setup calls, meant
-  to run once per application startup. Each takes at least 1000 ms of
+- `hkdfguard_create_kek`, `hkdfguard_kek_exists` and (macOS-only)
+  `hkdfguard_kek_fingerprint` are setup calls, meant to run once per
+  application startup. Each takes at least 1000 ms of
   wall-clock time whatever its outcome, and they are serialized with each
   other across threads, so a process can make at most about one per
   second -- the same floor as the Linux and Windows builds. On macOS it is
   fixed (Linux reads `startup_behavior.setup_min_delay_ms` from its policy
   file, Windows `HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs`).
-  A NULL pointer or an invalid service name returns immediately. Call them
+  A NULL pointer, an invalid service name, or `kek_fingerprint`'s size
+  probe returns immediately. `kek_fingerprint` is gated because "found" and
+  "not found" tell a caller which services have a KEK, the same thing
+  `kek_exists` does. Call them
   once at startup, then use `hkdfguard_wrap_dek` / `hkdfguard_unwrap_dek`,
   which are not gated.
 - `hkdfguard_create_kek` is safe under concurrent first use: the keychain's
