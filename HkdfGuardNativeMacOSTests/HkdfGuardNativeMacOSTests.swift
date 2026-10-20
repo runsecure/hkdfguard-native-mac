@@ -1367,7 +1367,7 @@ struct HkdfGuardCrossPlatformABITests {
     static let linuxMissing = Comment(rawValue: "hkdfguard-native-linux is not checked out next to this repository")
 
     /// The functions only this platform exports, as its header documents.
-    static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_kek_fingerprint"]
+    static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_machine_policy"]
 
     static func read(_ url: URL) throws -> String {
         try String(contentsOf: url, encoding: .utf8)
@@ -1559,6 +1559,7 @@ struct HkdfGuardAuditTests {
         let cases: [(code: Int32, event: Int, severity: String)] = [
             (-18, 2000, "warning"),   // KEK_ACCESS_DENIED
             (-19, 2002, "error"),     // KEK_INVALID
+            (-9, 2004, "error"),      // POLICY_INVALID
             (-3, 2005, "error"),      // PROVIDER_UNAVAILABLE
             (-5, 2005, "error"),      // CRYPTO_ERROR
             (-6, 2005, "error"),      // INTERNAL_ERROR

@@ -97,6 +97,14 @@
 // file with more than one hard link (the same redirection, through a link
 // O_NOFOLLOW cannot see), a FIFO, a device, or a directory.
 //
+// Production mode (MachineScope.swift): a service the com.hkdfguard policy
+// lists in MachineServices has a machine-scoped KEK -- a root-owned file
+// in /Library/Application Support/HkdfGuard/keks, usable only by
+// LaunchDaemons in its RunnerGroup. For those services `provision` and
+// `retire` need root and the policy's SecurityAdminGroup, `wrap` root and
+// its DeploymentAdminGroup, and provision's and wrap's Secure Enclave work
+// runs in a one-off LaunchDaemon job (`__system-job`, internal).
+//
 // `wrap` creates nothing but the output file, and only after every argument
 // has been validated. `provision` creates nothing until its service name
 // has been validated. A malformed invocation of either never leaves a
@@ -194,6 +202,7 @@ enum HKDFGuardStatus: Int32 {
     case encryptionFailed = -5             // ERR_CRYPTO_ERROR
     case unexpectedOutputLength = -6       // ERR_INTERNAL_ERROR
     case invalidServiceIdentifier = -8     // ERR_INVALID_SERVICE_NAME
+    case policyInvalid = -9                // ERR_POLICY_INVALID
     case payloadMalformed = -10            // ERR_PAYLOAD_MALFORMED
     case decryptionFailed = -11            // ERR_PAYLOAD_AUTH_FAILED
     case unsupportedCiphersuite = -12      // ERR_PAYLOAD_UNSUPPORTED
@@ -225,6 +234,7 @@ enum HKDFGuardStatus: Int32 {
         case .encryptionFailed: return "a cryptographic operation failed"
         case .unexpectedOutputLength: return "internal error: the library produced an unexpected output length"
         case .invalidServiceIdentifier: return "the service name is missing, empty, longer than 128 characters, or contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains \"..\""
+        case .policyInvalid: return "the hkdfguard policy (a managed com.hkdfguard profile, or /Library/Application Support/HkdfGuard/policy.plist) can't be used -- run `\(programName) status` to see why"
         case .payloadMalformed: return "the wrapped payload is malformed"
         case .decryptionFailed: return "decryption failed"
         case .unsupportedCiphersuite: return "the wrapped payload uses a ciphersuite this build does not support"
@@ -312,6 +322,7 @@ enum Command {
     case wrap(WrapArgs)
     case retire(RetireArgs)
     case status(serviceName: String)
+    case systemJob(folder: String) // internal: see MachineScope.swift
     case help
 }
 
@@ -344,8 +355,15 @@ func printUsage() {
                       reports it as corrupt (-19) and the Secure Enclave is proven
                       usable in this session, so a healthy KEK that merely could not
                       be loaded right now is never mistaken for a corrupt one.
-          status      report the keychain mode, whether a KEK exists for <name>, and
-                      its fingerprint. Read-only: never creates or deletes anything.
+          status      report the KEK's scope (and keychain mode), whether it exists,
+                      and its fingerprint. Read-only: never creates or deletes anything.
+
+        Production mode: when a com.hkdfguard policy (an MDM profile, or
+        /Library/Application Support/HkdfGuard/policy.plist) lists <name> in
+        MachineServices, its KEK is machine-scoped. provision and retire then need
+        sudo and SecurityAdminGroup, wrap needs sudo and DeploymentAdminGroup, and
+        only LaunchDaemons running as members of the service's RunnerGroup can
+        unwrap. Unlisted services, and every service with no policy, are as above.
 
         wrap options (exactly one DEK source is required):
           --key-file-path|-kf <path>  where to write the wrapped payload
@@ -421,6 +439,13 @@ func parseArgs(_ arguments: [String]) throws -> Command {
     }
     let command = rest.removeFirst()
     switch command {
+    case "__system-job":
+        // Internal: the LaunchDaemon side of a machine-scoped provision or
+        // wrap. Never in the usage; refuses to run except as root.
+        guard rest.count == 1 else {
+            throw CLIError("__system-job is internal to \(programName)")
+        }
+        return .systemJob(folder: rest[0])
     case "--help", "-h", "help":
         return .help
     case "provision":
@@ -1870,6 +1895,11 @@ func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [
 
 func runProvision(_ args: ProvisionArgs) throws {
     try validateServiceCharset(args.serviceName)
+    let policy = try loadPolicy()
+    if policy.isMachineScoped(args.serviceName) {
+        try runProvisionMachine(service: args.serviceName.lowercased(), policy: policy)
+        return
+    }
     let created = try provisionKEK(service: args.serviceName)
     let (status, fingerprint) = readKekFingerprint(service: args.serviceName)
     guard status == HKDFGuardStatus.success.rawValue else {
@@ -1892,9 +1922,15 @@ func runRetire(_ args: RetireArgs) throws {
     try validateServiceCharset(args.serviceName)
     // Validated as ASCII above, so this is the exact form the library stores.
     let service = args.serviceName.lowercased()
+    let policy = try loadPolicy()
+    if policy.isMachineScoped(service) {
+        try runRetireMachine(service: service, confirmation: args.confirmation, policy: policy)
+        return
+    }
     switch args.confirmation {
     case .fingerprint(let fingerprint):
         try retireKEK(service: service, expectedFingerprint: fingerprint)
+        auditKekRetired(service: service, fingerprint: fingerprint, scope: keychainModeName())
         print("retired KEK for service \"\(service)\" (fingerprint \(hexString(fingerprint)), keychain: \(keychainModeName()))")
         print("every payload wrapped under it is now permanently unrecoverable")
     case .corrupt:
@@ -1909,8 +1945,16 @@ func runRetire(_ args: RetireArgs) throws {
 func runStatus(serviceName: String) throws {
     try validateServiceCharset(serviceName)
     let service = serviceName.lowercased()
+    let policy = try loadPolicy()
     print("service: \(service)")
-    print("keychain: \(keychainModeName())")
+    if policy.isMachineScoped(service) {
+        print("scope: machine (policy \(policy.source ?? "?"))")
+        print("kek file: \(policy.keyFilePath(service))")
+        print("runner group: \(policy.runnerGroup(service) ?? "(none: root only)")")
+    } else {
+        print("scope: user\(policy.production ? " (production policy \(policy.source ?? "?") does not list this service)" : "")")
+        print("keychain: \(keychainModeName())")
+    }
 
     let (status, exists) = kekExistsStatus(service: service)
     switch status {
@@ -1924,7 +1968,7 @@ func runStatus(serviceName: String) throws {
     case HKDFGuardStatus.success.rawValue:
         print("kek: absent")
     case HKDFGuardStatus.kekCorrupted.rawValue:
-        print("kek: corrupt (present but not reconstructable; see retire --corrupt)")
+        print("kek: corrupt (present but not reconstructable, or a machine KEK file root doesn't control; see retire --corrupt)")
     default:
         throw CLIError("could not determine the KEK state for service \"\(service)\": \(describeStatus(status))")
     }
@@ -1961,9 +2005,19 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // any DEK is read.
     try validateServiceCharset(args.serviceName)
 
+    // A machine-scoped service: the deployment admin's role, checked before
+    // the DEK is read; and the key file goes, by default, to the runner
+    // group whose daemons unwrap it.
+    let policy = try loadPolicy()
+    let machine = policy.isMachineScoped(args.serviceName)
+    if machine {
+        try requireAdminRole(.deployment, policy: policy, service: args.serviceName.lowercased(), command: "wrap")
+    }
+
     // Resolved before the DEK is read or the Secure Enclave is used, so a
-    // bad --group fails fast and costs nothing. Without --group: owner-only.
-    let group = try args.groupName.map(resolveKeyFileGroup)
+    // bad --group fails fast and costs nothing. Without --group: owner-only
+    // (for a machine-scoped service, its RunnerGroup if it has one).
+    let group = try (args.groupName ?? (machine ? policy.runnerGroup(args.serviceName) : nil)).map(resolveKeyFileGroup)
 
     // `wrap` never checks for or creates a KEK -- hkdfguard_kek_exists and
     // hkdfguard_create_kek belong to the `provision` command alone. With no
@@ -1975,7 +2029,9 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // returns the wrapped form -- before the potentially slow --force
     // secure overwrite and the file write below.
     let wrapped = try withSuppliedDek(args.dekSource) { dek in
-        try wrapDek(service: args.serviceName, dek: dek)
+        machine
+            ? try wrapDekInSystemContext(service: args.serviceName.lowercased(), dek: dek)
+            : try wrapDek(service: args.serviceName, dek: dek)
     }
 
     // The KEK this payload was actually sealed to, as the library embedded
@@ -2000,8 +2056,88 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
 
     // The Linux tool's wording for who can read it.
     let access = group.map { "owner read/write + \($0.name) read-only" } ?? "owner read/write"
-    print("wrapped key written to \(spelledArgs.keyFilePath) (\(wrapped.count) bytes, \(access), service \"\(args.serviceName)\", keychain: \(keychainModeName()))")
+    print("wrapped key written to \(spelledArgs.keyFilePath) (\(wrapped.count) bytes, \(access), service \"\(args.serviceName)\", \(machine ? "scope: machine" : "keychain: \(keychainModeName())"))")
     print("fingerprint: \(hexString(usedFingerprint))\(args.expectedFingerprint == nil ? " -- confirm it matches the one recorded when this service was provisioned" : " (confirmed)")")
+}
+
+// MARK: - Machine-scoped services (production mode; see MachineScope.swift)
+
+// `provision` for a machine-scoped service: the security admin, as root;
+// the KEK itself is created by a one-off LaunchDaemon job, since one made
+// from this (login) session would be unusable by the service's daemons.
+func runProvisionMachine(service: String, policy: CLIPolicy) throws {
+    try requireAdminRole(.security, policy: policy, service: service, command: "provision")
+    let (existsStatus, existed) = kekExistsStatus(service: service)
+    guard existsStatus == HKDFGuardStatus.success.rawValue else {
+        throw CLIError("can't check for an existing machine KEK for service \"\(service)\": \(describeStatus(existsStatus))")
+    }
+    let result = try runSystemJob(.provision, service: service)
+    guard result.status == HKDFGuardStatus.success.rawValue else {
+        throw CLIError("creating the machine KEK for service \"\(service)\" failed: \(describeStatus(result.status)) (details: `log show --last 5m --predicate 'subsystem == \"com.hkdfguard\"'`)")
+    }
+    let (status, fingerprint) = readKekFingerprint(service: service)
+    guard status == HKDFGuardStatus.success.rawValue else {
+        throw CLIError("the machine KEK for service \"\(service)\" exists but its fingerprint could not be read: \(describeStatus(status))")
+    }
+    let group = policy.runnerGroup(service) ?? "(none: root only)"
+    if existed {
+        print("machine KEK already provisioned for service \"\(service)\"; verified, nothing to do (runner group: \(group))")
+        print("fingerprint: \(hexString(fingerprint)) -- confirm it matches the one recorded when this service was provisioned")
+    } else {
+        print("machine KEK provisioned for service \"\(service)\" at \(policy.keyFilePath(service)) (runner group: \(group))")
+        print("fingerprint: \(hexString(fingerprint)) -- record this; retire requires it")
+    }
+}
+
+// `retire` for a machine-scoped service: the security admin, as root.
+// Deletes the KEK file; nothing else holds the key.
+func runRetireMachine(service: String, confirmation: RetireConfirmation, policy: CLIPolicy) throws {
+    try requireAdminRole(.security, policy: policy, service: service, command: "retire")
+    switch confirmation {
+    case .fingerprint(let expected):
+        let (status, current) = readKekFingerprint(service: service)
+        switch status {
+        case HKDFGuardStatus.success.rawValue:
+            break
+        case HKDFGuardStatus.kekNotFound.rawValue:
+            throw CLIError("no machine KEK exists for service \"\(service)\"; nothing to retire")
+        case HKDFGuardStatus.kekCorrupted.rawValue:
+            throw CLIError("the machine KEK file for service \"\(service)\" is not one this library wrote, or root doesn't control it; if it is genuinely corrupt, retire it with --corrupt")
+        default:
+            throw CLIError("cannot read the machine KEK's fingerprint for service \"\(service)\": \(describeStatus(status)); refusing to retire a KEK that cannot be confirmed")
+        }
+        guard current == expected else {
+            throw CLIError("fingerprint mismatch for service \"\(service)\": the current machine KEK is \(hexString(current)), not \(hexString(expected)); nothing was deleted")
+        }
+        try deleteMachineKeyFile(policy: policy, service: service)
+        auditKekRetired(service: service, fingerprint: expected, scope: "machine")
+        print("retired machine KEK for service \"\(service)\" (fingerprint \(hexString(expected)))")
+        print("every payload wrapped under it is now permanently unrecoverable")
+    case .corrupt:
+        let (status, _) = kekExistsStatus(service: service)
+        guard status == HKDFGuardStatus.kekCorrupted.rawValue else {
+            throw CLIError(status == HKDFGuardStatus.success.rawValue
+                ? "the machine KEK for service \"\(service)\" is not corrupt (or absent); nothing was deleted -- retire a valid KEK with --fingerprint"
+                : "cannot inspect the machine KEK for service \"\(service)\": \(describeStatus(status)); nothing was deleted")
+        }
+        try deleteMachineKeyFile(policy: policy, service: service)
+        auditKekRetired(service: service, fingerprint: [], scope: "machine")
+        print("retired corrupt machine KEK file for service \"\(service)\"; it can now be provisioned again")
+    }
+}
+
+// `wrap` under a machine KEK: the wrap itself runs in a one-off LaunchDaemon
+// job (only the system context can use the key), the DEK handed over
+// through a FIFO. The caller checked the deployment admin's role.
+func wrapDekInSystemContext(service: String, dek: UnsafeRawBufferPointer) throws -> [UInt8] {
+    let result = try runSystemJob(.wrap, service: service, dek: dek)
+    guard result.status == HKDFGuardStatus.success.rawValue else {
+        if result.status == HKDFGuardStatus.kekNotFound.rawValue {
+            throw CLIError("no machine KEK exists for service \"\(service)\"; a security admin must run `sudo \(programName) provision --service-name \(service)` first")
+        }
+        throw CLIError("hkdfguard_wrap_dek failed in the system job: \(describeStatus(result.status))")
+    }
+    return result.payload
 }
 
 // MARK: - Entry point
@@ -2047,6 +2183,8 @@ do {
         runOrExit { try runRetire(args) }
     case .status(let serviceName):
         runOrExit { try runStatus(serviceName: serviceName) }
+    case .systemJob(let folder):
+        runOrExit { try runSystemJobSide(folder: folder) }
     }
 } catch {
     // An argument-parsing failure: print the error and usage, then exit 2.

@@ -253,18 +253,20 @@ Console.app shows the same records live.
 | 1000 | default | A KEK was created (not merely found). |
 | 1002 | default | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | default | A DEK was unwrapped. |
+| 1004 | error | A KEK was retired by the CLI's `retire` (written by the CLI, category `audit`); names its fingerprint, scope and the admin behind `sudo`. |
 | 2000 | error | `KEK_ACCESS_DENIED`. |
 | 2002 | fault | `KEK_INVALID`. |
 | 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2004 | fault | `POLICY_INVALID`: the production policy can't be used; every call fails closed until it is fixed (see [Production mode](#production-mode-machine-scoped-keks)). |
 | 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
 | 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
 | 2007 | warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` / `hkdfguard_kek_fingerprint` calls (each held to at least 1000 ms; see [Concurrency](#concurrency)). Logged once per process. |
 
 The unified log has no "warning" level, so Linux's info / warning / error
 are `default` / `error` / `fault` here. `default` is the level the log keeps
-on disk by default. Linux's 1001 (a KEK created on a fallback provider) and
-2004 (`POLICY_INVALID`) never occur on macOS: there is one provider, the
-Secure Enclave, and no policy file.
+on disk by default. Linux's 1001 (a KEK created on a fallback provider)
+never occurs on macOS: there is one provider, the Secure Enclave. 2004
+occurs only with a production policy.
 
 Each record is `key=value` fields followed by a sentence:
 
@@ -423,6 +425,7 @@ here are defined there but never returned on macOS.
 | `-5`  | `ERR_CRYPTO_ERROR` | `encryptionFailed` | the RNG failed, the Secure Enclave refused the key agreement (wrap or unwrap), or AES-GCM sealing failed |
 | `-6`  | `ERR_INTERNAL_ERROR` | `unexpectedOutputLength` | an internal failure the library detected: output of an impossible length, or a buffer that should exist not existing (a bug). Linux also returns it for a caught panic; a Swift runtime trap can't be caught, so this library has no force-unwrap, `try!`, `fatalError` or `precondition` on its export paths (a test enforces it), and returns -6 where Linux would have caught one |
 | `-8`  | `ERR_INVALID_SERVICE_NAME` | `invalidServiceIdentifier` | see `service` above |
+| `-9`  | `ERR_POLICY_INVALID` | `policyInvalid` | the production policy can't be used (an unknown setting, a wrong type, not root's, or a runner group that doesn't exist or is too broad); **every** call fails until it is fixed |
 | `-10` | `ERR_PAYLOAD_MALFORMED` | `payloadMalformed` | `wrapped_len != 125` |
 | `-11` | `ERR_PAYLOAD_AUTH_FAILED` | `decryptionFailed` | the AES-GCM tag did not verify: an altered payload, or one wrapped for a different service under the same KEK |
 | `-12` | `ERR_PAYLOAD_UNSUPPORTED` | `unsupportedCiphersuite` | the payload's suite byte is not one this build implements; a newer or different build wrote it. Not tampering |
@@ -513,7 +516,11 @@ hardened runtime, attach a debugger to it.
 
 ## Access policy and headless use
 
-Every KEK is created with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and
+This section describes **user-scoped** KEKs: every KEK with no policy, and
+any service a production policy doesn't list. Machine-scoped KEKs differ;
+see [Production mode](#production-mode-machine-scoped-keks).
+
+Every user-scoped KEK is created with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and
 `privateKeyUsage` only — no user-presence or biometric requirement, so
 using the key never triggers a Touch ID/password prompt. Consequences:
 
@@ -535,7 +542,7 @@ using the key never triggers a Touch ID/password prompt. Consequences:
   does not bridge users; it runs in a different keychain context. No
   administrator rights are needed for any of these operations.
 
-The policy is fixed; there is no per-service override. The library has no
+The access policy of a user-scoped KEK is fixed. The library has no
 delete or rotate API — a service that needs a new KEK adopts a new service
 name — and deletion exists only as the CLI's fingerprint-confirmed
 `retire` command (below), so no process that merely loads the dylib gets a
@@ -555,6 +562,143 @@ has already unwrapped every DEK they could reach. Recover in this order:
 A legacy-mode KEK item can come back if a backup of the login keychain
 taken before retirement is restored onto the same Mac; account for backups
 if the goal is a true crypto-shred.
+
+## Production mode: machine-scoped KEKs
+
+With no policy, every KEK is user-scoped, as above: one person may
+provision, wrap and unwrap. That is **development mode**. A **production
+policy** can make chosen services machine-scoped instead, which separates
+the roles:
+
+| Role | Does | As | Allowed by the policy's |
+|---|---|---|---|
+| Security admin | `provision`, `retire` | `sudo` | `SecurityAdminGroup` |
+| Deployment admin | `wrap` | `sudo` | `DeploymentAdminGroup` |
+| Application runtime | `hkdfguard_open_file` + `hkdfguard_unwrap_dek` | a LaunchDaemon running as a member of the service's `RunnerGroup` | `MachineServices` |
+
+A machine KEK suits a service that runs as a LaunchDaemon: it works logged
+out, at the login window, and after an unattended restart
+(`sudo fdesetup authrestart`), and survives password resets and account
+changes, which a user's keychain does not.
+
+### The policy
+
+On a managed Mac, deliver it as a configuration profile for the preference
+domain **`com.hkdfguard`** (Jamf "Application & Custom Settings", an Intune
+custom profile, and so on), scoped to the device. macOS writes it to
+`/Library/Managed Preferences/com.hkdfguard.plist`. On a Mac without MDM,
+put the same keys in `/Library/Application Support/HkdfGuard/policy.plist`
+(`root:wheel 0644`). The managed one wins when both exist. Either must be
+root's and writable only by root, as must every folder above it.
+
+```xml
+<dict>
+  <key>MachineServices</key>
+  <dict>
+    <key>com.example.orders</key>
+    <dict><key>RunnerGroup</key><string>_orders</string></dict>
+  </dict>
+  <key>SecurityAdminGroup</key><string>secadmins</string>
+  <key>DeploymentAdminGroup</key><string>deployers</string>
+</dict>
+```
+
+The library reads the policy as a file and checks every setting. An
+unknown key (a misspelling, say) or a wrong type makes the policy
+**invalid**, and then every call, for every service, fails with `-9`
+(`POLICY_INVALID`) until it is fixed: a misspelt `MachineServices` must not
+quietly leave a production service user-scoped. `hkdfguard status` prints
+why. Services the policy doesn't list stay user-scoped. Leaving out
+`SecurityAdminGroup` or `DeploymentAdminGroup` lets any admin who can
+`sudo` act in that role.
+
+### The service account and its runner group
+
+Run the service's LaunchDaemon as a dedicated account that cannot log in,
+and make it the only member of the `RunnerGroup`. People must never be
+members: the group is what can read the KEK file.
+
+```sh
+sudo dseditgroup -o create -r "Orders service" _orders
+sudo dscl . -create /Users/_orders UserShell /usr/bin/false   # plus UniqueID, PrimaryGroupID, IsHidden 1, NFSHomeDirectory /var/empty
+sudo dseditgroup -o edit -a _orders -t user _orders
+```
+
+The library refuses a `RunnerGroup` that covers too many accounts (`staff`,
+`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …).
+
+### Provisioning, wrapping and retiring
+
+```sh
+sudo hkdfguard provision -sn com.example.orders            # security admin
+# machine KEK provisioned for service "com.example.orders" at
+#   /Library/Application Support/HkdfGuard/keks/com.example.orders.kek (runner group: _orders)
+# fingerprint: 3f1c…e09a -- record this; retire requires it
+
+printf '%s' "$DEK_B64" | sudo hkdfguard wrap \
+    -kf /Library/Application\ Support/Orders/dek.key -sn com.example.orders \
+    --dek-stdin -fp 3f1c…e09a                               # deployment admin
+
+sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
+```
+
+- **The role is checked against the admin behind `sudo`**: the account that
+  logged in to the session, which `sudo` doesn't change. `sudo` alone isn't
+  enough. A root login is trusted.
+- **The Secure Enclave work runs in a one-off LaunchDaemon job.** The
+  Secure Enclave binds a key to the context it was created in, so a key
+  made from Terminal, `sudo` included, would be unusable by the service's
+  daemons. `provision` and `wrap` hand that step to a short-lived system job
+  running the same `hkdfguard` executable. The DEK goes to it through a FIFO
+  in a root-only folder, so it never touches disk. The job runs only if the
+  `hkdfguard` executable and the library it loaded are root's and writable
+  only by root, which the installed package's are; a build run from a
+  source tree is refused.
+- **`wrap` gives the key file to the `RunnerGroup`** (`0640`) unless
+  `--group` says otherwise, so the daemons can read it.
+- **`retire` deletes the KEK file** after confirming the fingerprint, and
+  writes audit event 1004. Every payload wrapped under it becomes
+  unrecoverable.
+
+### What the runtime can and can't do
+
+The application calls the same functions as always. For a machine-scoped
+service:
+
+- **Only LaunchDaemons can unwrap.** A process in a login session
+  (Terminal, `sudo` from it, a GUI app, SSH) gets `-18`
+  (`KEK_ACCESS_DENIED`). The library refuses those sessions itself, and the
+  Secure Enclave would refuse them anyway: a key created by a daemon can't
+  be used from a login session.
+- **Only root and `RunnerGroup` members can read the KEK file**; anyone else
+  gets `-18`.
+- **The KEK file** is `/Library/Application Support/HkdfGuard/keks/<service>.kek`,
+  `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). It holds the
+  public key and the Secure Enclave key blob, which is usable only by this
+  Mac's Secure Enclave, in the system context, after the first unlock since
+  boot (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). A file that
+  isn't root's, that anyone else can write, that others can read, or that
+  this library didn't write is `-19` (`KEK_INVALID`).
+- **Root is trusted.** Root can read the file and install a LaunchDaemon, so
+  an admin who can `sudo` can ultimately use the key, as with every secret
+  store on macOS. If admins reaching a Mac over SSH is a concern, turn off
+  Remote Login through MDM, and forward the `com.hkdfguard` log to your SIEM.
+
+### Verifying it on a Mac
+
+`scripts/verify-machine-scope.sh` runs the whole flow against this repo's
+builds, as root:
+- provisioning, with both role refusals;
+- wrapping in the system job;
+- a `nobody` LaunchDaemon unwrapping, while root in Terminal and an account
+  outside the group are refused;
+- `retire`.
+
+It cleans up after itself, and refuses to run where a real policy exists.
+
+```sh
+sudo bash scripts/verify-machine-scope.sh
+```
 
 ## Command-line tool: `hkdfguard`
 
@@ -1088,8 +1232,10 @@ sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
 ```
 
 Removes `v1/`, the `PATH` symlink (only if it still points at this CLI), and
-the package receipt. **KEKs are not touched**: they live in each user's
-keychain, not in the install folder. Retire any that should go *before*
+the package receipt. **KEKs are not touched**: user-scoped ones live in each
+user's keychain, and machine-scoped ones in
+`/Library/Application Support/HkdfGuard/keks`, outside `v1/`, as does a local
+`policy.plist`. Retire any that should go *before*
 uninstalling, while the CLI still exists (see `retire` above).
 
 ### Why this location

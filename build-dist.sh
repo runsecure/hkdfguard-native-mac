@@ -41,6 +41,14 @@
 # timestamp server: this script needs network access to complete.
 set -euo pipefail
 
+# Signing needs this user's login keychain, which root can't use: under sudo,
+# codesign fails with errSecInternalComponent and root-owned files are left
+# in the build folders. Run as yourself; nothing here needs root.
+if [ "$(/usr/bin/id -u)" -eq 0 ]; then
+    echo "error: don't run $(basename "$0") with sudo -- run it as yourself; nothing here needs root" >&2
+    exit 1
+fi
+
 # This script signs what every machine will trust; don't let the caller's
 # environment decide which codesign/xcodebuild/swift/security/curl it runs.
 # PATH is pinned to the system folders. TOOLCHAINS (an alternate Swift

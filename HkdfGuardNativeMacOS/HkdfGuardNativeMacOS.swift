@@ -244,6 +244,12 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     case unexpectedOutputLength = -6
     /// HKDFGUARD_ERR_INVALID_SERVICE_NAME
     case invalidServiceIdentifier = -8
+    /// HKDFGUARD_ERR_POLICY_INVALID: the production policy (a managed
+    /// `com.hkdfguard` profile, or the local policy file) can't be used --
+    /// an unknown setting, a wrong type, insecure ownership, or a runner
+    /// group that doesn't exist or is too broad. Every call fails closed
+    /// until it is fixed, as on Linux.
+    case policyInvalid = -9
 
     // MARK: Wrapped payload
 
@@ -415,6 +421,7 @@ extension HKDFGuardStatus {
         case .encryptionFailed: return "ERR_CRYPTO_ERROR"
         case .unexpectedOutputLength: return "ERR_INTERNAL_ERROR"
         case .invalidServiceIdentifier: return "ERR_INVALID_SERVICE_NAME"
+        case .policyInvalid: return "ERR_POLICY_INVALID"
         case .payloadMalformed: return "ERR_PAYLOAD_MALFORMED"
         case .decryptionFailed: return "ERR_PAYLOAD_AUTH_FAILED"
         case .unsupportedCiphersuite: return "ERR_PAYLOAD_UNSUPPORTED"
@@ -653,8 +660,14 @@ func reconstructKEK(
 /// and used once. Nothing is stored. Only run when a stored blob has
 /// already failed to load, so a healthy KEK never pays for it.
 func secureEnclaveIsUsableNow() -> Bool {
+    enclaveProbeSucceeds(makeAccessControl())
+}
+
+/// The probe itself, under `access` -- the user-scoped KEKs' policy above,
+/// or the machine KEKs'.
+private func enclaveProbeSucceeds(_ access: SecAccessControl?) -> Bool {
     guard SecureEnclave.isAvailable,
-          let access = makeAccessControl(),
+          let access,
           let probe = try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access) else {
         return false
     }
@@ -691,6 +704,15 @@ func kekExists(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (
         return (HKDFGuardStatus.enclaveUnavailable.rawValue, false)
     }
 
+    switch kekScope(service: service) {
+    case .policyInvalid:
+        return (HKDFGuardStatus.policyInvalid.rawValue, false)
+    case .machine:
+        return machineKekExists(service: service)
+    case .user:
+        break
+    }
+
     switch loadKEKDataRepresentation(service: service, mode: mode) {
     case .notFound:
         return (HKDFGuardStatus.success.rawValue, false)
@@ -725,6 +747,15 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
     // Secure Enclave must exist.
     guard SecureEnclave.isAvailable else {
         return HKDFGuardStatus.enclaveUnavailable.rawValue
+    }
+
+    switch kekScope(service: service) {
+    case .policyInvalid:
+        return HKDFGuardStatus.policyInvalid.rawValue
+    case .machine(let settings):
+        return createMachineKEK(service: service, settings: settings)
+    case .user:
+        break
     }
 
     // Existing key? Only a definite "not found" may proceed to create one:
@@ -856,6 +887,15 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
         return (HKDFGuardStatus.enclaveUnavailable.rawValue, nil)
     }
 
+    switch kekScope(service: service) {
+    case .policyInvalid:
+        return (HKDFGuardStatus.policyInvalid.rawValue, nil)
+    case .machine:
+        return getMachineKEK(service: service)
+    case .user:
+        break
+    }
+
     switch loadKEKDataRepresentation(service: service, mode: mode) {
     case .notFound:
         return (HKDFGuardStatus.kekNotFound.rawValue, nil)
@@ -887,6 +927,657 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
 /// `wrapDekCore`), so the derived key and the tag commit to it too.
 func kekFingerprint(_ publicKey: P256.KeyAgreement.PublicKey) -> Data {
     Data(SHA256.hash(data: publicKey.x963Representation))
+}
+
+// MARK: - Machine scope (production mode)
+//
+// With no policy -- development mode -- every KEK is user-scoped, as above.
+// A production policy can name services whose KEK is machine-scoped
+// instead: created by root in the system context (a LaunchDaemon, never a
+// login session), kept as a root-owned file its service's runner group may
+// read, and usable only by LaunchDaemons. The Secure Enclave binds a key to
+// the context it was created in: one created from Terminal -- `sudo`
+// included -- is unusable by daemons, and one created by a daemon is
+// unusable from any login session. So a machine KEK serves services that
+// run as LaunchDaemons, survives logouts, password resets and reboots
+// (AfterFirstUnlock), and can't be used from Terminal or over SSH.
+
+private let machineLog = Logger(subsystem: "com.hkdfguard", category: "machine")
+
+/// The device-level managed preferences macOS writes for an MDM
+/// configuration profile with the `com.hkdfguard` preference domain.
+let managedPolicyFilePath = "/Library/Managed Preferences/com.hkdfguard.plist"
+/// The policy on a Mac without MDM. Ignored when a managed one exists.
+let localPolicyFilePath = "/Library/Application Support/HkdfGuard/policy.plist"
+/// One file per machine-scoped service: `<service>.kek`.
+let machineKeyFolderPath = "/Library/Application Support/HkdfGuard/keks"
+private let machinePolicyMaxSize = 64 * 1024
+
+/// A machine-scoped service's settings.
+struct MachineServiceSettings: Equatable {
+    /// The group whose members -- the service accounts its LaunchDaemons
+    /// run as -- may read its KEK file. nil: root only.
+    var runnerGroup: String?
+}
+
+struct MachinePolicy: Equatable {
+    var source: String
+    /// Who may provision and retire machine KEKs (the CLI checks it).
+    var securityAdminGroup: String?
+    /// Who may wrap DEKs under them (the CLI checks it).
+    var deploymentAdminGroup: String?
+    /// Normalized (lowercase) service name -> its settings.
+    var machineServices: [String: MachineServiceSettings]
+}
+
+enum PolicyLoad: Equatable {
+    case none                  // development mode
+    case loaded(MachinePolicy) // production mode
+    case invalid(String)       // every call fails closed with POLICY_INVALID
+}
+
+/// Test-only overrides of where the policy and the machine KEKs come
+/// from. `nil` (the default, and always in production) reads the real
+/// ones. Task-local, so a test's override applies to its own calls only,
+/// never to a suite running alongside it; internal, so only `@testable
+/// import` can reach them -- never part of the C ABI.
+enum MachineScopeTestOverrides {
+    @TaskLocal static var policy: PolicyLoad?
+    @TaskLocal static var keyFolder: String?
+}
+
+private struct PolicyError: Error {
+    let reason: String
+}
+
+/// A local or directory group name: ASCII letters, digits, `_`, `-`, `.`.
+func validGroupName(_ name: String) -> Bool {
+    let bytes = Array(name.utf8)
+    guard !bytes.isEmpty, bytes.count <= 255, bytes.first != UInt8(ascii: "-") else {
+        return false
+    }
+    return bytes.allSatisfy { byte in
+        (0x30...0x39).contains(byte) || (0x41...0x5A).contains(byte) || (0x61...0x7A).contains(byte)
+            || byte == UInt8(ascii: "_") || byte == UInt8(ascii: "-") || byte == UInt8(ascii: ".")
+    }
+}
+
+/// Validates and parses a policy's settings. Strict: an unknown setting or
+/// a wrong type makes the whole policy invalid, never ignored -- a
+/// misspelt `MachineServices` would otherwise leave a production service
+/// quietly user-scoped.
+func parseMachinePolicy(_ values: [String: Any], source: String) -> PolicyLoad {
+    func group(_ value: Any?, _ setting: String) throws -> String? {
+        guard let value else {
+            return nil
+        }
+        guard let name = value as? String, validGroupName(name) else {
+            throw PolicyError(reason: "\(setting) must be a group name")
+        }
+        return name
+    }
+    do {
+        let known: Set<String> = ["MachineServices", "SecurityAdminGroup", "DeploymentAdminGroup"]
+        if let unknown = Set(values.keys).subtracting(known).sorted().first {
+            throw PolicyError(reason: "unknown setting \"\(unknown)\"")
+        }
+        var services: [String: MachineServiceSettings] = [:]
+        if let raw = values["MachineServices"] {
+            guard let table = raw as? [String: Any] else {
+                throw PolicyError(reason: "MachineServices must be a dictionary keyed by service name")
+            }
+            for name in table.keys.sorted() {
+                guard validServiceName(service: name) else {
+                    throw PolicyError(reason: "MachineServices: \"\(name)\" is not a valid service name")
+                }
+                let service = String(decoding: name.utf8.map { (0x41...0x5A).contains($0) ? $0 + 0x20 : $0 }, as: UTF8.self)
+                guard let settings = table[name] as? [String: Any] else {
+                    throw PolicyError(reason: "MachineServices.\(name) must be a dictionary")
+                }
+                if let unknown = Set(settings.keys).subtracting(["RunnerGroup"]).sorted().first {
+                    throw PolicyError(reason: "MachineServices.\(name): unknown setting \"\(unknown)\"")
+                }
+                guard services[service] == nil else {
+                    throw PolicyError(reason: "MachineServices names \"\(service)\" twice (service names are case-insensitive)")
+                }
+                services[service] = MachineServiceSettings(
+                    runnerGroup: try group(settings["RunnerGroup"], "MachineServices.\(name).RunnerGroup"))
+            }
+        }
+        return .loaded(MachinePolicy(
+            source: source,
+            securityAdminGroup: try group(values["SecurityAdminGroup"], "SecurityAdminGroup"),
+            deploymentAdminGroup: try group(values["DeploymentAdminGroup"], "DeploymentAdminGroup"),
+            machineServices: services))
+    } catch let error as PolicyError {
+        return .invalid("\(source): \(error.reason)")
+    } catch {
+        return .invalid("\(source): \(error)")
+    }
+}
+
+/// Reads all of `fd`, refusing more than `limit` bytes. nil on a read
+/// error or an oversized file.
+private func readAll(fd: Int32, limit: Int) -> Data? {
+    var data = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    defer { secureZero(&buffer) }
+    while data.count <= limit {
+        let count = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+        if count < 0 {
+            if errno == EINTR {
+                continue
+            }
+            return nil
+        }
+        if count == 0 {
+            return data
+        }
+        data.append(contentsOf: buffer[0..<count])
+    }
+    return nil
+}
+
+/// The policy at `path`, read as a file rather than through CFPreferences
+/// so that every setting in it is seen and validated. nil when there is
+/// no such file. It, and every folder above it, must be root's and
+/// writable by root alone -- as Linux requires of its policy.
+func loadPolicyFile(atPath path: String) -> PolicyLoad? {
+    let url = URL(fileURLWithPath: path)
+    let folderFd = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard folderFd >= 0 else {
+        let code = errno
+        return code == ENOENT ? nil : .invalid("\(path): its folder can't be opened (\(String(cString: strerror(code))))")
+    }
+    defer { close(folderFd) }
+    let fd = openat(folderFd, url.lastPathComponent, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else {
+        let code = errno
+        return code == ENOENT ? nil : .invalid("\(path) can't be opened (\(String(cString: strerror(code))))")
+    }
+    defer { close(fd) }
+    guard keyFileFoldersAreTrusted(folderFd: folderFd, rootOnly: true) else {
+        return .invalid("\(path): a folder above it is not root's, or others can write it")
+    }
+    var info = stat()
+    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+        return .invalid("\(path) is not a regular file")
+    }
+    guard info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0,
+          !onVolumeIgnoringOwnership(fd),
+          !aclGrantsOthersAChange(fd: fd, isFolder: false, rootOnly: true) else {
+        return .invalid("\(path) must be owned by root and writable by root alone")
+    }
+    guard info.st_size <= off_t(machinePolicyMaxSize), let data = readAll(fd: fd, limit: machinePolicyMaxSize) else {
+        return .invalid("\(path) is larger than \(machinePolicyMaxSize) bytes, or can't be read")
+    }
+    guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+          let values = plist as? [String: Any] else {
+        return .invalid("\(path) is not a property list dictionary")
+    }
+    return parseMachinePolicy(values, source: path)
+}
+
+/// The policy in effect: the managed one if MDM delivered it, else the
+/// local file, else none (development mode). Read on every call, so a
+/// changed profile takes effect without restarting anything.
+func currentMachinePolicy() -> PolicyLoad {
+    if let forced = MachineScopeTestOverrides.policy {
+        return forced
+    }
+    if let managed = loadPolicyFile(atPath: managedPolicyFilePath) {
+        return managed
+    }
+    return loadPolicyFile(atPath: localPolicyFilePath) ?? .none
+}
+
+/// Where a service's KEK lives.
+enum KEKScope: Equatable {
+    case user
+    case machine(MachineServiceSettings)
+    /// The policy can't be used: every call fails closed, whatever the
+    /// service, until it is fixed -- as on Linux.
+    case policyInvalid
+}
+
+func kekScope(service: String) -> KEKScope {
+    switch currentMachinePolicy() {
+    case .none:
+        return .user
+    case .invalid(let reason):
+        machineLog.error("hkdfguard policy invalid, every call fails closed until it is fixed: \(reason, privacy: .public)")
+        return .policyInvalid
+    case .loaded(let policy):
+        return policy.machineServices[service].map { .machine($0) } ?? .user
+    }
+}
+
+/// Whether this process runs outside every login session: a LaunchDaemon,
+/// or a process one started -- not Terminal, `sudo` from it, SSH, or a GUI
+/// app. Judged from the process's audit session, which every process of a
+/// login session shares and none can leave: one with graphic, terminal,
+/// remote or console access is a login session. The Secure Enclave binds a
+/// key to the context it was created in, so a machine KEK must be created
+/// here to be usable by daemons, and is refused here first anywhere else.
+func runningInSystemContext() -> Bool {
+    var info = auditinfo_addr_t()
+    guard getaudit_addr(&info, Int32(MemoryLayout<auditinfo_addr_t>.size)) == 0 else {
+        return false
+    }
+    // AU_SESSION_FLAG_HAS_GRAPHIC_ACCESS | _HAS_TTY | _IS_REMOTE | _HAS_CONSOLE_ACCESS
+    let loginSessionFlags: UInt64 = 0x0010 | 0x0020 | 0x1000 | 0x2000
+    return UInt64(info.ai_flags) & loginSessionFlags == 0
+}
+
+// The machine KEK file: magic "HKGK", format 1, the KEK's public key
+// (uncompressed x963, 65 bytes) -- so its fingerprint can be read without
+// the Secure Enclave, by `status` and `retire` -- then the Secure Enclave
+// blob, length-prefixed (big-endian u16). The blob is usable only by this
+// Mac's Secure Enclave, in the system context.
+private let machineKeyMagic = Data("HKGK".utf8)
+private let machineKeyFormatVersion: UInt8 = 1
+private let machineKeyPublicKeyLength = 65
+private let machineKeyHeaderLength = 4 + 1 + 65 + 2
+private let machineKeyMaxSize = 4096
+
+struct MachineKeyFile: Equatable {
+    var publicKey: Data
+    var blob: Data
+}
+
+func encodeMachineKeyFile(_ file: MachineKeyFile) -> Data? {
+    guard file.publicKey.count == machineKeyPublicKeyLength, !file.blob.isEmpty,
+          machineKeyHeaderLength + file.blob.count <= machineKeyMaxSize else {
+        return nil
+    }
+    var out = machineKeyMagic
+    out.append(machineKeyFormatVersion)
+    out.append(file.publicKey)
+    out.append(UInt8(file.blob.count >> 8))
+    out.append(UInt8(file.blob.count & 0xFF))
+    out.append(file.blob)
+    return out
+}
+
+func decodeMachineKeyFile(_ data: Data) -> MachineKeyFile? {
+    var bytes = [UInt8](data)
+    defer { secureZero(&bytes) }
+    guard bytes.count > machineKeyHeaderLength, bytes.count <= machineKeyMaxSize,
+          Data(bytes[0..<4]) == machineKeyMagic, bytes[4] == machineKeyFormatVersion else {
+        return nil
+    }
+    let publicKey = Data(bytes[5..<(5 + machineKeyPublicKeyLength)])
+    let length = Int(bytes[70]) << 8 | Int(bytes[71])
+    guard length > 0, bytes.count == machineKeyHeaderLength + length,
+          (try? P256.KeyAgreement.PublicKey(x963Representation: publicKey)) != nil else {
+        return nil
+    }
+    return MachineKeyFile(publicKey: publicKey, blob: Data(bytes[machineKeyHeaderLength...]))
+}
+
+enum MachineKeyRead {
+    case found(MachineKeyFile)
+    case notFound
+    case accessDenied(String)
+    case untrusted(String)
+}
+
+private func machineKeyFolder() -> String {
+    MachineScopeTestOverrides.keyFolder ?? machineKeyFolderPath
+}
+
+/// Reads a machine KEK file. It must be root's, writable by root alone,
+/// with no access at all for others (its runner group may read it), in
+/// folders only root controls; the reasons are for the log only.
+func readMachineKeyFile(service: String) -> MachineKeyRead {
+    let folder = machineKeyFolder()
+    let folderFd = open(folder, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard folderFd >= 0 else {
+        let code = errno
+        if code == ENOENT {
+            return .notFound
+        }
+        if code == EACCES {
+            return .accessDenied("\(folder) can't be opened by this account")
+        }
+        return .untrusted("\(folder) can't be opened (\(String(cString: strerror(code))))")
+    }
+    defer { close(folderFd) }
+    guard keyFileFoldersAreTrusted(folderFd: folderFd, rootOnly: true) else {
+        return .untrusted("\(folder), or a folder above it, is not root's or can be written by others")
+    }
+    let fd = openat(folderFd, "\(service).kek", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else {
+        let code = errno
+        if code == ENOENT {
+            return .notFound
+        }
+        if code == EACCES {
+            return .accessDenied("this account may not read the machine KEK for \(service): it is neither root nor in the service's runner group")
+        }
+        return .untrusted("the machine KEK file for \(service) can't be opened (\(String(cString: strerror(code))))")
+    }
+    defer { close(fd) }
+    var info = stat()
+    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0,
+          info.st_mode & (S_IWGRP | S_IROTH | S_IWOTH | S_IXOTH) == 0,
+          !onVolumeIgnoringOwnership(fd),
+          !aclGrantsOthersAChange(fd: fd, isFolder: false, rootOnly: true) else {
+        return .untrusted("the machine KEK file for \(service) is not a root-owned file that only root can change and only its runner group can read")
+    }
+    guard info.st_size <= off_t(machineKeyMaxSize), var bytes = readAll(fd: fd, limit: machineKeyMaxSize) else {
+        return .untrusted("the machine KEK file for \(service) is too large, or can't be read")
+    }
+    defer { secureZero(&bytes) }
+    guard let file = decodeMachineKeyFile(bytes) else {
+        return .untrusted("the machine KEK file for \(service) is not one this library wrote")
+    }
+    return .found(file)
+}
+
+/// Machine KEKs stay usable after the first unlock following a boot --
+/// logged out, at the login window, after an unattended restart -- unlike
+/// the user-scoped KEKs' WhenUnlocked, which fails as soon as the last user
+/// logs out.
+private func makeMachineAccessControl() -> SecAccessControl? {
+    var error: Unmanaged<CFError>?
+    return SecAccessControlCreateWithFlags(
+        nil,
+        kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        [.privateKeyUsage],
+        &error
+    )
+}
+
+/// Whether `key` can do a key agreement now, and gets the answer its
+/// public key predicts.
+private func keyAgreementWorks(_ key: SecureEnclave.P256.KeyAgreement.PrivateKey) -> Bool {
+    let peer = P256.KeyAgreement.PrivateKey()
+    guard let ours = try? key.sharedSecretFromKeyAgreement(with: peer.publicKey),
+          let theirs = try? peer.sharedSecretFromKeyAgreement(with: key.publicKey) else {
+        return false
+    }
+    return ours == theirs
+}
+
+private func logMachineRefusal(_ service: String, _ reason: String) {
+    machineLog.error("\(service, privacy: .public): \(reason, privacy: .public)")
+}
+
+/// Whether the machine KEK file for `service` exists. File-level only --
+/// no Secure Enclave use -- so root can ask from Terminal (`status`).
+func machineKekExists(service: String) -> (status: Int32, exists: Bool) {
+    switch readMachineKeyFile(service: service) {
+    case .found(var file):
+        secureZero(&file.blob)
+        return (HKDFGuardStatus.success.rawValue, true)
+    case .notFound:
+        return (HKDFGuardStatus.success.rawValue, false)
+    case .accessDenied(let reason):
+        logMachineRefusal(service, reason)
+        return (HKDFGuardStatus.keychainAccessDenied.rawValue, false)
+    case .untrusted(let reason):
+        logMachineRefusal(service, reason)
+        return (HKDFGuardStatus.kekCorrupted.rawValue, false)
+    }
+}
+
+/// The machine KEK's public key, from its file -- no Secure Enclave use,
+/// so it can be read from anywhere the file can (the fingerprint).
+func machinePublicKey(service: String) -> (status: Int32, key: P256.KeyAgreement.PublicKey?) {
+    switch readMachineKeyFile(service: service) {
+    case .found(var file):
+        defer { secureZero(&file.blob) }
+        guard let key = try? P256.KeyAgreement.PublicKey(x963Representation: file.publicKey) else {
+            return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+        }
+        return (HKDFGuardStatus.success.rawValue, key)
+    case .notFound:
+        return (HKDFGuardStatus.kekNotFound.rawValue, nil)
+    case .accessDenied(let reason):
+        logMachineRefusal(service, reason)
+        return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
+    case .untrusted(let reason):
+        logMachineRefusal(service, reason)
+        return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+    }
+}
+
+/// Loads the machine KEK for wrap and unwrap: only in the system context,
+/// and only if it is the key its file says.
+func getMachineKEK(service: String) -> (status: Int32, key: SecureEnclave.P256.KeyAgreement.PrivateKey?) {
+    guard runningInSystemContext() else {
+        logMachineRefusal(service, "machine KEKs can only be used by a LaunchDaemon -- not from Terminal, sudo, SSH or a login session")
+        return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
+    }
+    switch readMachineKeyFile(service: service) {
+    case .notFound:
+        return (HKDFGuardStatus.kekNotFound.rawValue, nil)
+    case .accessDenied(let reason):
+        logMachineRefusal(service, reason)
+        return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
+    case .untrusted(let reason):
+        logMachineRefusal(service, reason)
+        return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+    case .found(var file):
+        defer { secureZero(&file.blob) }
+        switch reconstructKEK(file.blob, enclaveIsUsable: { enclaveProbeSucceeds(makeMachineAccessControl()) }) {
+        case .key(let key):
+            guard key.publicKey.x963Representation == file.publicKey else {
+                logMachineRefusal(service, "the machine KEK file's key does not match the public key it records")
+                return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+            }
+            return (HKDFGuardStatus.success.rawValue, key)
+        case .corrupt:
+            return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+        case .enclaveRefused:
+            return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
+        }
+    }
+}
+
+/// Groups too broad to read a machine KEK: each covers essentially every
+/// account, every administrator, or everyone allowed to log in remotely.
+private let overBroadRunnerGroups: Set<String> = [
+    "staff", "everyone", "localaccounts", "netaccounts", "authedusers",
+    "interactusers", "consoleusers", "admin", "com.apple.access_ssh",
+]
+
+/// Opens the machine KEK folder, creating it (root:wheel 0755) if it is
+/// missing. Its parent must already exist -- the package installs it.
+private func openMachineKeyFolderCreatingIt(service: String) -> Int32? {
+    let url = URL(fileURLWithPath: machineKeyFolder())
+    let parentFd = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard parentFd >= 0 else {
+        logMachineRefusal(service, "\(url.deletingLastPathComponent().path) is missing: install the hkdfguard package")
+        return nil
+    }
+    defer { close(parentFd) }
+    let leaf = url.lastPathComponent
+    let created = mkdirat(parentFd, leaf, 0o755) == 0
+    guard created || errno == EEXIST else {
+        logMachineRefusal(service, "\(url.path) can't be created (\(String(cString: strerror(errno))))")
+        return nil
+    }
+    let fd = openat(parentFd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else {
+        return nil
+    }
+    if created && (fchown(fd, 0, 0) != 0 || fchmod(fd, 0o755) != 0) {
+        close(fd)
+        return nil
+    }
+    guard keyFileFoldersAreTrusted(folderFd: fd, rootOnly: true) else {
+        logMachineRefusal(service, "\(url.path), or a folder above it, is not root's or can be written by others")
+        close(fd)
+        return nil
+    }
+    return fd
+}
+
+private enum MachineKeyWrite {
+    case written
+    case alreadyExists // another provisioner won the race
+    case failed
+}
+
+/// Writes the KEK file under a temporary name, owned root:`gid`, mode 0640
+/// (0600 for root only), synced, then renames it into place -- only if no
+/// file has that name yet, so an existing KEK is never replaced.
+private func writeMachineKeyFile(_ bytes: Data, service: String, folderFd: Int32, gid: gid_t) -> MachineKeyWrite {
+    let finalName = "\(service).kek"
+    let tempName = ".\(service).\(UInt64.random(in: .min ... .max)).tmp"
+    let fd = openat(folderFd, tempName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    guard fd >= 0 else {
+        logMachineRefusal(service, "the machine KEK file can't be created (\(String(cString: strerror(errno))))")
+        return .failed
+    }
+    var written = bytes.withUnsafeBytes { raw -> Bool in
+        var offset = 0
+        while offset < raw.count {
+            let count = write(fd, raw.baseAddress?.advanced(by: offset), raw.count - offset)
+            if count < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                return false
+            }
+            offset += count
+        }
+        return true
+    }
+    let mode: mode_t = gid == 0 ? 0o600 : 0o640
+    written = written && fchown(fd, 0, gid) == 0 && fchmod(fd, mode) == 0 && fsync(fd) == 0
+    close(fd)
+    guard written else {
+        unlinkat(folderFd, tempName, 0)
+        logMachineRefusal(service, "the machine KEK file can't be written")
+        return .failed
+    }
+    if renameatx_np(folderFd, tempName, folderFd, finalName, UInt32(RENAME_EXCL)) != 0 {
+        let code = errno
+        unlinkat(folderFd, tempName, 0)
+        return code == EEXIST ? .alreadyExists : .failed
+    }
+    _ = fsync(folderFd)
+    return .written
+}
+
+/// Verifies an existing machine KEK, never replacing one: usable, and the
+/// key its file records.
+private func verifyExistingMachineKEK(service: String) -> Int32 {
+    switch readMachineKeyFile(service: service) {
+    case .found(var file):
+        defer { secureZero(&file.blob) }
+        guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: file.blob),
+              key.publicKey.x963Representation == file.publicKey,
+              keyAgreementWorks(key) else {
+            logMachineRefusal(service, "the existing machine KEK can't be used, or is not the key its file records; it was left untouched")
+            return HKDFGuardStatus.kekCorrupted.rawValue
+        }
+        return HKDFGuardStatus.success.rawValue
+    case .notFound:
+        return HKDFGuardStatus.kekNotFound.rawValue
+    case .accessDenied(let reason):
+        logMachineRefusal(service, reason)
+        return HKDFGuardStatus.keychainAccessDenied.rawValue
+    case .untrusted(let reason):
+        logMachineRefusal(service, reason)
+        return HKDFGuardStatus.kekCorrupted.rawValue
+    }
+}
+
+/// Creates the machine KEK for `service` if it has none: root only, in
+/// the system context only (the CLI's `provision` runs this as a one-off
+/// LaunchDaemon job). Idempotent; an existing KEK is verified, never
+/// replaced.
+func createMachineKEK(service: String, settings: MachineServiceSettings) -> Int32 {
+    guard geteuid() == 0 else {
+        logMachineRefusal(service, "only root can create a machine KEK")
+        return HKDFGuardStatus.keychainAccessDenied.rawValue
+    }
+    guard runningInSystemContext() else {
+        logMachineRefusal(service, "a machine KEK must be created by a LaunchDaemon (`sudo hkdfguard provision` does this for you); one created from Terminal would be unusable by the daemons it is for")
+        return HKDFGuardStatus.keychainAccessDenied.rawValue
+    }
+    var gid: gid_t = 0
+    if let name = settings.runnerGroup {
+        guard !overBroadRunnerGroups.contains(name.lowercased()) else {
+            logMachineRefusal(service, "RunnerGroup \(name) is too broad: name a group that holds only this service's accounts")
+            return HKDFGuardStatus.policyInvalid.rawValue
+        }
+        guard let group = getgrnam(name) else {
+            logMachineRefusal(service, "RunnerGroup \(name) does not name a group on this Mac")
+            return HKDFGuardStatus.policyInvalid.rawValue
+        }
+        gid = group.pointee.gr_gid
+    }
+
+    let existing = verifyExistingMachineKEK(service: service)
+    guard existing == HKDFGuardStatus.kekNotFound.rawValue else {
+        return existing
+    }
+
+    guard let folderFd = openMachineKeyFolderCreatingIt(service: service) else {
+        return HKDFGuardStatus.keychainWriteFailed.rawValue
+    }
+    defer { close(folderFd) }
+    guard let access = makeMachineAccessControl() else {
+        return HKDFGuardStatus.accessControlCreationFailed.rawValue
+    }
+    guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access) else {
+        return HKDFGuardStatus.keyGenerationFailed.rawValue
+    }
+    var blob = key.dataRepresentation
+    defer { secureZero(&blob) }
+    guard keyAgreementWorks(key),
+          let reloaded = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob),
+          keyAgreementWorks(reloaded) else {
+        return HKDFGuardStatus.kekVerificationFailed.rawValue
+    }
+    guard var encoded = encodeMachineKeyFile(MachineKeyFile(publicKey: key.publicKey.x963Representation, blob: blob)) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
+    }
+    defer { secureZero(&encoded) }
+    switch writeMachineKeyFile(encoded, service: service, folderFd: folderFd, gid: gid) {
+    case .written:
+        auditMachineKekCreated(service: service, runnerGroup: settings.runnerGroup)
+        return HKDFGuardStatus.success.rawValue
+    case .alreadyExists:
+        return verifyExistingMachineKEK(service: service)
+    case .failed:
+        return HKDFGuardStatus.keychainWriteFailed.rawValue
+    }
+}
+
+/// The policy in effect, as JSON, for `hkdfguard_machine_policy`.
+func machinePolicyJSON() -> Data? {
+    var object: [String: Any] = [
+        "machineKeyFolder": machineKeyFolder(),
+        "systemContext": runningInSystemContext(),
+    ]
+    switch currentMachinePolicy() {
+    case .none:
+        object["mode"] = "development"
+    case .invalid(let reason):
+        object["mode"] = "invalid"
+        object["reason"] = reason
+    case .loaded(let policy):
+        object["mode"] = "production"
+        object["source"] = policy.source
+        if let group = policy.securityAdminGroup {
+            object["securityAdminGroup"] = group
+        }
+        if let group = policy.deploymentAdminGroup {
+            object["deploymentAdminGroup"] = group
+        }
+        var services: [String: [String: String]] = [:]
+        for (service, settings) in policy.machineServices {
+            services[service] = settings.runnerGroup.map { ["runnerGroup": $0] } ?? [:]
+        }
+        object["machineServices"] = services
+    }
+    return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
 // MARK: - Wrap (seal) a DEK under the Secure Enclave KEK
@@ -1032,7 +1723,7 @@ enum AuditEvent: Int {
     case accessDenied = 2000
     case kekInvalid = 2002
     case integrityFailure = 2003
-    case policyInvalid = 2004 // never on macOS: no policy file
+    case policyInvalid = 2004
     case operationFailed = 2005
     case plaintextKeyFile = 2006
     case setupCallsExceeded = 2007
@@ -1111,6 +1802,15 @@ func auditKekCreated(service: String, mode: KeychainMode) {
     )
 }
 
+/// A machine-scoped KEK was created (not merely found).
+func auditMachineKekCreated(service: String, runnerGroup: String?) {
+    auditEmit(
+        .info, .kekCreated,
+        fields: "op=\(AuditOp.createKek.rawValue) service=\(auditQuote(Array(service.utf8))) provider=\(auditProvider) keychain=machine runner_group=\(auditQuote(Array((runnerGroup ?? "(root only)").utf8)))",
+        message: "machine KEK created on \(auditProvider)"
+    )
+}
+
 /// A DEK was wrapped (`op` is wrap or generateAndWrap) or unwrapped
 /// (`unwrap`). `payload` is the 125-byte payload produced or consumed:
 /// public bytes, the first 32 of which are the KEK fingerprint.
@@ -1135,6 +1835,8 @@ func auditOperationFailed(_ op: AuditOp, service: String, code: Int32) {
     switch status {
     case .keychainAccessDenied:
         (event, severity, meaning) = (.accessDenied, .warning, "the caller is not authorized to use this KEK")
+    case .policyInvalid:
+        (event, severity, meaning) = (.policyInvalid, .error, "the policy can't be trusted or used; every call fails closed until it is fixed")
     case .kekCorrupted:
         (event, severity, meaning) = (.kekInvalid, .error, "a KEK exists under this service name but is corrupt or not one this library would create; it was left untouched")
     case .decryptionFailed, .fingerprintMismatch, .payloadMalformed, .unsupportedCiphersuite:
@@ -1455,6 +2157,40 @@ public func hkdfguard_keychain_mode(
     return HKDFGuardStatus.success.rawValue
 }
 
+/// macOS-only. Reports the KEK policy in effect, as UTF-8 JSON (not
+/// NUL-terminated): `mode` is "development" (no policy: every KEK is
+/// user-scoped), "production" (with `source`, the role groups, and
+/// `machineServices`: service -> `runnerGroup`), or "invalid" (with
+/// `reason`; every other call then fails with POLICY_INVALID). Also
+/// `machineKeyFolder`, and `systemContext`: whether this process may use
+/// machine KEKs at all. The hkdfguard CLI uses it to enforce the roles.
+/// Buffer contract as the other functions': a capacity too small is
+/// BUFFER_TOO_SMALL with `*outLen` set to the length needed.
+@_cdecl("hkdfguard_machine_policy")
+public func hkdfguard_machine_policy(
+    outPtr: UnsafeMutablePointer<UInt8>?,
+    outLen: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    guard let outLen, outLen.pointee >= 0 else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    guard let json = machinePolicyJSON(), !json.isEmpty, json.count <= Int(Int32.max) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
+    }
+    guard Int(outLen.pointee) >= json.count else {
+        outLen.pointee = Int32(json.count)
+        return HKDFGuardStatus.outputBufferTooSmall.rawValue
+    }
+    guard let outPtr else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    guard copyOut(json, to: outPtr, count: json.count) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
+    }
+    outLen.pointee = Int32(json.count)
+    return HKDFGuardStatus.success.rawValue
+}
+
 /// Reports whether a Secure Enclave KEK already exists for `service`,
 /// without creating one — `*outExists` is always written, on every return
 /// path (1 if a valid KEK exists, 0 otherwise, including when the status
@@ -1513,9 +2249,19 @@ public func hkdfguard_kek_fingerprint(
 
     // The key itself stays inside the gate; only its public fingerprint
     // leaves it.
+    // For a machine KEK, from its file's public key: no Secure Enclave use,
+    // so root can read it from Terminal (`status`, `provision`, `retire`).
     let (status, maybeFingerprint) = gatedSetup { () -> (Int32, Data?) in
-        let (status, maybeKey) = getKEK(service: service)
-        return (status, maybeKey.map { kekFingerprint($0.publicKey) })
+        switch kekScope(service: service) {
+        case .policyInvalid:
+            return (HKDFGuardStatus.policyInvalid.rawValue, nil)
+        case .machine:
+            let (status, maybeKey) = machinePublicKey(service: service)
+            return (status, maybeKey.map(kekFingerprint))
+        case .user:
+            let (status, maybeKey) = getKEK(service: service)
+            return (status, maybeKey.map { kekFingerprint($0.publicKey) })
+        }
     }
     guard let fingerprint = maybeFingerprint else {
         auditOperationFailed(.kekFingerprint, service: service, code: status)
@@ -1861,7 +2607,11 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
 /// A folder writable by the `admin` group (`/Applications`, say) fails,
 /// as a group-writable folder does on Linux: every administrator could
 /// replace the key there without root.
-func keyFileFoldersAreTrusted(folderFd: Int32) -> Bool {
+///
+/// `rootOnly` (the policy file's and machine keys' folders): every folder
+/// must be root's, not this user's, and no group or other write bit is
+/// excused by the sticky bit either -- as Linux judges its policy folder.
+func keyFileFoldersAreTrusted(folderFd: Int32, rootOnly: Bool = false) -> Bool {
     // Walked by descriptor, from the key file's own folder up through
     // openat(fd, "..") until a folder is its own parent (/): no path string
     // is decoded, split or looked up again, so neither an odd folder name
@@ -1879,14 +2629,14 @@ func keyFileFoldersAreTrusted(folderFd: Int32) -> Bool {
         var info = stat()
         guard fstat(current, &info) == 0,
               info.st_mode & S_IFMT == S_IFDIR,
-              info.st_uid == 0 || info.st_uid == uid,
+              info.st_uid == 0 || (!rootOnly && info.st_uid == uid),
               !onVolumeIgnoringOwnership(current),
-              !aclGrantsOthersAChange(fd: current, isFolder: true) else {
+              !aclGrantsOthersAChange(fd: current, isFolder: true, rootOnly: rootOnly) else {
             return false
         }
         let writable = info.st_mode & (S_IWGRP | S_IWOTH) != 0
         let sticky = info.st_mode & S_ISVTX != 0
-        if writable && !sticky && !onSealedSystemVolume(current) {
+        if writable && (rootOnly || !sticky) && !onSealedSystemVolume(current) {
             return false
         }
 
@@ -1947,7 +2697,10 @@ private func onSealedSystemVolume(_ fd: Int32) -> Bool {
 /// folders passes. Entries for root or this user are harmless. An ACL that
 /// can't be read, or an entry whose principal can't be resolved, counts as
 /// granting (fail closed).
-private func aclGrantsOthersAChange(fd: Int32, isFolder: Bool) -> Bool {
+///
+/// `rootOnly`: an entry for this user counts as granting too -- for files
+/// only root may control (the policy, machine keys), whoever reads them.
+private func aclGrantsOthersAChange(fd: Int32, isFolder: Bool, rootOnly: Bool = false) -> Bool {
     guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
         return errno != ENOENT // no ACL at all; any other failure fails closed
     }
@@ -1988,7 +2741,7 @@ private func aclGrantsOthersAChange(fd: Int32, isFolder: Bool) -> Bool {
         let resolved = qualifier.withMemoryRebound(to: UInt8.self, capacity: 16) {
             mbr_uuid_to_id($0, &id, &type) == 0
         }
-        guard resolved, type == ID_TYPE_UID, id == 0 || id == uid else {
+        guard resolved, type == ID_TYPE_UID, id == 0 || (!rootOnly && id == uid) else {
             return true
         }
     }
