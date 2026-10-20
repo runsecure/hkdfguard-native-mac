@@ -912,10 +912,12 @@ hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 | `HkdfGuardNativeMacOSTestHost` | `HkdfGuardNativeMacOSTestHost.app` | Minimal entitled host app for the test bundle, so the suite can run in data-protection mode (see Tests) |
 
 All library targets build from the single `HkdfGuardNativeMacOS.swift`.
-Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). The
-dylib, both CLI builds, the test bundle, and the test host target
-**macOS 14.0+**; the framework target uses the
-SDK's recommended deployment target.
+Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). Every
+target -- the framework, the dylib, both CLI builds, the test bundle, and
+the test host -- targets **macOS 14.0+**, set explicitly rather than left
+to Xcode's recommended value, which differs between Xcode versions (Xcode
+26 recommends 11.0, too old for the library's `OSAllocatedUnfairLock` and
+`Duration`).
 
 Supporting scripts: `build-dist.sh` (signed, notarized build artifacts,
 below), `build-pkg.sh` with `pkg/` (the installer package — the only way the
