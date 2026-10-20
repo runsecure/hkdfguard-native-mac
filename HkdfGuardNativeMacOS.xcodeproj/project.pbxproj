@@ -13,6 +13,7 @@
 		C1A7E5700001000000000004 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A7E5700001000000000003 /* main.swift */; };
 		C1A7E570000100000000000B /* HkdfGuardNativeMacOS.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 219DF893D63442E9B2C50B4A /* HkdfGuardNativeMacOS.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		C1A7E5700002000000000004 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A7E5700002000000000003 /* main.swift */; };
+		C1A7E57000020000000000F2 /* MachineScope.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A7E57000020000000000F1 /* MachineScope.swift */; };
 		C1A7E570000200000000000B /* libhkdfguard.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 26F6201A383E44E0B578B634 /* libhkdfguard.dylib */; };
 		C1A7E570000200000000000C /* libhkdfguard.dylib in Embed Libraries */ = {isa = PBXBuildFile; fileRef = 26F6201A383E44E0B578B634 /* libhkdfguard.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		E5F23DE693EE4DF9A2E335D0 /* hkdfguard.h in Headers */ = {isa = PBXBuildFile; fileRef = 6F7623D1D4864AF684EF4BEE /* hkdfguard.h */; settings = {ATTRIBUTES = (Public, ); }; };
@@ -80,6 +81,7 @@
 		C1A7E5700001000000000005 /* HkdfGuardNativeMacOSTestHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HkdfGuardNativeMacOSTestHost.entitlements; sourceTree = "<group>"; };
 		C1A7E5700002000000000002 /* hkdfguard.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = hkdfguard.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C1A7E5700002000000000003 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = main.swift; path = "hkdfguard-cli/Sources/hkdfguard/main.swift"; sourceTree = "<group>"; };
+		C1A7E57000020000000000F1 /* MachineScope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = MachineScope.swift; path = "hkdfguard-cli/Sources/hkdfguard/MachineScope.swift"; sourceTree = "<group>"; };
 		C1A7E5700002000000000005 /* hkdfguard.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; name = hkdfguard.entitlements; path = "hkdfguard-cli/hkdfguard.entitlements"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -175,6 +177,7 @@
 			isa = PBXGroup;
 			children = (
 				C1A7E5700002000000000003 /* main.swift */,
+				C1A7E57000020000000000F1 /* MachineScope.swift */,
 				C1A7E5700002000000000005 /* hkdfguard.entitlements */,
 			);
 			name = "hkdfguard-app";
@@ -411,6 +414,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				C1A7E5700002000000000004 /* main.swift in Sources */,
+				C1A7E57000020000000000F2 /* MachineScope.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -456,7 +460,7 @@
 					"@executable_path/../Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = "$(RECOMMENDED_MACOSX_DEPLOYMENT_TARGET)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 0.9.0;
 				MODULE_VERIFIER_SUPPORTED_LANGUAGE_STANDARDS = "gnu17 gnu++20";
 				PRODUCT_BUNDLE_IDENTIFIER = com.hkdfguard.native.macos;
@@ -633,7 +637,7 @@
 					"@executable_path/../Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = "$(RECOMMENDED_MACOSX_DEPLOYMENT_TARGET)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 0.9.0;
 				MODULE_VERIFIER_SUPPORTED_LANGUAGE_STANDARDS = "gnu17 gnu++20";
 				PRODUCT_BUNDLE_IDENTIFIER = com.hkdfguard.native.macos;
@@ -878,7 +882,7 @@
 					"@executable_path/../Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = "$(RECOMMENDED_MACOSX_DEPLOYMENT_TARGET)";
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 0.9.0;
 				MODULE_VERIFIER_SUPPORTED_LANGUAGE_STANDARDS = "gnu17 gnu++20";
 				PRODUCT_BUNDLE_IDENTIFIER = com.hkdfguard.native.macos;

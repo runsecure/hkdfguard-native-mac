@@ -253,18 +253,20 @@ Console.app shows the same records live.
 | 1000 | default | A KEK was created (not merely found). |
 | 1002 | default | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | default | A DEK was unwrapped. |
+| 1004 | error | A KEK was retired by the CLI's `retire` (written by the CLI, category `audit`); names its fingerprint, scope and the admin behind `sudo`. |
 | 2000 | error | `KEK_ACCESS_DENIED`. |
 | 2002 | fault | `KEK_INVALID`. |
 | 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
+| 2004 | fault | `POLICY_INVALID`: the production policy can't be used; every call fails closed until it is fixed (see [Production mode](#production-mode-machine-scoped-keks)). |
 | 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
 | 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
 | 2007 | warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` / `hkdfguard_kek_fingerprint` calls (each held to at least 1000 ms; see [Concurrency](#concurrency)). Logged once per process. |
 
 The unified log has no "warning" level, so Linux's info / warning / error
 are `default` / `error` / `fault` here. `default` is the level the log keeps
-on disk by default. Linux's 1001 (a KEK created on a fallback provider) and
-2004 (`POLICY_INVALID`) never occur on macOS: there is one provider, the
-Secure Enclave, and no policy file.
+on disk by default. Linux's 1001 (a KEK created on a fallback provider)
+never occurs on macOS: there is one provider, the Secure Enclave. 2004
+occurs only with a production policy.
 
 Each record is `key=value` fields followed by a sentence:
 
@@ -423,6 +425,7 @@ here are defined there but never returned on macOS.
 | `-5`  | `ERR_CRYPTO_ERROR` | `encryptionFailed` | the RNG failed, the Secure Enclave refused the key agreement (wrap or unwrap), or AES-GCM sealing failed |
 | `-6`  | `ERR_INTERNAL_ERROR` | `unexpectedOutputLength` | an internal failure the library detected: output of an impossible length, or a buffer that should exist not existing (a bug). Linux also returns it for a caught panic; a Swift runtime trap can't be caught, so this library has no force-unwrap, `try!`, `fatalError` or `precondition` on its export paths (a test enforces it), and returns -6 where Linux would have caught one |
 | `-8`  | `ERR_INVALID_SERVICE_NAME` | `invalidServiceIdentifier` | see `service` above |
+| `-9`  | `ERR_POLICY_INVALID` | `policyInvalid` | the production policy can't be used (an unknown setting, a wrong type, not root's, or a runner group that doesn't exist or is too broad); **every** call fails until it is fixed |
 | `-10` | `ERR_PAYLOAD_MALFORMED` | `payloadMalformed` | `wrapped_len != 125` |
 | `-11` | `ERR_PAYLOAD_AUTH_FAILED` | `decryptionFailed` | the AES-GCM tag did not verify: an altered payload, or one wrapped for a different service under the same KEK |
 | `-12` | `ERR_PAYLOAD_UNSUPPORTED` | `unsupportedCiphersuite` | the payload's suite byte is not one this build implements; a newer or different build wrote it. Not tampering |
@@ -513,7 +516,11 @@ hardened runtime, attach a debugger to it.
 
 ## Access policy and headless use
 
-Every KEK is created with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and
+This section describes **user-scoped** KEKs: every KEK with no policy, and
+any service a production policy doesn't list. Machine-scoped KEKs differ;
+see [Production mode](#production-mode-machine-scoped-keks).
+
+Every user-scoped KEK is created with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and
 `privateKeyUsage` only — no user-presence or biometric requirement, so
 using the key never triggers a Touch ID/password prompt. Consequences:
 
@@ -535,7 +542,7 @@ using the key never triggers a Touch ID/password prompt. Consequences:
   does not bridge users; it runs in a different keychain context. No
   administrator rights are needed for any of these operations.
 
-The policy is fixed; there is no per-service override. The library has no
+The access policy of a user-scoped KEK is fixed. The library has no
 delete or rotate API — a service that needs a new KEK adopts a new service
 name — and deletion exists only as the CLI's fingerprint-confirmed
 `retire` command (below), so no process that merely loads the dylib gets a
@@ -555,6 +562,143 @@ has already unwrapped every DEK they could reach. Recover in this order:
 A legacy-mode KEK item can come back if a backup of the login keychain
 taken before retirement is restored onto the same Mac; account for backups
 if the goal is a true crypto-shred.
+
+## Production mode: machine-scoped KEKs
+
+With no policy, every KEK is user-scoped, as above: one person may
+provision, wrap and unwrap. That is **development mode**. A **production
+policy** can make chosen services machine-scoped instead, which separates
+the roles:
+
+| Role | Does | As | Allowed by the policy's |
+|---|---|---|---|
+| Security admin | `provision`, `retire` | `sudo` | `SecurityAdminGroup` |
+| Deployment admin | `wrap` | `sudo` | `DeploymentAdminGroup` |
+| Application runtime | `hkdfguard_open_file` + `hkdfguard_unwrap_dek` | a LaunchDaemon running as a member of the service's `RunnerGroup` | `MachineServices` |
+
+A machine KEK suits a service that runs as a LaunchDaemon: it works logged
+out, at the login window, and after an unattended restart
+(`sudo fdesetup authrestart`), and survives password resets and account
+changes, which a user's keychain does not.
+
+### The policy
+
+On a managed Mac, deliver it as a configuration profile for the preference
+domain **`com.hkdfguard`** (Jamf "Application & Custom Settings", an Intune
+custom profile, and so on), scoped to the device. macOS writes it to
+`/Library/Managed Preferences/com.hkdfguard.plist`. On a Mac without MDM,
+put the same keys in `/Library/Application Support/HkdfGuard/policy.plist`
+(`root:wheel 0644`). The managed one wins when both exist. Either must be
+root's and writable only by root, as must every folder above it.
+
+```xml
+<dict>
+  <key>MachineServices</key>
+  <dict>
+    <key>com.example.orders</key>
+    <dict><key>RunnerGroup</key><string>_orders</string></dict>
+  </dict>
+  <key>SecurityAdminGroup</key><string>secadmins</string>
+  <key>DeploymentAdminGroup</key><string>deployers</string>
+</dict>
+```
+
+The library reads the policy as a file and checks every setting. An
+unknown key (a misspelling, say) or a wrong type makes the policy
+**invalid**, and then every call, for every service, fails with `-9`
+(`POLICY_INVALID`) until it is fixed: a misspelt `MachineServices` must not
+quietly leave a production service user-scoped. `hkdfguard status` prints
+why. Services the policy doesn't list stay user-scoped. Leaving out
+`SecurityAdminGroup` or `DeploymentAdminGroup` lets any admin who can
+`sudo` act in that role.
+
+### The service account and its runner group
+
+Run the service's LaunchDaemon as a dedicated account that cannot log in,
+and make it the only member of the `RunnerGroup`. People must never be
+members: the group is what can read the KEK file.
+
+```sh
+sudo dseditgroup -o create -r "Orders service" _orders
+sudo dscl . -create /Users/_orders UserShell /usr/bin/false   # plus UniqueID, PrimaryGroupID, IsHidden 1, NFSHomeDirectory /var/empty
+sudo dseditgroup -o edit -a _orders -t user _orders
+```
+
+The library refuses a `RunnerGroup` that covers too many accounts (`staff`,
+`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …).
+
+### Provisioning, wrapping and retiring
+
+```sh
+sudo hkdfguard provision -sn com.example.orders            # security admin
+# machine KEK provisioned for service "com.example.orders" at
+#   /Library/Application Support/HkdfGuard/keks/com.example.orders.kek (runner group: _orders)
+# fingerprint: 3f1c…e09a -- record this; retire requires it
+
+printf '%s' "$DEK_B64" | sudo hkdfguard wrap \
+    -kf /Library/Application\ Support/Orders/dek.key -sn com.example.orders \
+    --dek-stdin -fp 3f1c…e09a                               # deployment admin
+
+sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
+```
+
+- **The role is checked against the admin behind `sudo`**: the account that
+  logged in to the session, which `sudo` doesn't change. `sudo` alone isn't
+  enough. A root login is trusted.
+- **The Secure Enclave work runs in a one-off LaunchDaemon job.** The
+  Secure Enclave binds a key to the context it was created in, so a key
+  made from Terminal, `sudo` included, would be unusable by the service's
+  daemons. `provision` and `wrap` hand that step to a short-lived system job
+  running the same `hkdfguard` executable. The DEK goes to it through a FIFO
+  in a root-only folder, so it never touches disk. The job runs only if the
+  `hkdfguard` executable and the library it loaded are root's and writable
+  only by root, which the installed package's are; a build run from a
+  source tree is refused.
+- **`wrap` gives the key file to the `RunnerGroup`** (`0640`) unless
+  `--group` says otherwise, so the daemons can read it.
+- **`retire` deletes the KEK file** after confirming the fingerprint, and
+  writes audit event 1004. Every payload wrapped under it becomes
+  unrecoverable.
+
+### What the runtime can and can't do
+
+The application calls the same functions as always. For a machine-scoped
+service:
+
+- **Only LaunchDaemons can unwrap.** A process in a login session
+  (Terminal, `sudo` from it, a GUI app, SSH) gets `-18`
+  (`KEK_ACCESS_DENIED`). The library refuses those sessions itself, and the
+  Secure Enclave would refuse them anyway: a key created by a daemon can't
+  be used from a login session.
+- **Only root and `RunnerGroup` members can read the KEK file**; anyone else
+  gets `-18`.
+- **The KEK file** is `/Library/Application Support/HkdfGuard/keks/<service>.kek`,
+  `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). It holds the
+  public key and the Secure Enclave key blob, which is usable only by this
+  Mac's Secure Enclave, in the system context, after the first unlock since
+  boot (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). A file that
+  isn't root's, that anyone else can write, that others can read, or that
+  this library didn't write is `-19` (`KEK_INVALID`).
+- **Root is trusted.** Root can read the file and install a LaunchDaemon, so
+  an admin who can `sudo` can ultimately use the key, as with every secret
+  store on macOS. If admins reaching a Mac over SSH is a concern, turn off
+  Remote Login through MDM, and forward the `com.hkdfguard` log to your SIEM.
+
+### Verifying it on a Mac
+
+`scripts/verify-machine-scope.sh` runs the whole flow against this repo's
+builds, as root:
+- provisioning, with both role refusals;
+- wrapping in the system job;
+- a `nobody` LaunchDaemon unwrapping, while root in Terminal and an account
+  outside the group are refused;
+- `retire`.
+
+It cleans up after itself, and refuses to run where a real policy exists.
+
+```sh
+sudo bash scripts/verify-machine-scope.sh
+```
 
 ## Command-line tool: `hkdfguard`
 
@@ -768,17 +912,20 @@ hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 | `HkdfGuardNativeMacOSTestHost` | `HkdfGuardNativeMacOSTestHost.app` | Minimal entitled host app for the test bundle, so the suite can run in data-protection mode (see Tests) |
 
 All library targets build from the single `HkdfGuardNativeMacOS.swift`.
-Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). The
-dylib, both CLI builds, the test bundle, and the test host target
-**macOS 14.0+**; the framework target uses the
-SDK's recommended deployment target.
+Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). Every
+target -- the framework, the dylib, both CLI builds, the test bundle, and
+the test host -- targets **macOS 14.0+**, set explicitly rather than left
+to Xcode's recommended value, which differs between Xcode versions (Xcode
+26 recommends 11.0, too old for the library's `OSAllocatedUnfairLock` and
+`Duration`).
 
 Supporting scripts: `build-dist.sh` (signed, notarized build artifacts,
 below), `build-pkg.sh` with `pkg/` (the installer package — the only way the
 library is installed; see [Installing on a machine](#installing-on-a-machine)),
 and `setup-hosted-test-kek.sh` (a one-time, per-developer provisioning of a
 data-protection KEK in the test-only access group, under
-`com.hkdfguard.fixture.hostedtests`; see Tests).
+`com.hkdfguard.fixture.hostedtests`; see Tests). `.github/` holds the CI
+and release workflows (see [Continuous integration](#continuous-integration)).
 
 ## Building
 
@@ -917,14 +1064,120 @@ anything, so a missing one fails in seconds. The Developer ID provisioning
 profile is created by `xcodebuild` during export (automatic signing,
 `-allowProvisioningUpdates`).
 
+## Continuous integration
+
+Two GitHub Actions workflows, in `.github/workflows/`, both on
+GitHub-hosted Apple silicon runners (`macos-26`, Xcode 26.6):
+
+| Workflow | Runs on | Does | Credentials |
+|---|---|---|---|
+| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed | none |
+| `release.yml` | a pushed `vX.Y.Z` tag, or by hand | `ci.yml`, then `build-release.sh` — signed, notarized, stapled — and, for a tag, the GitHub Release | the `release` environment's secrets |
+
+**What CI can't test.** A macOS VM has no Secure Enclave, so every test
+that wraps or unwraps skips itself there (see [Tests](#tests)), and the
+hosted suite and `scripts/verify-machine-scope.sh` need a registered Mac,
+root and LaunchDaemons. A green CI run proves the build, the argument
+handling, the key file checks and the cross-platform ABI. It does not prove
+the cryptography. Before tagging a release, run the full suite on real
+Apple silicon:
+
+```sh
+xcodebuild test -scheme HkdfGuardNativeMacOSTests
+xcodebuild test -scheme HkdfGuardNativeMacOSTests-Hosted -allowProvisioningUpdates
+sudo bash scripts/verify-machine-scope.sh
+```
+
+**Unsigned builds.** `ci.yml` sets `XCODE_XCCONFIG_FILE` to
+`.github/ci/unsigned.xcconfig` (ad-hoc signing, no team, no profile). It
+passes the same file as `TEST_RUNNER_XCODE_XCCONFIG_FILE`, so the
+`xcodebuild` that `HkdfGuardCommandLineToolTests` runs inside the test
+process builds unsigned too. To reproduce a CI run locally:
+
+```sh
+X="$PWD/.github/ci/unsigned.xcconfig"
+XCODE_XCCONFIG_FILE="$X" TEST_RUNNER_XCODE_XCCONFIG_FILE="$X" \
+  xcodebuild test -scheme HkdfGuardNativeMacOSTests -destination 'platform=macOS,arch=arm64'
+```
+
+`HkdfGuardCrossPlatformABITests` needs `hkdfguard-native-linux` checked
+out beside this repository; `ci.yml` checks it out there. If that
+repository is private, give the workflow a repository secret
+`LINUX_REPO_TOKEN`: a fine-grained token with read-only *Contents* access to
+`runsecure/hkdfguard-native-linux` and nothing else. Without one the
+checkout fails, the run shows a warning, and those tests skip themselves.
+
+### Setting up `release.yml`
+
+The signing credentials are **environment** secrets, not repository
+secrets, so no other workflow or job can read them. Once, under
+*Settings > Environments*, create an environment named `release`:
+
+- **Required reviewers:** the people who hold the Developer ID
+  certificates. Every run waits for one of them to approve it.
+- **Deployment branches and tags:** *Selected branches and tags*: the tag
+  pattern `v*`, and the branch `main` for manual dry runs.
+
+Then, under *Settings > Rules > Rulesets*, add a tag ruleset for `v*` that
+only administrators can bypass, so not everyone with write access can
+create a release tag.
+
+Its secrets:
+
+| Secret | Value |
+|---|---|
+| `DEVELOPER_ID_APPLICATION_P12` | base64 of the *Developer ID Application* certificate and private key, exported from Keychain Access as `.p12` |
+| `DEVELOPER_ID_INSTALLER_P12` | the same for the *Developer ID Installer* certificate |
+| `APPLE_DEVELOPMENT_P12` | optional: the same for an *Apple Development* certificate, used to sign the archive before its Developer ID export. Without it, `xcodebuild -allowProvisioningUpdates` may create a new development certificate on every run |
+| `SIGNING_P12_PASSWORD` | the password all of the `.p12` files were exported with |
+| `ASC_KEY_P8` | the contents of an App Store Connect API key's `AuthKey_<id>.p8` (*Users and Access > Integrations > Team Keys*). Its role must be **Admin**: only an Admin key can make `xcodebuild` create the Developer ID provisioning profile `hkdfguard.app` needs. The same key notarizes |
+| `ASC_KEY_ID` | that key's ID |
+| `ASC_ISSUER_ID` | the team's issuer ID, shown above the keys list |
+
+```sh
+base64 -i DeveloperIDApplication.p12 | pbcopy   # paste as DEVELOPER_ID_APPLICATION_P12
+base64 -i DeveloperIDInstaller.p12 | pbcopy     # paste as DEVELOPER_ID_INSTALLER_P12
+```
+
+The workflow imports the certificates into a throwaway keychain, which it
+makes the default for the job. It stores the API key there as the
+`hkdfguard-notary` notarytool profile, runs `build-release.sh`, and
+deletes both whether or not the build succeeded. Run it by hand from `main`
+first: that run does everything except publish, and uploads the `.pkg` as a
+workflow artifact, so you can test the signing setup without making a
+release.
+
 ## Publishing a release
 
 The only distribution is a signed, notarized **installer package** attached
 to a tagged GitHub Release. There are no zips, no NuGet package, and no
 install scripts: a Mac gets the library by installing the package, and
-nothing else puts it in place. That keeps one manually signed artifact —
-built by a person on one Mac, with no CI — as the only thing every machine
-trusts.
+nothing else puts it in place. Every machine trusts exactly one signed
+artifact, built by `release.yml` from a `vX.Y.Z` tag on `main`. The signing
+keys live only in the protected `release` environment (see
+[Setting up `release.yml`](#setting-up-releaseyml)).
+
+That moves the trust boundary from one Mac to GitHub. Anyone who can
+approve a run in the `release` environment, or change `release.yml` or the
+build scripts on `main`, can ship code that every installed Mac trusts.
+Keep its reviewers to the people who hold the Developer ID certificates,
+and require reviews on `main`.
+
+To release, make sure `MARKETING_VERSION` in the Xcode project is the new
+version, run the full suite on real hardware (see
+[Continuous integration](#continuous-integration)), then push a signed tag:
+
+```sh
+git tag -s v0.9.0 -m v0.9.0   # must equal v<MARKETING_VERSION>
+git push origin v0.9.0
+```
+
+The workflow checks that the tag matches `MARKETING_VERSION` and is on
+`main`. After a reviewer approves, it builds, notarizes and publishes the
+Release, with the package's SHA-256 in the release notes.
+
+To build and publish one by hand instead (the workflow runs the same
+steps):
 
 ```sh
 VERSION=v0.9.0   # must equal MARKETING_VERSION in the Xcode project
@@ -1088,8 +1341,10 @@ sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
 ```
 
 Removes `v1/`, the `PATH` symlink (only if it still points at this CLI), and
-the package receipt. **KEKs are not touched**: they live in each user's
-keychain, not in the install folder. Retire any that should go *before*
+the package receipt. **KEKs are not touched**: user-scoped ones live in each
+user's keychain, and machine-scoped ones in
+`/Library/Application Support/HkdfGuard/keks`, outside `v1/`, as does a local
+`policy.plist`. Retire any that should go *before*
 uninstalling, while the CLI still exists (see `retire` above).
 
 ### Why this location

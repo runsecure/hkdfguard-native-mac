@@ -38,7 +38,8 @@ FOUNDATION_EXPORT const unsigned char HkdfGuardNativeMacOSVersionString[];
 //
 // The one HKDFGUARD_NULLABLE pointer is `out` on hkdfguard_wrap_dek,
 // hkdfguard_unwrap_dek, hkdfguard_generate_and_wrap_dek, and
-// hkdfguard_open_file, as on Linux: a size probe passes `out = NULL` with
+// hkdfguard_open_file, as on Linux (and on the macOS-only
+// hkdfguard_machine_policy, whose size is the JSON's length): a size probe passes `out = NULL` with
 // `*out_len = 0` and gets HKDFGUARD_ERR_BUFFER_TOO_SMALL with the size to
 // allocate in `*out_len` (125 for a payload, 32 for a DEK), without the
 // keychain, the Secure Enclave, or the file being touched. A NULL `out` with
@@ -195,7 +196,7 @@ extern "C" {
 // libraries, this one shares the function names and signatures, status
 // codes, flags, and call semantics. Two functions here are macOS-only, with
 // no Linux or Windows counterpart, so a cross-platform caller must not rely
-// on them: hkdfguard_keychain_mode and hkdfguard_kek_fingerprint. Not shared
+// on them: hkdfguard_keychain_mode and hkdfguard_machine_policy. Not shared
 // either: the payload layout, which is per-platform (Linux's carries a
 // version byte, a provider tag and a key id, 132..276 bytes). The
 // construction is the same on all three -- ECDH against a hashed
@@ -282,7 +283,53 @@ extern "C" {
 //   - The protection boundary is "which processes may read the keychain
 //     item" (the keychain mode's job), not "a human approved this use".
 //
-// There is no per-service policy override.
+// That is the user scope, and with no policy it is the only one
+// (development mode). A production policy can make services machine-scoped
+// instead -- see "Machine scope" below.
+
+// ---------------------------------------------------------------------------
+// Machine scope (production mode)
+// ---------------------------------------------------------------------------
+// A production policy is an MDM configuration profile for the preference
+// domain com.hkdfguard (read from /Library/Managed Preferences/
+// com.hkdfguard.plist) or, on a Mac without MDM, the file
+// /Library/Application Support/HkdfGuard/policy.plist. Either must be
+// root's and writable by root alone, as must every folder above it; the
+// managed one wins when both exist. Settings:
+//
+//   MachineServices       dictionary: service name -> { RunnerGroup }
+//   SecurityAdminGroup    who may provision and retire machine KEKs (CLI)
+//   DeploymentAdminGroup  who may wrap DEKs under them (CLI)
+//
+// An unknown setting, a wrong type, or an unusable file makes the policy
+// invalid, and then every call fails with HKDFGUARD_ERR_POLICY_INVALID
+// until it is fixed.
+//
+// A service listed in MachineServices has a machine KEK: a Secure Enclave
+// key created by root in the system context (a LaunchDaemon -- the CLI's
+// `provision` does this), kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+// kept in /Library/Application Support/HkdfGuard/keks/<service>.kek, owned
+// root:<RunnerGroup>, mode 0640 (0600 with no RunnerGroup). Its consumers
+// call the same functions as always, and:
+//
+//   - only LaunchDaemons can wrap or unwrap with it: a process in a login
+//     session -- Terminal, `sudo` from it, a GUI app, SSH -- gets
+//     HKDFGUARD_ERR_KEK_ACCESS_DENIED. (The Secure Enclave binds the key
+//     to the system context; the library refuses other contexts first.)
+//   - only root and members of RunnerGroup can read the file; anyone else
+//     gets HKDFGUARD_ERR_KEK_ACCESS_DENIED. Make RunnerGroup hold only the
+//     no-login service accounts its daemons run as.
+//   - it works logged out, at the login window, and after an unattended
+//     restart (`fdesetup authrestart`).
+//   - a file that is not root's, writable by anyone else, readable by
+//     others, or not one this library wrote is HKDFGUARD_ERR_KEK_INVALID.
+//
+// hkdfguard_kek_exists and hkdfguard_kek_fingerprint answer from the file
+// alone, without the Secure Enclave, so root can use them from Terminal.
+// hkdfguard_create_kek creates a machine KEK only as root in the system
+// context (HKDFGUARD_ERR_KEK_ACCESS_DENIED otherwise). Root can always
+// read the file and run a LaunchDaemon: like every secret store on macOS,
+// machine scope trusts root.
 
 // ---------------------------------------------------------------------------
 // Functions
@@ -343,6 +390,20 @@ int hkdfguard_harden_process_with_flags(unsigned int flags);
 int hkdfguard_keychain_mode(
     int* HKDFGUARD_NONNULL out_mode);
 
+// macOS-only. Writes the KEK policy in effect to `out` as UTF-8 JSON (not
+// NUL-terminated) -- see "Machine scope" above. "mode" is "development",
+// "production" (with "source", "securityAdminGroup",
+// "deploymentAdminGroup" and "machineServices": service -> "runnerGroup"),
+// or "invalid" (with "reason"; every other call then fails with
+// HKDFGUARD_ERR_POLICY_INVALID). Also "machineKeyFolder", and
+// "systemContext": whether this process may use machine KEKs at all. The
+// CLI uses it to enforce the admin roles. `*out_len` is the capacity on
+// entry; set to the length written, or to the length needed with
+// HKDFGUARD_ERR_BUFFER_TOO_SMALL (`out` may be NULL for that size probe).
+int hkdfguard_machine_policy(
+    uint8_t* HKDFGUARD_NULLABLE out,
+    int* HKDFGUARD_NONNULL out_len);
+
 // Reports whether a Secure Enclave KEK already exists for `service`,
 // without creating one. `*out_exists` is written on every return path --
 // 1 if a valid KEK exists, 0 otherwise (including whenever the return
@@ -365,7 +426,7 @@ int hkdfguard_kek_exists(
     const char* HKDFGUARD_NONNULL service,
     int* HKDFGUARD_NONNULL out_exists);
 
-// macOS-only. Writes the 32-byte fingerprint (SHA-256 of the KEK's public key, uncompressed 0x04 || x || y) of
+// Writes the 32-byte fingerprint (SHA-256 of the KEK's public key, uncompressed 0x04 || x || y) of
 // the KEK for `service` to `out` -- the same value embedded at the front of
 // every payload wrapped under it. Public-key material, not a secret. Lets an
 // operator record which KEK a service uses after provisioning, and confirm

@@ -1,0 +1,123 @@
+# Unsigned build and test on a GitHub-hosted Apple silicon runner.
+#
+# Runs on every push to main, every pull request, by hand, and as the first
+# job of release.yml. Needs no Apple credentials: everything is ad-hoc signed
+# (.github/ci/unsigned.xcconfig), and the library runs in legacy keychain
+# mode in the plain xctest agent.
+#
+# What a hosted runner cannot cover -- run these on real Mac hardware before
+# tagging a release (see README.md, "Continuous integration"):
+#   - every test that needs the Secure Enclave: macOS VMs have none, so
+#     those tests skip themselves (`SecureEnclave.isAvailable`)
+#   - the hosted, data-protection suite (HkdfGuardNativeMacOSTests-Hosted),
+#     which needs a provisioning profile for a registered Mac
+#   - scripts/verify-machine-scope.sh, which needs root and LaunchDaemons
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    secrets:
+      LINUX_REPO_TOKEN:
+        description: Read access to hkdfguard-native-linux, if that repository is private
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  # The newest Xcode on the macos-26 image. The project needs Swift 6.2+.
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  test:
+    name: Build and test (unsigned)
+    runs-on: macos-26
+    timeout-minutes: 45
+    concurrency:
+      group: ci-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      # Checked out side by side, as on a developer's Mac:
+      # HkdfGuardCrossPlatformABITests looks for ../hkdfguard-native-linux.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: hkdfguard-native-mac
+          persist-credentials: false
+
+      - name: Check out hkdfguard-native-linux
+        id: linux
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runsecure/hkdfguard-native-linux
+          path: hkdfguard-native-linux
+          token: ${{ secrets.LINUX_REPO_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Report a missing hkdfguard-native-linux
+        if: steps.linux.outcome != 'success'
+        run: echo "::warning::hkdfguard-native-linux could not be checked out (private? set the LINUX_REPO_TOKEN secret); the cross-platform ABI tests will be skipped"
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sysctl -n machdep.cpu.brand_string
+
+      - name: Check shell script syntax
+        working-directory: hkdfguard-native-mac
+        run: |
+          for f in build-dist.sh build-pkg.sh build-release.sh setup-hosted-test-kek.sh scripts/verify-machine-scope.sh; do
+            bash -n "$f"
+          done
+          for f in pkg/scripts/postinstall pkg/uninstall.sh; do
+            sh -n "$f"
+          done
+
+      - name: Test (unhosted, legacy keychain mode)
+        working-directory: hkdfguard-native-mac
+        run: |
+          set -o pipefail
+          xcconfig="$PWD/.github/ci/unsigned.xcconfig"
+          # TEST_RUNNER_-prefixed variables reach the test process, which
+          # builds the dylib and CLI itself (HkdfGuardCommandLineToolTests).
+          XCODE_XCCONFIG_FILE="$xcconfig" TEST_RUNNER_XCODE_XCCONFIG_FILE="$xcconfig" \
+          xcodebuild test \
+            -project HkdfGuardNativeMacOS.xcodeproj \
+            -scheme HkdfGuardNativeMacOSTests \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/HkdfGuardNativeMacOSTests.xcresult"
+
+      # The configurations build-dist.sh ships, compiled (not signed): the
+      # framework in Release, and the CLI with HKDFGUARD_STRICT_HARDENING.
+      - name: Build release configurations
+        working-directory: hkdfguard-native-mac
+        run: |
+          export XCODE_XCCONFIG_FILE="$PWD/.github/ci/unsigned.xcconfig"
+          xcodebuild -project HkdfGuardNativeMacOS.xcodeproj \
+            -scheme HkdfGuardNativeMacOS -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO build
+          xcodebuild -project HkdfGuardNativeMacOS.xcodeproj \
+            -target HkdfGuardNativeMacOSDylib -configuration Release \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO BUILD_DIR="$PWD/build-ci" build
+          HKDFGUARD_DYLIB_DIR="$PWD/build-ci/Release" swift build -c release \
+            --arch arm64 \
+            --package-path hkdfguard-cli \
+            --scratch-path "$RUNNER_TEMP/cli-build" \
+            -Xswiftc -DHKDFGUARD_STRICT_HARDENING
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results
+          path: ${{ runner.temp }}/HkdfGuardNativeMacOSTests.xcresult
+          retention-days: 14
