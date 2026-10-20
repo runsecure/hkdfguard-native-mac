@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds the Release dylib and the hkdfguard-v1-initialize CLI for each
-# supported architecture, signs both with the hardened runtime, verifies
-# them, and collects what a downstream consumer needs (dylib, C header, CLI,
-# SHA256SUMS) into dist/<rid>/ -- one folder per .NET-style runtime
-# identifier: osx-x64 and osx-arm64.
+# Builds the Release dylib and the hkdfguard CLI for arm64
+# (Apple silicon) -- the only supported architecture -- signs both with the
+# hardened runtime, verifies them, and collects what a downstream consumer
+# needs (dylib, C header, CLI, SHA256SUMS) into dist/osx-arm64/, named for
+# the .NET runtime identifier. It must run on an Apple silicon Mac.
 #
-# It also builds the bundled CLI, dist/osx-universal/hkdfguard-v1-initialize.app:
-# the same CLI as a universal app bundle carrying the shared
+# It also builds the bundled CLI, dist/osx-arm64-app/hkdfguard.app:
+# the same CLI as an arm64 app bundle carrying the shared
 # com.hkdfguard.keys keychain access group and an embedded provisioning
 # profile, which is what lets it run in data-protection keychain mode. It is
 # archived and exported by Xcode, because only an export embeds the profile
@@ -16,7 +16,7 @@
 #
 # For a release, set HKDFGUARD_RELEASE=1. It refuses to run unless every
 # artifact will be signed with a "Developer ID Application" identity and
-# notarized -- the bare CLI and dylib in each architecture folder as well as
+# notarized -- the bare CLI and dylib in dist/osx-arm64/ as well as
 # the app bundle -- so a development-signed build, which Gatekeeper rejects on
 # any other Mac, can never be mistaken for a release:
 #
@@ -41,10 +41,30 @@
 # timestamp server: this script needs network access to complete.
 set -euo pipefail
 
+# Signing needs this user's login keychain, which root can't use: under sudo,
+# codesign fails with errSecInternalComponent and root-owned files are left
+# in the build folders. Run as yourself; nothing here needs root.
+if [ "$(/usr/bin/id -u)" -eq 0 ]; then
+    echo "error: don't run $(basename "$0") with sudo -- run it as yourself; nothing here needs root" >&2
+    exit 1
+fi
+
+# This script signs what every machine will trust; don't let the caller's
+# environment decide which codesign/xcodebuild/swift/security/curl it runs.
+# PATH is pinned to the system folders. TOOLCHAINS (an alternate Swift
+# toolchain for xcrun's shims) is cleared: nothing here needs it.
+# DEVELOPER_DIR is left alone -- it is how a particular Xcode is chosen --
+# but the folder in use is printed, so a build log always shows which
+# toolchain built and signed the release.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+unset TOOLCHAINS
+echo "==> Developer tools: ${DEVELOPER_DIR:-$(xcode-select -p)}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT/dist"
-CLI_PKG="$ROOT/hkdfguard-v1-initialize"
-DYLIB_NAME="libhkdfguard_v1.dylib"
+CLI_PKG="$ROOT/hkdfguard-cli"
+DYLIB_NAME="libhkdfguard.dylib"
 HEADER="$ROOT/HkdfGuardNativeMacOS/hkdfguard.h"
 
 # Signing identity for every artifact below. Override with
@@ -79,9 +99,11 @@ case "${HKDFGUARD_APP_EXPORT:-}" in
         ;;
 esac
 
-APP_SCHEME="hkdfguard-v1-initialize-app"
-APP_NAME="hkdfguard-v1-initialize.app"
-APP_EXECUTABLE="hkdfguard-v1-initialize"
+APP_SCHEME="hkdfguard-app"
+APP_TARGET="hkdfguard-app"
+APP_NAME="hkdfguard.app"
+APP_EXECUTABLE="hkdfguard"
+APP_BUNDLE_ID="com.hkdfguard.cli"
 ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
 
 # Credentials. None are stored in this script or the repository; each input
@@ -99,7 +121,20 @@ ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
 #                            in to Xcode. KEY_PATH is the path to the .p8 file;
 #                            keep that file outside the repository. When
 #                            unset, xcodebuild uses the account signed in to
-#                            Xcode (Settings > Accounts).
+#                            Xcode (Settings > Accounts). Not used with
+#                            HKDFGUARD_APP_PROFILE.
+#   HKDFGUARD_APP_PROFILE    optional name of an installed Developer ID
+#                            provisioning profile for the bundled CLI
+#                            ($APP_BUNDLE_ID). When set, the bundle is archived
+#                            and exported with manual signing -- the
+#                            HKDFGUARD_SIGN_IDENTITY certificate and this
+#                            profile -- and xcodebuild never contacts Apple to
+#                            create or download a certificate or profile.
+#                            Requires a Developer ID HKDFGUARD_SIGN_IDENTITY.
+#                            Install the profile with Xcode > Settings >
+#                            Accounts > Download Manual Profiles. (Double-
+#                            clicking the file does not put it where Xcode
+#                            looks.)
 #   HKDFGUARD_NOTARY_PROFILE optional name of a notarytool keychain profile.
 #                            Create it once with
 #                              xcrun notarytool store-credentials <name>
@@ -109,6 +144,7 @@ ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
 #                            is notarized and stapled; requires developer-id.
 TEAM_ID="${HKDFGUARD_TEAM_ID:-}"
 NOTARY_PROFILE="${HKDFGUARD_NOTARY_PROFILE:-}"
+APP_PROFILE="${HKDFGUARD_APP_PROFILE:-}"
 
 XCODE_AUTH_ARGS=()
 if [ -n "${HKDFGUARD_ASC_KEY_PATH:-}" ]; then
@@ -129,7 +165,7 @@ if [ -n "$NOTARY_PROFILE" ] && [ "$APP_EXPORT" != "developer-id" ]; then
     exit 2
 fi
 
-# True when the per-architecture dylib and bare CLI are signed with Developer
+# True when the dylib and bare CLI are signed with Developer
 # ID -- the only certificate Gatekeeper accepts outside your own Macs, and the
 # only one notarization accepts.
 is_developer_id() { [[ "$SIGN_IDENTITY" == "Developer ID Application"* ]]; }
@@ -139,6 +175,15 @@ is_developer_id() { [[ "$SIGN_IDENTITY" == "Developer ID Application"* ]]; }
 if [ -n "$NOTARY_PROFILE" ] && ! is_developer_id; then
     echo "error: HKDFGUARD_NOTARY_PROFILE is set, but HKDFGUARD_SIGN_IDENTITY is '$SIGN_IDENTITY'; notarization requires a \"Developer ID Application\" identity" >&2
     exit 2
+fi
+
+# A Developer ID profile only works with a Developer ID certificate and a
+# developer-id export.
+if [ -n "$APP_PROFILE" ]; then
+    is_developer_id \
+        || { echo "error: HKDFGUARD_APP_PROFILE is set, but HKDFGUARD_SIGN_IDENTITY is '$SIGN_IDENTITY'; a Developer ID profile needs a \"Developer ID Application\" identity" >&2; exit 2; }
+    [ "$APP_EXPORT" = "developer-id" ] \
+        || { echo "error: HKDFGUARD_APP_PROFILE is set, but HKDFGUARD_APP_EXPORT is $APP_EXPORT; it requires developer-id" >&2; exit 2; }
 fi
 
 if [ "${HKDFGUARD_RELEASE:-}" = "1" ]; then
@@ -176,6 +221,31 @@ assert_arch() {
 # on its first match, the tool then dies of SIGPIPE writing the rest of its
 # output, and `set -o pipefail` reports that as a failed pipeline -- a
 # false failure (or, for a negated check, a false pass).
+# The binary's LC_RPATH list must be exactly the one given: nothing may be
+# searched for the dylib before (or besides) the directory the binary is in.
+assert_only_rpath() {
+    local file="$1" expected="$2" rpaths
+    rpaths="$(otool -l "$file" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}')"
+    [ "$rpaths" = "$expected" ] \
+        || fail "$file must have exactly one rpath, $expected; found: $(tr '\n' ' ' <<<"$rpaths")"
+}
+
+# Asserts `file`'s signature carries exactly the given top-level
+# entitlements -- none at all when no keys are given. An allowlist, not a
+# list of known-bad keys: get-task-allow (debugger attach),
+# cs.disable-library-validation, cs.allow-dyld-environment-variables, or
+# anything else added later fails the build, since each would undo part of
+# what the hardened runtime and the signature checks promise.
+assert_entitlements() {
+    local file="$1" actual expected
+    shift
+    actual="$(codesign -d --entitlements - "$file" 2>/dev/null \
+        | awk '/^\t\[Key\] /{sub(/^\t\[Key\] /, ""); print}' | sort)"
+    expected="$(printf '%s\n' "$@" | sed '/^$/d' | sort)"
+    [ "$actual" = "$expected" ] \
+        || fail "$file: entitlements are [$(tr '\n' ' ' <<<"$actual")], expected [$(tr '\n' ' ' <<<"$expected")]"
+}
+
 assert_signed() {
     local file="$1" info
     codesign --verify --strict --verbose=1 "$file" \
@@ -204,47 +274,96 @@ assert_identity() {
     fi
 }
 
-# Asserts Gatekeeper accepts `file` as notarized. A bare dylib or executable
-# cannot carry a stapled ticket, so Gatekeeper looks the ticket up online;
-# right after notarization the lookup can lag briefly, hence the retries.
-# `type` is "open" for a dylib (judged by its own signature) or "execute" for
-# the CLI.
-assert_notarized() {
-    local file="$1" type="$2" assessment attempt
-    for attempt in 1 2 3 4 5 6; do
-        if [ "$type" = "open" ]; then
-            assessment="$(spctl --assess --type open --context context:primary-signature -vv "$file" 2>&1)" || true
-        else
-            assessment="$(spctl --assess --type execute -vv "$file" 2>&1)" || true
-        fi
-        grep -q 'source=Notarized Developer ID' <<<"$assessment" && return 0
-        sleep 10
+# Asserts Apple's notarization log `log` lists `file`'s cdhash among the
+# ticket contents -- the authoritative answer, straight from the notary
+# service, with no local caching in between.
+assert_in_ticket() {
+    local file="$1" log="$2" cdhash i entry
+    cdhash="$(codesign -dvvv "$file" 2>&1 | sed -n 's/^CDHash=//p')"
+    [ -n "$cdhash" ] || fail "$file: could not read its cdhash"
+    for ((i = 0; ; i++)); do
+        entry="$(plist_value "$log" "ticketContents.$i.cdhash")"
+        [ -n "$entry" ] || break
+        [ "$entry" = "$cdhash" ] && return 0
     done
-    fail "Gatekeeper does not report $file as notarized: $assessment"
+    fail "$file (cdhash $cdhash) is not in the notarization ticket: $(cat "$log")"
 }
 
-# Notarizes the dylib and bare CLI in one architecture folder. Nothing is
+# Apple's ticket service: where Gatekeeper on any Mac fetches the
+# notarization ticket of a bare dylib or executable (which, unlike an app or
+# package, cannot carry a stapled one), keyed by cdhash. `stapler` uses the
+# same service.
+TICKET_LOOKUP_URL="https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
+
+# Asserts the ticket service publishes a notarization ticket for `file` --
+# what every *other* Mac will find when it first runs it. Checked against
+# the service directly rather than through this Mac's `spctl`: syspolicyd
+# caches lookups by cdhash, and a negative answer it cached once has been
+# seen to outlast a published ticket by many minutes. The build is
+# reproducible, so the same cdhash recurs across builds of unchanged code.
+# Retries cover the short delay between "Accepted" and publication.
+assert_ticket_published() {
+    local file="$1" cdhash response attempt
+    cdhash="$(codesign -dvvv "$file" 2>&1 | sed -n 's/^CDHash=//p')"
+    [ -n "$cdhash" ] || fail "$file: could not read its cdhash"
+    response="$WORK/ticket-$cdhash.json"
+    for attempt in $(seq 1 12); do
+        if curl -fsS -m 20 -X POST -H 'Content-Type: application/json' \
+                -d "{\"records\":[{\"recordName\":\"2/2/$cdhash\"}]}" \
+                "$TICKET_LOOKUP_URL" -o "$response" 2>/dev/null \
+            && [ "$(plist_value "$response" records.0.recordType)" = DeveloperIDTicket ] \
+            && [ -n "$(plist_value "$response" records.0.fields.signedTicket.value)" ]; then
+            return 0
+        fi
+        sleep 15
+    done
+    fail "Apple's ticket service has no notarization ticket for $file (cdhash $cdhash) after 3 minutes: $(cat "$response" 2>/dev/null)"
+}
+
+# Reports what this Mac's Gatekeeper says about `file`, as a warning only --
+# see assert_ticket_published for why it is not the authority. Assessed by
+# the file's own signature (--type open with the primary-signature context):
+# `--type execute` on a bare executable only says "does not seem to be an
+# app" and never reports a source.
+report_local_gatekeeper() {
+    local file="$1" assessment
+    assessment="$(spctl --assess --type open --context context:primary-signature -vv "$file" 2>&1)" || true
+    if ! grep -q 'source=Notarized Developer ID' <<<"$assessment"; then
+        echo "    note: this Mac's Gatekeeper does not yet report $(basename "$file") as notarized"
+        echo "          (likely a cached lookup; Apple's ticket service has the ticket, checked above)"
+    fi
+}
+
+# Notarizes the dylib and bare CLI in dist/<rid>/. Nothing is
 # modified on disk -- no ticket can be stapled to a bare Mach-O -- so the
 # signatures checked above and the SHA256SUMS written afterward stay valid.
 notarize_arch() {
     local rid="$1" out="$2"
     local bundle="$WORK/notarize-$rid" submission="$WORK/notarize-$rid.zip" result="$WORK/notary-$rid.json"
-    echo "==> Notarizing $rid ($DYLIB_NAME, hkdfguard-v1-initialize) with keychain profile \"$NOTARY_PROFILE\""
+    local log="$WORK/notary-log-$rid.json" id
+    echo "==> Notarizing $rid ($DYLIB_NAME, hkdfguard) with keychain profile \"$NOTARY_PROFILE\""
     mkdir -p "$bundle"
-    cp "$out/$DYLIB_NAME" "$out/hkdfguard-v1-initialize" "$bundle/"
+    cp "$out/$DYLIB_NAME" "$out/hkdfguard" "$bundle/"
     ditto -c -k --keepParent "$bundle" "$submission"
     xcrun notarytool submit "$submission" --keychain-profile "$NOTARY_PROFILE" \
         --wait --output-format json >"$result" \
         || fail "notarytool submit failed for $rid: $(cat "$result")"
     [ "$(plist_value "$result" status)" = "Accepted" ] \
         || fail "notarization of $rid not accepted: $(cat "$result") -- run 'xcrun notarytool log <id> --keychain-profile $NOTARY_PROFILE' for details"
-    assert_notarized "$out/$DYLIB_NAME" open
-    assert_notarized "$out/hkdfguard-v1-initialize" execute
+    id="$(plist_value "$result" id)"
+    xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE" "$log" >/dev/null \
+        || fail "could not fetch the notarization log for $rid (submission $id)"
+    assert_in_ticket "$out/$DYLIB_NAME" "$log"
+    assert_in_ticket "$out/hkdfguard" "$log"
+    assert_ticket_published "$out/$DYLIB_NAME"
+    assert_ticket_published "$out/hkdfguard"
+    report_local_gatekeeper "$out/$DYLIB_NAME"
+    report_local_gatekeeper "$out/hkdfguard"
 }
 
 # build_arch <xcode-arch> <rid>
-#   xcode-arch: value for xcodebuild ARCHS / swift build --arch (x86_64, arm64)
-#   rid:        dist/ subfolder name (osx-x64, osx-arm64)
+#   xcode-arch: value for xcodebuild ARCHS / swift build --arch (arm64)
+#   rid:        dist/ subfolder name (osx-arm64)
 build_arch() {
     local arch="$1" rid="$2"
     local build_dir="$ROOT/build-$arch"
@@ -265,44 +384,56 @@ build_arch() {
         build
     [ -f "$dylib_dir/$DYLIB_NAME" ] || fail "expected $dylib_dir/$DYLIB_NAME after the xcodebuild above"
 
-    echo "==> Building hkdfguard-v1-initialize for $arch (release)"
-    # Distinct --scratch-path per architecture: SwiftPM caches the evaluated
-    # manifest (and therefore the linker flags derived from
-    # HKDFGUARD_DYLIB_DIR) per scratch directory.
+    echo "==> Building hkdfguard for $arch (release)"
+    # A dedicated --scratch-path: SwiftPM caches the evaluated manifest (and
+    # therefore the linker flags derived from HKDFGUARD_DYLIB_DIR) per
+    # scratch directory, so a plain `swift build` can't bleed into this one.
+    # HKDFGUARD_STRICT_HARDENING: this CLI is signed below with the
+    # Hardened Runtime and no entitlements, so it can require that of itself
+    # (HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE). The --help smoke test
+    # after signing proves it does start.
     HKDFGUARD_DYLIB_DIR="$dylib_dir" swift build -c release \
         --arch "$arch" \
         --package-path "$CLI_PKG" \
-        --scratch-path "$scratch"
+        --scratch-path "$scratch" \
+        -Xswiftc -DHKDFGUARD_STRICT_HARDENING
     local cli_bin_dir
     cli_bin_dir="$(HKDFGUARD_DYLIB_DIR="$dylib_dir" swift build -c release \
         --arch "$arch" \
         --package-path "$CLI_PKG" \
         --scratch-path "$scratch" \
+        -Xswiftc -DHKDFGUARD_STRICT_HARDENING \
         --show-bin-path)"
-    [ -f "$cli_bin_dir/hkdfguard-v1-initialize" ] || fail "expected CLI at $cli_bin_dir/hkdfguard-v1-initialize"
+    [ -f "$cli_bin_dir/hkdfguard" ] || fail "expected CLI at $cli_bin_dir/hkdfguard"
 
     echo "==> Assembling $out"
     cp "$dylib_dir/$DYLIB_NAME" "$out/"
     cp "$HEADER" "$out/"
-    cp "$cli_bin_dir/hkdfguard-v1-initialize" "$out/"
+    cp "$cli_bin_dir/hkdfguard" "$out/"
 
-    echo "==> Making $rid/hkdfguard-v1-initialize self-contained"
+    echo "==> Making $rid/hkdfguard self-contained"
     # As linked (see Package.swift), the CLI finds the dylib via an -rpath
-    # baked in as this machine's absolute per-arch build directory -- fine
+    # baked in as this machine's absolute build directory -- fine
     # locally, useless once dist/ is copied anywhere else. The dylib's own
     # install_name is the relocatable "@rpath/<name>.dylib", so the CLI
     # only needs an rpath that resolves relative to itself:
     # @executable_path, i.e. "the directory this binary lives in".
-    local cli="$out/hkdfguard-v1-initialize"
-    install_name_tool -delete_rpath "$dylib_dir" "$cli"
+    #
+    # And ONLY that rpath. SwiftPM also records the toolchain's own
+    # directories (/usr/lib/swift and a path inside /Applications/Xcode.app),
+    # and dyld searches rpaths in order: an rpath under /Applications --
+    # writable by the admin group -- ahead of @executable_path would let an
+    # admin who isn't root plant a (Team-signed) libhkdfguard.dylib that a
+    # root `hkdfguard` loads in preference to the root-only installed copy.
+    # Every rpath other than @executable_path is removed, and the result is
+    # asserted to be exactly that one.
+    local cli="$out/hkdfguard"
+    local rpath
+    while read -r rpath; do
+        [ -n "$rpath" ] && install_name_tool -delete_rpath "$rpath" "$cli"
+    done < <(otool -l "$cli" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}')
     install_name_tool -add_rpath "@executable_path" "$cli"
-    local rpaths
-    rpaths="$(otool -l "$cli" | grep -A2 LC_RPATH || true)"
-    if grep -q "path $dylib_dir" <<<"$rpaths"; then
-        fail "$cli still carries the absolute build rpath $dylib_dir"
-    fi
-    grep -q 'path @executable_path' <<<"$rpaths" \
-        || fail "$cli lacks the @executable_path rpath"
+    assert_only_rpath "$cli" "@executable_path"
 
     echo "==> Signing (hardened runtime, timestamped) with: $SIGN_IDENTITY"
     # install_name_tool invalidated the CLI's linker signature; and the
@@ -318,37 +449,27 @@ build_arch() {
     assert_signed "$cli"
     assert_identity "$out/$DYLIB_NAME"
     assert_identity "$cli"
+    assert_entitlements "$out/$DYLIB_NAME"
+    assert_entitlements "$cli"
     local links
     links="$(otool -L "$cli")"
     grep -q "@rpath/$DYLIB_NAME" <<<"$links" \
         || fail "$cli does not reference @rpath/$DYLIB_NAME"
 
-    # Smoke test, host architecture only: --help must launch, which means
-    # dyld resolved the dylib next to the binary via @executable_path AND
-    # library validation (hardened runtime) accepted its signature.
-    if [ "$(uname -m)" = "$arch" ]; then
-        echo "==> Smoke test: $cli --help"
-        local help
-        help="$("$cli" --help 2>&1)" || fail "$cli --help exited non-zero: $help"
-        grep -qi usage <<<"$help" || fail "$cli --help did not print usage"
-    else
-        echo "==> (skipping launch smoke test: host is $(uname -m), artifact is $arch)"
-    fi
+    # Smoke test: --help must launch, which means dyld resolved the dylib
+    # next to the binary via @executable_path AND library validation
+    # (hardened runtime) accepted its signature.
+    echo "==> Smoke test: $cli --help"
+    local help
+    help="$("$cli" --help 2>&1)" || fail "$cli --help exited non-zero: $help"
+    grep -qi usage <<<"$help" || fail "$cli --help did not print usage"
 
     if [ -n "$NOTARY_PROFILE" ]; then
         notarize_arch "$rid" "$out"
     fi
 
     echo "==> Writing $rid/SHA256SUMS"
-    (cd "$out" && shasum -a 256 "$DYLIB_NAME" "$(basename "$HEADER")" hkdfguard-v1-initialize > SHA256SUMS)
-}
-
-# Asserts that a Mach-O file contains both supported architectures.
-assert_universal() {
-    local file="$1" archs
-    archs="$(lipo -archs "$file")"
-    [[ " $archs " == *" arm64 "* && " $archs " == *" x86_64 "* ]] \
-        || fail "$file is built for '$archs', expected both arm64 and x86_64"
+    (cd "$out" && shasum -a 256 "$DYLIB_NAME" "$(basename "$HEADER")" hkdfguard > SHA256SUMS)
 }
 
 # Prints `key`'s raw value from a plist, or nothing if it is absent.
@@ -356,12 +477,12 @@ plist_value() {
     plutil -extract "$2" raw -o - "$1" 2>/dev/null || true
 }
 
-# build_app: archives the bundled CLI (universal), exports it with the
+# build_app: archives the bundled CLI (arm64), exports it with the
 # embedded provisioning profile its keychain-access-groups entitlement
 # requires, verifies it, optionally notarizes and staples it, and stages it
-# as osx-universal/hkdfguard-v1-initialize.app.
+# as osx-arm64-app/hkdfguard.app.
 build_app() {
-    local out="$STAGE/osx-universal"
+    local out="$STAGE/osx-arm64-app"
     local archive="$WORK/app.xcarchive"
     local export_dir="$WORK/export"
     local options="$WORK/ExportOptions.plist"
@@ -369,31 +490,71 @@ build_app() {
     local expected_group="$TEAM_ID.$ACCESS_GROUP_SUFFIX"
 
     echo
-    echo "==================== osx-universal ($APP_NAME, export: $APP_EXPORT) ===================="
+    echo "==================== osx-arm64-app ($APP_NAME, export: $APP_EXPORT) ===================="
 
-    echo "==> Archiving $APP_SCHEME (Release, arm64 + x86_64, team $TEAM_ID)"
+    # A developer-id export carries no get-task-allow, so its CLI can require
+    # a protected signature of itself (see main.swift); a debugging export
+    # is development-signed and stays advisory. The smoke test after
+    # stapling proves the strict build starts.
+    local strict_conditions=()
+    if [ "$APP_EXPORT" = "developer-id" ]; then
+        strict_conditions=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) HKDFGUARD_STRICT_HARDENING')
+    fi
+
+    # Automatic signing lets xcodebuild create or download what it needs
+    # (-allowProvisioningUpdates). With HKDFGUARD_APP_PROFILE the archive is
+    # signed manually, with the Developer ID certificate and the named
+    # profile, and nothing is fetched. These settings apply to every target
+    # the scheme builds, including the dylib, which can't take a profile, so
+    # the profile is looked up by target name: only $APP_TARGET resolves one,
+    # every other target gets an empty specifier.
+    local provisioning_args=(-allowProvisioningUpdates ${XCODE_AUTH_ARGS[@]+"${XCODE_AUTH_ARGS[@]}"})
+    local manual_signing=()
+    if [ -n "$APP_PROFILE" ]; then
+        provisioning_args=()
+        local profile_key
+        profile_key="HKDFGUARD_PROFILE_FOR_$(tr -c 'A-Za-z0-9_\n' '_' <<<"$APP_TARGET")"
+        manual_signing=(
+            CODE_SIGN_STYLE=Manual
+            "CODE_SIGN_IDENTITY=$SIGN_IDENTITY"
+            'PROVISIONING_PROFILE_SPECIFIER=$(HKDFGUARD_PROFILE_FOR_$(TARGET_NAME:c99extidentifier))'
+            "$profile_key=$APP_PROFILE"
+        )
+    fi
+
+    echo "==> Archiving $APP_SCHEME (Release, arm64, team $TEAM_ID, signing: ${APP_PROFILE:+manual, profile $APP_PROFILE}${APP_PROFILE:-automatic})"
     xcodebuild archive \
         -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
         -scheme "$APP_SCHEME" \
         -configuration Release \
         -destination "generic/platform=macOS" \
         -archivePath "$archive" \
-        -allowProvisioningUpdates \
-        ${XCODE_AUTH_ARGS[@]+"${XCODE_AUTH_ARGS[@]}"} \
-        ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
-        DEVELOPMENT_TEAM="$TEAM_ID"
+        ${provisioning_args[@]+"${provisioning_args[@]}"} \
+        ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+        DEVELOPMENT_TEAM="$TEAM_ID" \
+        ${manual_signing[@]+"${manual_signing[@]}"} \
+        ${strict_conditions[@]+"${strict_conditions[@]}"}
 
     echo "==> Exporting ($APP_EXPORT)"
     plutil -create xml1 "$options"
     plutil -insert method -string "$APP_EXPORT" "$options"
     plutil -insert teamID -string "$TEAM_ID" "$options"
-    plutil -insert signingStyle -string automatic "$options"
+    if [ -n "$APP_PROFILE" ]; then
+        plutil -insert signingStyle -string manual "$options"
+        plutil -insert signingCertificate -string "$SIGN_IDENTITY" "$options"
+        # PlistBuddy, not plutil: the bundle ID's dots would read as a key path.
+        /usr/libexec/PlistBuddy \
+            -c "Add :provisioningProfiles dict" \
+            -c "Add :provisioningProfiles:$APP_BUNDLE_ID string $APP_PROFILE" \
+            "$options"
+    else
+        plutil -insert signingStyle -string automatic "$options"
+    fi
     xcodebuild -exportArchive \
         -archivePath "$archive" \
         -exportPath "$export_dir" \
         -exportOptionsPlist "$options" \
-        -allowProvisioningUpdates \
-        ${XCODE_AUTH_ARGS[@]+"${XCODE_AUTH_ARGS[@]}"}
+        ${provisioning_args[@]+"${provisioning_args[@]}"}
 
     local app="$export_dir/$APP_NAME"
     local exe="$app/Contents/MacOS/$APP_EXECUTABLE"
@@ -405,8 +566,10 @@ build_app() {
     codesign --verify --strict --deep --verbose=1 "$app" \
         || fail "$app: signature does not verify"
 
+    # -dvv, not -dv: only the second level of verbosity prints the
+    # Authority= (certificate chain) lines checked below.
     local info
-    info="$(codesign -dv "$app" 2>&1)"
+    info="$(codesign -dvv "$app" 2>&1)"
     grep -q 'flags=0x10000(runtime)' <<<"$info" || fail "$app: hardened runtime flag missing"
     grep -q "^TeamIdentifier=$TEAM_ID\$" <<<"$info" || fail "$app: not signed by team $TEAM_ID"
     if [ "$APP_EXPORT" = "developer-id" ]; then
@@ -419,8 +582,18 @@ build_app() {
     info="$(codesign -dv "$embedded_dylib" 2>&1)"
     grep -q "^TeamIdentifier=$TEAM_ID\$" <<<"$info" || fail "$embedded_dylib: not signed by team $TEAM_ID"
 
-    assert_universal "$exe"
-    assert_universal "$embedded_dylib"
+    # The app's own keychain identity and nothing more. A development
+    # export is debuggable by design (get-task-allow) and never packaged:
+    # build-pkg.sh accepts only the developer-id set.
+    local app_entitlements=(com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups)
+    if [ "$APP_EXPORT" != "developer-id" ]; then
+        app_entitlements+=(com.apple.security.get-task-allow)
+    fi
+    assert_entitlements "$exe" "${app_entitlements[@]}"
+    assert_entitlements "$embedded_dylib"
+
+    assert_arch "$exe" arm64
+    assert_arch "$embedded_dylib" arm64
 
     # The library stores KEKs under the FIRST listed access group.
     local entitlements="$WORK/entitlements.plist"
@@ -442,6 +615,10 @@ build_app() {
     security cms -D -i "$profile" >"$profile_plist" 2>/dev/null || fail "$profile: could not decode"
     [ "$(plist_value "$profile_plist" TeamIdentifier.0)" = "$TEAM_ID" ] \
         || fail "$profile: not issued for team $TEAM_ID"
+    if [ -n "$APP_PROFILE" ]; then
+        [ "$(plist_value "$profile_plist" Name)" = "$APP_PROFILE" ] \
+            || fail "$profile: is '$(plist_value "$profile_plist" Name)', expected HKDFGUARD_APP_PROFILE '$APP_PROFILE'"
+    fi
     local profile_group
     profile_group="$(plist_value "$profile_plist" Entitlements.keychain-access-groups.0)"
     [ "$profile_group" = "$expected_group" ] || [ "$profile_group" = "$TEAM_ID.*" ] \
@@ -454,18 +631,6 @@ build_app() {
             || fail "$profile: expected a development profile with registered devices"
         echo "    note: development-signed; launches only on Macs registered in this profile"
     fi
-
-    # Read-only smoke test on this Mac: the bundle launches (AMFI accepted the
-    # profile, library validation accepted the embedded dylib) and the
-    # library reports data-protection mode. `status` never creates a key.
-    echo "==> Smoke test: $APP_EXECUTABLE --help, status"
-    local output
-    output="$("$exe" --help 2>&1)" || fail "$exe --help exited non-zero: $output"
-    grep -qi usage <<<"$output" || fail "$exe --help did not print usage"
-    output="$("$exe" status --service-name com.hkdfguard.builddist.smoketest 2>&1)" \
-        || fail "$exe status exited non-zero: $output"
-    grep -q '^keychain: data-protection$' <<<"$output" \
-        || fail "$exe does not run in data-protection keychain mode: $output"
 
     if [ -n "$NOTARY_PROFILE" ]; then
         echo "==> Notarizing with keychain profile \"$NOTARY_PROFILE\""
@@ -489,12 +654,34 @@ build_app() {
 
     mkdir -p "$out"
     ditto "$app" "$out/$APP_NAME"
+
+    # Read-only smoke test on this Mac, run only now -- after stapling, and on
+    # the work copy rather than the one staged for dist/. Once a notarized
+    # app has been launched, macOS App Management protection blocks writes
+    # into the bundle, so stapler would fail ("Error 73", can't create
+    # output). The code is reproducible, so even a fresh export can already
+    # be notarized from an earlier run. The bundle launches (AMFI accepted the
+    # profile, library validation accepted the embedded dylib) and the
+    # library reports data-protection mode. `status` never creates a key.
+    echo "==> Smoke test: $APP_EXECUTABLE --help, status"
+    local output
+    output="$("$exe" --help 2>&1)" || fail "$exe --help exited non-zero: $output"
+    grep -qi usage <<<"$output" || fail "$exe --help did not print usage"
+    output="$("$exe" status --service-name com.hkdfguard.builddist.smoketest 2>&1)" \
+        || fail "$exe status exited non-zero: $output"
+    grep -q '^keychain: data-protection$' <<<"$output" \
+        || fail "$exe does not run in data-protection keychain mode: $output"
 }
 
 # Resolves the Team ID and checks signing prerequisites up front, so a
-# missing certificate fails in seconds rather than after the
-# per-architecture builds.
+# missing certificate fails in seconds rather than after the builds.
 preflight_app() {
+    # The hardware, not this shell: hw.optional.arm64 is 1 on Apple silicon
+    # even under Rosetta, and does not exist on Intel. The arm64 smoke tests
+    # below have to launch what was just built.
+    [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ] \
+        || fail "build-dist.sh builds arm64 only and must run on an Apple silicon Mac"
+
     if [ -z "$TEAM_ID" ]; then
         TEAM_ID="$(xcodebuild -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
             -scheme "$APP_SCHEME" -configuration Release -showBuildSettings 2>/dev/null \
@@ -514,17 +701,63 @@ testing on registered Macs only.
 EOF
 )"
     fi
+
+    [ -z "$APP_PROFILE" ] || preflight_profile
+}
+
+# Finds the installed profile named HKDFGUARD_APP_PROFILE -- where Xcode 16
+# and later keep profiles, and where older versions did -- and checks it
+# before anything is built: exactly one with that name, a Developer ID
+# profile for this team and $APP_BUNDLE_ID, granting the production access
+# group, and not expired.
+preflight_profile() {
+    local dir file name matches=()
+    for dir in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+               "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+        [ -d "$dir" ] || continue
+        for file in "$dir"/*.provisionprofile; do
+            [ -f "$file" ] || continue
+            name="$(security cms -D -i "$file" 2>/dev/null | plutil -extract Name raw -o - - 2>/dev/null)" || continue
+            [ "$name" = "$APP_PROFILE" ] && matches+=("$file")
+        done
+    done
+    [ "${#matches[@]}" -gt 0 ] || fail "$(cat <<EOF
+no installed provisioning profile named "$APP_PROFILE" (HKDFGUARD_APP_PROFILE).
+Install it with Xcode > Settings > Accounts > (your team) > Download Manual
+Profiles; double-clicking the file does not put it where Xcode looks.
+EOF
+)"
+    [ "${#matches[@]}" -eq 1 ] \
+        || fail "found ${#matches[@]} installed profiles named \"$APP_PROFILE\"; remove the stale ones: ${matches[*]}"
+
+    local plist="$WORK/preflight-profile.plist"
+    security cms -D -i "${matches[0]}" >"$plist" 2>/dev/null || fail "${matches[0]}: could not decode"
+    echo "==> Provisioning profile: $APP_PROFILE (${matches[0]})"
+    [ "$(plist_value "$plist" TeamIdentifier.0)" = "$TEAM_ID" ] \
+        || fail "profile \"$APP_PROFILE\" is not issued for team $TEAM_ID"
+    [ "$(plist_value "$plist" ProvisionsAllDevices)" = "true" ] \
+        || fail "profile \"$APP_PROFILE\" is not a Developer ID profile (it does not provision all devices)"
+    [ "$(plist_value "$plist" Entitlements.com\\.apple\\.application-identifier)" = "$TEAM_ID.$APP_BUNDLE_ID" ] \
+        || fail "profile \"$APP_PROFILE\" is for '$(plist_value "$plist" Entitlements.com\\.apple\\.application-identifier)', expected '$TEAM_ID.$APP_BUNDLE_ID'"
+    local group
+    group="$(plist_value "$plist" Entitlements.keychain-access-groups.0)"
+    [ "$group" = "$TEAM_ID.$ACCESS_GROUP_SUFFIX" ] || [ "$group" = "$TEAM_ID.*" ] \
+        || fail "profile \"$APP_PROFILE\" does not grant the keychain access group '$TEAM_ID.$ACCESS_GROUP_SUFFIX' (grants '$group')"
+    local expires
+    expires="$(plist_value "$plist" ExpirationDate)"
+    [[ "$expires" > "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ]] \
+        || fail "profile \"$APP_PROFILE\" expired at $expires"
 }
 
 preflight_app
-build_arch x86_64 osx-x64
-build_arch arm64  osx-arm64
+build_arch arm64 osx-arm64
 build_app
 
 echo
 echo "==> All builds and checks passed; installing into $DIST"
 rm -rf "$DIST"
 mv "$STAGE" "$DIST"
+rm -rf "$WORK"
 trap - EXIT
 
 echo "==> Done:"
@@ -532,4 +765,4 @@ find "$DIST" -type f | sort | while read -r f; do
     printf '%-70s %s\n' "${f#"$ROOT"/}" "$(lipo -archs "$f" 2>/dev/null || echo '-')"
 done
 echo
-cat "$DIST"/osx-*/SHA256SUMS
+cat "$DIST"/osx-arm64/SHA256SUMS

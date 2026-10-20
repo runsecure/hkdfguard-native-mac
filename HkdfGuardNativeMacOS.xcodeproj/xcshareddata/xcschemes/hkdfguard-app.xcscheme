@@ -16,13 +16,20 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "C1A7E5700002000000000001"
-               BuildableName = "hkdfguard-v1-initialize.app"
-               BlueprintName = "hkdfguard-v1-initialize-app"
+               BuildableName = "hkdfguard.app"
+               BlueprintName = "hkdfguard-app"
                ReferencedContainer = "container:HkdfGuardNativeMacOS.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
+   <TestAction
+      buildConfiguration = "Debug"
+      selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
+      selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
+      shouldUseLaunchSchemeArgsEnv = "YES"
+      shouldAutocreateTestPlan = "YES">
+   </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
@@ -38,12 +45,22 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "C1A7E5700002000000000001"
-            BuildableName = "hkdfguard-v1-initialize.app"
-            BlueprintName = "hkdfguard-v1-initialize-app"
+            BuildableName = "hkdfguard.app"
+            BlueprintName = "hkdfguard-app"
             ReferencedContainer = "container:HkdfGuardNativeMacOS.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
+   <ProfileAction
+      buildConfiguration = "Release"
+      shouldUseLaunchSchemeArgsEnv = "YES"
+      savedToolIdentifier = ""
+      useCustomWorkingDirectory = "NO"
+      debugDocumentVersioning = "YES">
+   </ProfileAction>
+   <AnalyzeAction
+      buildConfiguration = "Debug">
+   </AnalyzeAction>
    <ArchiveAction
       buildConfiguration = "Release"
       revealArchiveInOrganizer = "NO">

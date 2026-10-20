@@ -2,22 +2,22 @@
 import Foundation
 import PackageDescription
 
-// This package builds one executable, `hkdfguard-v1-initialize`, that links
+// This package builds one executable, `hkdfguard`, that links
 // directly against the sibling Xcode project's already-built
-// libhkdfguard_v1.dylib (the HkdfGuardNativeMacOSDylib
+// libhkdfguard.dylib (the HkdfGuardNativeMacOSDylib
 // target) and calls into it purely through its stable C ABI
 // (`hkdfguard_wrap_dek`) -- the same interface any other-language caller
 // uses, matching this project's Linux equivalent
-// (hkdfguard-native-linux/src/bin/hkdfguard-v1-initialize.rs).
+// (hkdfguard-native-linux/src/bin/hkdfguard.rs).
 //
 // Build the library first:
 //   xcodebuild -project ../HkdfGuardNativeMacOS.xcodeproj \
 //       -target HkdfGuardNativeMacOSDylib -configuration Release build
 // then build/run this tool from anywhere:
 //   swift build --package-path <this-directory> -c release
-//   <this-directory>/.build/release/hkdfguard-v1-initialize --help
+//   <this-directory>/.build/release/hkdfguard --help
 //
-// The dylib's own `install_name` is `@rpath/libhkdfguard_v1.dylib`
+// The dylib's own `install_name` is `@rpath/libhkdfguard.dylib`
 // (see its build settings' DYLIB_INSTALL_NAME_BASE), so the executable needs
 // an explicit -rpath pointing at the directory it actually lives in to
 // resolve it at *run* time, not just link time. That directory is computed
@@ -31,12 +31,9 @@ import PackageDescription
 // normal installed command-line tool should.
 //
 // HKDFGUARD_DYLIB_DIR overrides that default directory. build-dist.sh uses
-// it to link each architecture's CLI against the matching per-architecture
-// dylib build (build-x86_64/Release, build-arm64/Release) -- the linker
-// refuses to link an x86_64 executable against an arm64-only dylib, so a
-// single hardcoded directory can only ever produce a host-architecture
-// CLI. Pair an override with a distinct --scratch-path per architecture so
-// one build's cached manifest/linker flags can't bleed into the other's.
+// it to link the CLI against its own Release dylib build
+// (build-arm64/Release). Pair an override with a dedicated --scratch-path so
+// a cached manifest/linker flags from another build can't bleed into it.
 let hkdfguardDylibDir: String = {
     if let override = ProcessInfo.processInfo.environment["HKDFGUARD_DYLIB_DIR"], !override.isEmpty {
         return override
@@ -47,17 +44,17 @@ let hkdfguardDylibDir: String = {
         .standardizedFileURL
         .path
 }()
-let hkdfguardDylibPath = "\(hkdfguardDylibDir)/libhkdfguard_v1.dylib"
+let hkdfguardDylibPath = "\(hkdfguardDylibDir)/libhkdfguard.dylib"
 
 let package = Package(
-    name: "hkdfguard-v1-initialize",
-    platforms: [.macOS(.v13)],
+    name: "hkdfguard",
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "hkdfguard-v1-initialize",
+            name: "hkdfguard",
             linkerSettings: [
                 // The exact dylib path is handed to the linker rather than
-                // `-L<dir> -lhkdfguard_v1`, so the link can only ever pick up
+                // `-L<dir> -lhkdfguard`, so the link can only ever pick up
                 // the build named here, never a same-named library found
                 // earlier on the linker's search path.
                 .unsafeFlags([

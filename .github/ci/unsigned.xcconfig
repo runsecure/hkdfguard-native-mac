@@ -1,0 +1,17 @@
+// Ad-hoc signing for CI builds and tests on GitHub-hosted runners, which
+// have no Apple certificates or provisioning profiles.
+//
+// Applied through the XCODE_XCCONFIG_FILE environment variable rather than
+// `xcodebuild -xcconfig`, so it also reaches the xcodebuild that
+// HkdfGuardCommandLineToolTests runs from inside the test process (passed
+// there as TEST_RUNNER_XCODE_XCCONFIG_FILE). Ad-hoc signed binaries carry
+// no Team ID, so this only works for the unhosted, legacy-mode suite: never
+// for the entitled targets (hkdfguard-app, the hosted test host) and never
+// for anything distributed.
+
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+CODE_SIGN_IDENTITY[sdk=macosx*] = -
+DEVELOPMENT_TEAM =
+PROVISIONING_PROFILE_SPECIFIER =
+PROVISIONING_PROFILE =

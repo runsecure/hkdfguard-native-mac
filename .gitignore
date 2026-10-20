@@ -5,7 +5,7 @@
 .DS_Store
 
 ## Build products (xcodebuild's default -derivedDataPath / raw `build/` output
-## directory used throughout this project's docs and by hkdfguard-v1-initialize's
+## directory used throughout this project's docs and by hkdfguard's
 ## Package.swift, which links against it)
 build/
 dist/
@@ -13,7 +13,7 @@ build-arm64/
 build-x64/
 build-x86_64/
 ## Per-architecture SwiftPM scratch directories used by build-dist.sh
-hkdfguard-v1-initialize/.build-*/
+hkdfguard-cli/.build-*/
 
 ## Signing secrets: App Store Connect API keys (.p8) and exported
 ## certificates with private keys (.p12/.pfx). build-dist.sh only takes

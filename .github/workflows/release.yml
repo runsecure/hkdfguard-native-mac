@@ -1,0 +1,211 @@
+# Signed, notarized release: runs build-release.sh (build-dist.sh, then
+# build-pkg.sh) on a GitHub-hosted Apple silicon runner and publishes
+#
+#   hkdfguard-native-macos-<version>-osx-arm64.pkg   (+ .sha256)
+#
+# to a GitHub Release.
+#
+#   push a tag vX.Y.Z   tests, builds, signs, notarizes, and publishes the
+#                       Release. The tag must equal v<MARKETING_VERSION> and
+#                       point at a commit on main.
+#   run by hand         the same build, uploaded only as a workflow artifact
+#                       (no tag, no Release) -- to check the signing setup.
+#
+# The signing credentials are secrets of the `release` environment, never of
+# the repository, so only a job that names that environment can read them;
+# protect the environment with required reviewers and restrict it to v* tags
+# (see README.md, "Continuous integration").
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  NOTARY_PROFILE: hkdfguard-notary
+  # The Developer ID provisioning profile hkdfguard.app is signed with
+  # (build-dist.sh's HKDFGUARD_APP_PROFILE), installed from the
+  # DEVELOPER_ID_PROVISIONING_PROFILE secret. With it, xcodebuild signs
+  # manually and never contacts Apple for a certificate or profile.
+  HKDFGUARD_APP_PROFILE: hkdfguard_app_profile
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+    # Only the token the tests need: never `secrets: inherit`.
+    secrets:
+      LINUX_REPO_TOKEN: ${{ secrets.LINUX_REPO_TOKEN }}
+
+  release:
+    name: Build, sign, notarize, publish
+    needs: test
+    runs-on: macos-26
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tag
+        if: github.ref_type == 'tag'
+        run: |
+          versions="$(grep -o 'MARKETING_VERSION = [^;]*;' HkdfGuardNativeMacOS.xcodeproj/project.pbxproj \
+            | sed 's/MARKETING_VERSION = //; s/;//' | sort -u)"
+          [ "$(wc -l <<<"$versions" | tr -d ' ')" = 1 ] \
+            || { echo "::error::MARKETING_VERSION differs between targets: $(tr '\n' ' ' <<<"$versions")"; exit 1; }
+          [ "$GITHUB_REF_NAME" = "v$versions" ] \
+            || { echo "::error::tag $GITHUB_REF_NAME does not match MARKETING_VERSION $versions"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::tag $GITHUB_REF_NAME is not on main"; exit 1; }
+
+      # A throwaway keychain, made the default and first in the search list,
+      # so codesign, productbuild, xcodebuild and notarytool all find the
+      # identities and the notary profile there -- as build-release.sh
+      # expects of a login keychain.
+      - name: Import signing certificates
+        env:
+          DEVELOPER_ID_APPLICATION_P12: ${{ secrets.DEVELOPER_ID_APPLICATION_P12 }}
+          DEVELOPER_ID_INSTALLER_P12: ${{ secrets.DEVELOPER_ID_INSTALLER_P12 }}
+          SIGNING_P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+        run: |
+          [ -n "$DEVELOPER_ID_APPLICATION_P12" ] || { echo "::error::DEVELOPER_ID_APPLICATION_P12 is not set in the release environment"; exit 1; }
+          [ -n "$DEVELOPER_ID_INSTALLER_P12" ] || { echo "::error::DEVELOPER_ID_INSTALLER_P12 is not set in the release environment"; exit 1; }
+          keychain="$RUNNER_TEMP/hkdfguard-signing.keychain-db"
+          password="$(openssl rand -base64 32)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          umask 077
+          import() {
+            local p12="$RUNNER_TEMP/import.p12"
+            printf '%s' "$1" | base64 --decode > "$p12"
+            security import "$p12" -k "$keychain" -f pkcs12 -P "$SIGNING_P12_PASSWORD" \
+              -T /usr/bin/codesign -T /usr/bin/productbuild -T /usr/bin/xcodebuild
+            rm -f "$p12"
+          }
+          import "$DEVELOPER_ID_APPLICATION_P12"
+          import "$DEVELOPER_ID_INSTALLER_P12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security find-identity -v
+
+      # Where Xcode 16 and later look for profiles, named by UUID as Xcode
+      # names them. build-dist.sh checks it again before building: Developer
+      # ID, this team, com.hkdfguard.cli, the production access group, not
+      # expired.
+      - name: Install the provisioning profile
+        env:
+          DEVELOPER_ID_PROVISIONING_PROFILE: ${{ secrets.DEVELOPER_ID_PROVISIONING_PROFILE }}
+        run: |
+          [ -n "$DEVELOPER_ID_PROVISIONING_PROFILE" ] \
+            || { echo "::error::DEVELOPER_ID_PROVISIONING_PROFILE is not set in the release environment"; exit 1; }
+          profile="$RUNNER_TEMP/app.provisionprofile"
+          printf '%s' "$DEVELOPER_ID_PROVISIONING_PROFILE" | base64 --decode > "$profile"
+          decoded="$(security cms -D -i "$profile")"
+          name="$(plutil -extract Name raw -o - - <<<"$decoded")"
+          uuid="$(plutil -extract UUID raw -o - - <<<"$decoded")"
+          [ "$name" = "$HKDFGUARD_APP_PROFILE" ] \
+            || { echo "::error::the DEVELOPER_ID_PROVISIONING_PROFILE secret holds \"$name\", expected \"$HKDFGUARD_APP_PROFILE\""; exit 1; }
+          dir="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          mkdir -p "$dir"
+          mv "$profile" "$dir/$uuid.provisionprofile"
+          echo "PROVISIONING_PROFILE_PATH=$dir/$uuid.provisionprofile" >> "$GITHUB_ENV"
+          echo "installed \"$name\" ($uuid), expires $(plutil -extract ExpirationDate raw -o - - <<<"$decoded")"
+
+      # Only notarytool uses the API key, through the keychain profile
+      # build-release.sh names. It is deliberately not given to xcodebuild
+      # (build-dist.sh's HKDFGUARD_ASC_* inputs): with HKDFGUARD_APP_PROFILE
+      # there is nothing to provision, so the key needs only the Developer role.
+      - name: Install the App Store Connect API key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          [ -n "$ASC_KEY_P8" ] && [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] \
+            || { echo "::error::ASC_KEY_P8, ASC_KEY_ID and ASC_ISSUER_ID must all be set in the release environment"; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$key"
+          xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --keychain "$SIGNING_KEYCHAIN"
+          # build-dist.sh and build-pkg.sh pass only --keychain-profile; make
+          # sure that lookup finds the profile now, not after the builds.
+          xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null \
+            || { echo "::error::notarytool cannot find the \"$NOTARY_PROFILE\" profile without --keychain"; exit 1; }
+
+      - name: Build, sign and notarize
+        env:
+          HKDFGUARD_NOTARY_PROFILE: ${{ env.NOTARY_PROFILE }}
+        run: ./build-release.sh
+
+      - name: Find the package
+        id: pkg
+        run: |
+          pkg="$(ls dist/hkdfguard-native-macos-*-osx-arm64.pkg | grep -v -e '-UNSIGNED' | head -n 1)"
+          [ -f "$pkg" ] && [ -f "$pkg.sha256" ] || { echo "::error::no signed package in dist/"; exit 1; }
+          echo "path=$pkg" >> "$GITHUB_OUTPUT"
+          cat "$pkg.sha256"
+
+      - name: Upload the package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hkdfguard-native-macos-osx-arm64
+          path: |
+            ${{ steps.pkg.outputs.path }}
+            ${{ steps.pkg.outputs.path }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # The checksum goes in the release notes -- outside the asset, so
+      # replacing the package cannot also replace the value it is checked
+      # against (see README.md, "Publishing a release").
+      - name: Publish the GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG: ${{ steps.pkg.outputs.path }}
+        run: |
+          {
+            echo "Install with the checks in the README's \"Installing\" section."
+            echo
+            echo "SHA-256 (verify with \`shasum -a 256 -c\`):"
+            echo '```'
+            cat "$PKG.sha256"
+            echo '```'
+            echo
+            echo "Built by GitHub Actions run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID from $GITHUB_SHA."
+          } > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$GITHUB_REF_NAME" "$PKG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/import.p12" "$RUNNER_TEMP/app.provisionprofile"
+          if [ -n "${PROVISIONING_PROFILE_PATH:-}" ]; then
+            rm -f "$PROVISIONING_PROFILE_PATH"
+          fi

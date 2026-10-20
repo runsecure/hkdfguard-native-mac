@@ -17,10 +17,10 @@
 # that provisioning once, signed, so it doesn't have to happen inside every
 # test invocation.
 #
-# How: builds the `hkdfguard-v1-initialize-app` target (the bundled,
+# How: builds the `hkdfguard-app` target (the bundled,
 # Team-signed, hardened-runtime build of the CLI; in Debug, entitled for
 # com.hkdfguard.tests.keys -- see HkdfGuardNativeMacOS.xcodeproj and
-# hkdfguard-v1-initialize/hkdfguard-v1-initialize.tests.entitlements) and runs its
+# hkdfguard-cli/hkdfguard.tests.entitlements) and runs its
 # `provision` command once. That entitlement is what puts the KEK in the
 # data-protection keychain instead of the legacy one (see "Keychain modes"
 # in README.md) -- running the bare SwiftPM CLI here would provision into
@@ -46,7 +46,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT="$ROOT/HkdfGuardNativeMacOS.xcodeproj"
-TARGET="hkdfguard-v1-initialize-app"
+TARGET="hkdfguard-app"
 
 # A fixed, well-known service name for the persistent fixture KEK -- ASCII
 # letters/digits/'.' only, matching the library's own charset rule (see
@@ -96,7 +96,7 @@ if ! xcodebuild -project "$PROJECT" \
         cat >&2 <<'EOF'
 
 error: this Mac (or its App ID) is not yet set up for automatic
-provisioning, so the entitled hkdfguard-v1-initialize-app target cannot be
+provisioning, so the entitled hkdfguard-app target cannot be
 signed. This is a one-time, per-developer-machine step this script cannot
 do for you:
 
@@ -105,7 +105,7 @@ do for you:
   2. Register it as a device: developer.apple.com -> Certificates,
      Identifiers & Profiles -> Devices -> + -> macOS -> paste the UDID.
      (Or open the project in Xcode, select the HkdfGuardNativeMacOSTestHost or
-     hkdfguard-v1-initialize-app target's Signing & Capabilities tab --
+     hkdfguard-app target's Signing & Capabilities tab --
      Xcode offers to register the device for you.)
   3. Re-run this script.
 EOF
@@ -123,7 +123,7 @@ fi
 # unless the project's default has been changed.
 BUILT_PRODUCTS_DIR="$(xcodebuild -project "$PROJECT" -target "$TARGET" -configuration "$CONFIGURATION" \
     -showBuildSettings 2>/dev/null | awk -F' = ' '/ CONFIGURATION_BUILD_DIR /{print $2; exit}')"
-CLI="$BUILT_PRODUCTS_DIR/hkdfguard-v1-initialize.app/Contents/MacOS/hkdfguard-v1-initialize"
+CLI="$BUILT_PRODUCTS_DIR/hkdfguard.app/Contents/MacOS/hkdfguard"
 
 if [ ! -x "$CLI" ]; then
     echo "error: build reported success but $CLI is not there -- looked in: $BUILT_PRODUCTS_DIR" >&2
