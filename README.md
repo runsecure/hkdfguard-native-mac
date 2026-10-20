@@ -922,7 +922,8 @@ below), `build-pkg.sh` with `pkg/` (the installer package — the only way the
 library is installed; see [Installing on a machine](#installing-on-a-machine)),
 and `setup-hosted-test-kek.sh` (a one-time, per-developer provisioning of a
 data-protection KEK in the test-only access group, under
-`com.hkdfguard.fixture.hostedtests`; see Tests).
+`com.hkdfguard.fixture.hostedtests`; see Tests). `.github/` holds the CI
+and release workflows (see [Continuous integration](#continuous-integration)).
 
 ## Building
 
@@ -1061,14 +1062,120 @@ anything, so a missing one fails in seconds. The Developer ID provisioning
 profile is created by `xcodebuild` during export (automatic signing,
 `-allowProvisioningUpdates`).
 
+## Continuous integration
+
+Two GitHub Actions workflows, in `.github/workflows/`, both on
+GitHub-hosted Apple silicon runners (`macos-26`, Xcode 26.6):
+
+| Workflow | Runs on | Does | Credentials |
+|---|---|---|---|
+| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed | none |
+| `release.yml` | a pushed `vX.Y.Z` tag, or by hand | `ci.yml`, then `build-release.sh` — signed, notarized, stapled — and, for a tag, the GitHub Release | the `release` environment's secrets |
+
+**What CI can't test.** A macOS VM has no Secure Enclave, so every test
+that wraps or unwraps skips itself there (see [Tests](#tests)), and the
+hosted suite and `scripts/verify-machine-scope.sh` need a registered Mac,
+root and LaunchDaemons. A green CI run proves the build, the argument
+handling, the key file checks and the cross-platform ABI. It does not prove
+the cryptography. Before tagging a release, run the full suite on real
+Apple silicon:
+
+```sh
+xcodebuild test -scheme HkdfGuardNativeMacOSTests
+xcodebuild test -scheme HkdfGuardNativeMacOSTests-Hosted -allowProvisioningUpdates
+sudo bash scripts/verify-machine-scope.sh
+```
+
+**Unsigned builds.** `ci.yml` sets `XCODE_XCCONFIG_FILE` to
+`.github/ci/unsigned.xcconfig` (ad-hoc signing, no team, no profile). It
+passes the same file as `TEST_RUNNER_XCODE_XCCONFIG_FILE`, so the
+`xcodebuild` that `HkdfGuardCommandLineToolTests` runs inside the test
+process builds unsigned too. To reproduce a CI run locally:
+
+```sh
+X="$PWD/.github/ci/unsigned.xcconfig"
+XCODE_XCCONFIG_FILE="$X" TEST_RUNNER_XCODE_XCCONFIG_FILE="$X" \
+  xcodebuild test -scheme HkdfGuardNativeMacOSTests -destination 'platform=macOS,arch=arm64'
+```
+
+`HkdfGuardCrossPlatformABITests` needs `hkdfguard-native-linux` checked
+out beside this repository; `ci.yml` checks it out there. If that
+repository is private, give the workflow a repository secret
+`LINUX_REPO_TOKEN`: a fine-grained token with read-only *Contents* access to
+`runsecure/hkdfguard-native-linux` and nothing else. Without one the
+checkout fails, the run shows a warning, and those tests skip themselves.
+
+### Setting up `release.yml`
+
+The signing credentials are **environment** secrets, not repository
+secrets, so no other workflow or job can read them. Once, under
+*Settings > Environments*, create an environment named `release`:
+
+- **Required reviewers:** the people who hold the Developer ID
+  certificates. Every run waits for one of them to approve it.
+- **Deployment branches and tags:** *Selected branches and tags*: the tag
+  pattern `v*`, and the branch `main` for manual dry runs.
+
+Then, under *Settings > Rules > Rulesets*, add a tag ruleset for `v*` that
+only administrators can bypass, so not everyone with write access can
+create a release tag.
+
+Its secrets:
+
+| Secret | Value |
+|---|---|
+| `DEVELOPER_ID_APPLICATION_P12` | base64 of the *Developer ID Application* certificate and private key, exported from Keychain Access as `.p12` |
+| `DEVELOPER_ID_INSTALLER_P12` | the same for the *Developer ID Installer* certificate |
+| `APPLE_DEVELOPMENT_P12` | optional: the same for an *Apple Development* certificate, used to sign the archive before its Developer ID export. Without it, `xcodebuild -allowProvisioningUpdates` may create a new development certificate on every run |
+| `SIGNING_P12_PASSWORD` | the password all of the `.p12` files were exported with |
+| `ASC_KEY_P8` | the contents of an App Store Connect API key's `AuthKey_<id>.p8` (*Users and Access > Integrations > Team Keys*). Its role must be **Admin**: only an Admin key can make `xcodebuild` create the Developer ID provisioning profile `hkdfguard.app` needs. The same key notarizes |
+| `ASC_KEY_ID` | that key's ID |
+| `ASC_ISSUER_ID` | the team's issuer ID, shown above the keys list |
+
+```sh
+base64 -i DeveloperIDApplication.p12 | pbcopy   # paste as DEVELOPER_ID_APPLICATION_P12
+base64 -i DeveloperIDInstaller.p12 | pbcopy     # paste as DEVELOPER_ID_INSTALLER_P12
+```
+
+The workflow imports the certificates into a throwaway keychain, which it
+makes the default for the job. It stores the API key there as the
+`hkdfguard-notary` notarytool profile, runs `build-release.sh`, and
+deletes both whether or not the build succeeded. Run it by hand from `main`
+first: that run does everything except publish, and uploads the `.pkg` as a
+workflow artifact, so you can test the signing setup without making a
+release.
+
 ## Publishing a release
 
 The only distribution is a signed, notarized **installer package** attached
 to a tagged GitHub Release. There are no zips, no NuGet package, and no
 install scripts: a Mac gets the library by installing the package, and
-nothing else puts it in place. That keeps one manually signed artifact —
-built by a person on one Mac, with no CI — as the only thing every machine
-trusts.
+nothing else puts it in place. Every machine trusts exactly one signed
+artifact, built by `release.yml` from a `vX.Y.Z` tag on `main`. The signing
+keys live only in the protected `release` environment (see
+[Setting up `release.yml`](#setting-up-releaseyml)).
+
+That moves the trust boundary from one Mac to GitHub. Anyone who can
+approve a run in the `release` environment, or change `release.yml` or the
+build scripts on `main`, can ship code that every installed Mac trusts.
+Keep its reviewers to the people who hold the Developer ID certificates,
+and require reviews on `main`.
+
+To release, make sure `MARKETING_VERSION` in the Xcode project is the new
+version, run the full suite on real hardware (see
+[Continuous integration](#continuous-integration)), then push a signed tag:
+
+```sh
+git tag -s v0.9.0 -m v0.9.0   # must equal v<MARKETING_VERSION>
+git push origin v0.9.0
+```
+
+The workflow checks that the tag matches `MARKETING_VERSION` and is on
+`main`. After a reviewer approves, it builds, notarizes and publishes the
+Release, with the package's SHA-256 in the release notes.
+
+To build and publish one by hand instead (the workflow runs the same
+steps):
 
 ```sh
 VERSION=v0.9.0   # must equal MARKETING_VERSION in the Xcode project
