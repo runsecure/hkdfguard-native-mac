@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import Security
 import os // Logger: hkdfguard_harden_process's advisory signature warning
+import Darwin.membership // mbr_uuid_to_id, ID_TYPE_UID: not re-exported by Foundation in every SDK
 
 #if compiler(<6.2)
 #error("HkdfGuardNativeMacOS requires a Swift 6.2 or later toolchain.")

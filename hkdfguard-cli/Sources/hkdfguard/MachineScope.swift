@@ -28,6 +28,7 @@ import Darwin
 import Foundation
 import os
 import Darwin.membership // mbr_uid_to_uuid, mbr_gid_to_uuid, mbr_check_membership
+import MachO // _NSGetExecutablePath
 
 @_silgen_name("hkdfguard_machine_policy")
 func hkdfguard_machine_policy(_ out: UnsafeMutablePointer<UInt8>?, _ outLen: UnsafeMutablePointer<Int32>?) -> Int32
