@@ -376,11 +376,17 @@ build_arch() {
     mkdir -p "$out"
 
     echo "==> Building $DYLIB_NAME for $arch (Release) into $build_dir"
+    # Signed manually with the identity it is re-signed with below. The
+    # project's automatic signing would want an Apple Development
+    # certificate, which a release machine (CI) need not have.
     xcodebuild -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
         -target HkdfGuardNativeMacOSDylib \
         -configuration Release \
         ARCHS="$arch" ONLY_ACTIVE_ARCH=NO \
         BUILD_DIR="$build_dir" \
+        CODE_SIGN_STYLE=Manual \
+        CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
+        DEVELOPMENT_TEAM="$TEAM_ID" \
         build
     [ -f "$dylib_dir/$DYLIB_NAME" ] || fail "expected $dylib_dir/$DYLIB_NAME after the xcodebuild above"
 
