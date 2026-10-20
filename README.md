@@ -1036,7 +1036,8 @@ input only names something kept in your keychain or Xcode:
 |---|---|
 | `HKDFGUARD_SIGN_IDENTITY` | a signing certificate in your login keychain |
 | `HKDFGUARD_TEAM_ID` | the Team to sign the bundle for (not secret; defaults to the project's `DEVELOPMENT_TEAM`) |
-| `HKDFGUARD_ASC_KEY_PATH`, `HKDFGUARD_ASC_KEY_ID`, `HKDFGUARD_ASC_ISSUER_ID` | optional App Store Connect API key (path to the `.p8`, kept outside the repo) so `xcodebuild` can manage provisioning profiles without an Apple ID signed in to Xcode; otherwise it uses the account in Xcode → Settings → Accounts |
+| `HKDFGUARD_ASC_KEY_PATH`, `HKDFGUARD_ASC_KEY_ID`, `HKDFGUARD_ASC_ISSUER_ID` | optional App Store Connect API key (path to the `.p8`, kept outside the repo) so `xcodebuild` can manage provisioning profiles without an Apple ID signed in to Xcode; otherwise it uses the account in Xcode → Settings → Accounts. Not used with `HKDFGUARD_APP_PROFILE` |
+| `HKDFGUARD_APP_PROFILE` | optional name of an installed **Developer ID provisioning profile** for `com.hkdfguard.cli`. When set, `hkdfguard.app` is archived and exported with manual signing — the `HKDFGUARD_SIGN_IDENTITY` certificate and this profile — and `xcodebuild` never contacts Apple for a certificate or profile. Requires a Developer ID identity. Checked before building: exactly one installed, Developer ID, this team and bundle ID, the `com.hkdfguard.keys` access group, not expired |
 | `HKDFGUARD_NOTARY_PROFILE` | optional `notarytool` keychain profile; when set, the dylib and CLI are notarized and checked with Gatekeeper, and the bundle is notarized, stapled, and checked (Developer ID only) |
 | `HKDFGUARD_RELEASE` | `1` for a release: refuses to run without a Developer ID identity, a Developer ID app export, and a notary profile |
 
@@ -1060,9 +1061,14 @@ HKDFGUARD_NOTARY_PROFILE=hkdfguard-notary \
 ```
 
 The script checks for the Developer ID certificate before building
-anything, so a missing one fails in seconds. The Developer ID provisioning
-profile is created by `xcodebuild` during export (automatic signing,
-`-allowProvisioningUpdates`).
+anything, so a missing one fails in seconds. By default the Developer ID
+provisioning profile is created by `xcodebuild` during export (automatic
+signing, `-allowProvisioningUpdates`). To sign with a profile you made in
+the developer portal instead — as `release.yml` does, with
+`hkdfguard_app_profile` — install it with Xcode → Settings → Accounts →
+Download Manual Profiles (double-clicking the file does not put it where
+Xcode looks) and add
+`HKDFGUARD_APP_PROFILE=hkdfguard_app_profile`.
 
 ## Continuous integration
 
@@ -1128,21 +1134,28 @@ Its secrets:
 |---|---|
 | `DEVELOPER_ID_APPLICATION_P12` | base64 of the *Developer ID Application* certificate and private key, exported from Keychain Access as `.p12` |
 | `DEVELOPER_ID_INSTALLER_P12` | the same for the *Developer ID Installer* certificate |
-| `APPLE_DEVELOPMENT_P12` | optional: the same for an *Apple Development* certificate, used to sign the archive before its Developer ID export. Without it, `xcodebuild -allowProvisioningUpdates` may create a new development certificate on every run |
-| `SIGNING_P12_PASSWORD` | the password all of the `.p12` files were exported with |
-| `ASC_KEY_P8` | the contents of an App Store Connect API key's `AuthKey_<id>.p8` (*Users and Access > Integrations > Team Keys*). Its role must be **Admin**: only an Admin key can make `xcodebuild` create the Developer ID provisioning profile `hkdfguard.app` needs. The same key notarizes |
+| `SIGNING_P12_PASSWORD` | the password both `.p12` files were exported with |
+| `DEVELOPER_ID_PROVISIONING_PROFILE` | base64 of the `hkdfguard_app_profile` Developer ID provisioning profile for `com.hkdfguard.cli`, downloaded from *Certificates, Identifiers & Profiles > Profiles*. The workflow refuses a profile with any other name (`HKDFGUARD_APP_PROFILE` in `release.yml`) |
+| `ASC_KEY_P8` | the contents of an App Store Connect API key's `AuthKey_<id>.p8` (*Users and Access > Integrations > Team Keys*), used only to notarize. The **Developer** role is enough: `xcodebuild` signs with the installed profile and is never given the key |
 | `ASC_KEY_ID` | that key's ID |
 | `ASC_ISSUER_ID` | the team's issuer ID, shown above the keys list |
 
 ```sh
 base64 -i DeveloperIDApplication.p12 | pbcopy   # paste as DEVELOPER_ID_APPLICATION_P12
 base64 -i DeveloperIDInstaller.p12 | pbcopy     # paste as DEVELOPER_ID_INSTALLER_P12
+base64 -i hkdfguard_app_profile.provisionprofile | pbcopy   # paste as DEVELOPER_ID_PROVISIONING_PROFILE
 ```
 
+The installing step prints the profile's expiration date. Regenerating or
+renewing it in the portal gives a new file, so update the secret then too;
+`build-dist.sh` refuses an expired profile before anything is built.
+
 The workflow imports the certificates into a throwaway keychain, which it
-makes the default for the job. It stores the API key there as the
-`hkdfguard-notary` notarytool profile, runs `build-release.sh`, and
-deletes both whether or not the build succeeded. Run it by hand from `main`
+makes the default for the job, and installs the provisioning profile. It
+stores the API key in that keychain as the `hkdfguard-notary` notarytool
+profile, runs `build-release.sh` with
+`HKDFGUARD_APP_PROFILE=hkdfguard_app_profile`, and deletes the keychain,
+key and profile whether or not the build succeeded. Run it by hand from `main`
 first: that run does everything except publish, and uploads the `.pkg` as a
 workflow artifact, so you can test the signing setup without making a
 release.

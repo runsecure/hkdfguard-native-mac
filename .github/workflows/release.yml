@@ -32,6 +32,11 @@ concurrency:
 env:
   DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
   NOTARY_PROFILE: hkdfguard-notary
+  # The Developer ID provisioning profile hkdfguard.app is signed with
+  # (build-dist.sh's HKDFGUARD_APP_PROFILE), installed from the
+  # DEVELOPER_ID_PROVISIONING_PROFILE secret. With it, xcodebuild signs
+  # manually and never contacts Apple for a certificate or profile.
+  HKDFGUARD_APP_PROFILE: hkdfguard_app_profile
 
 jobs:
   test:
@@ -75,7 +80,6 @@ jobs:
         env:
           DEVELOPER_ID_APPLICATION_P12: ${{ secrets.DEVELOPER_ID_APPLICATION_P12 }}
           DEVELOPER_ID_INSTALLER_P12: ${{ secrets.DEVELOPER_ID_INSTALLER_P12 }}
-          APPLE_DEVELOPMENT_P12: ${{ secrets.APPLE_DEVELOPMENT_P12 }}
           SIGNING_P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
         run: |
           [ -n "$DEVELOPER_ID_APPLICATION_P12" ] || { echo "::error::DEVELOPER_ID_APPLICATION_P12 is not set in the release environment"; exit 1; }
@@ -95,20 +99,39 @@ jobs:
           }
           import "$DEVELOPER_ID_APPLICATION_P12"
           import "$DEVELOPER_ID_INSTALLER_P12"
-          # Optional: lets the archive step sign with an existing Apple
-          # Development certificate instead of xcodebuild creating one.
-          if [ -n "$APPLE_DEVELOPMENT_P12" ]; then
-            import "$APPLE_DEVELOPMENT_P12"
-          fi
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain"
           security default-keychain -d user -s "$keychain"
           echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           security find-identity -v
 
-      # One App Store Connect API key serves both: xcodebuild uses it to fetch
-      # provisioning profiles (build-dist.sh's HKDFGUARD_ASC_* inputs), and
-      # notarytool through the keychain profile build-release.sh names.
+      # Where Xcode 16 and later look for profiles, named by UUID as Xcode
+      # names them. build-dist.sh checks it again before building: Developer
+      # ID, this team, com.hkdfguard.cli, the production access group, not
+      # expired.
+      - name: Install the provisioning profile
+        env:
+          DEVELOPER_ID_PROVISIONING_PROFILE: ${{ secrets.DEVELOPER_ID_PROVISIONING_PROFILE }}
+        run: |
+          [ -n "$DEVELOPER_ID_PROVISIONING_PROFILE" ] \
+            || { echo "::error::DEVELOPER_ID_PROVISIONING_PROFILE is not set in the release environment"; exit 1; }
+          profile="$RUNNER_TEMP/app.provisionprofile"
+          printf '%s' "$DEVELOPER_ID_PROVISIONING_PROFILE" | base64 --decode > "$profile"
+          decoded="$(security cms -D -i "$profile")"
+          name="$(plutil -extract Name raw -o - - <<<"$decoded")"
+          uuid="$(plutil -extract UUID raw -o - - <<<"$decoded")"
+          [ "$name" = "$HKDFGUARD_APP_PROFILE" ] \
+            || { echo "::error::the DEVELOPER_ID_PROVISIONING_PROFILE secret holds \"$name\", expected \"$HKDFGUARD_APP_PROFILE\""; exit 1; }
+          dir="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          mkdir -p "$dir"
+          mv "$profile" "$dir/$uuid.provisionprofile"
+          echo "PROVISIONING_PROFILE_PATH=$dir/$uuid.provisionprofile" >> "$GITHUB_ENV"
+          echo "installed \"$name\" ($uuid), expires $(plutil -extract ExpirationDate raw -o - - <<<"$decoded")"
+
+      # Only notarytool uses the API key, through the keychain profile
+      # build-release.sh names. It is deliberately not given to xcodebuild
+      # (build-dist.sh's HKDFGUARD_ASC_* inputs): with HKDFGUARD_APP_PROFILE
+      # there is nothing to provision, so the key needs only the Developer role.
       - name: Install the App Store Connect API key
         env:
           ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
@@ -120,11 +143,6 @@ jobs:
           umask 077
           key="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
           printf '%s\n' "$ASC_KEY_P8" > "$key"
-          {
-            echo "HKDFGUARD_ASC_KEY_PATH=$key"
-            echo "HKDFGUARD_ASC_KEY_ID=$ASC_KEY_ID"
-            echo "HKDFGUARD_ASC_ISSUER_ID=$ASC_ISSUER_ID"
-          } >> "$GITHUB_ENV"
           xcrun notarytool store-credentials "$NOTARY_PROFILE" \
             --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
             --keychain "$SIGNING_KEYCHAIN"
@@ -187,4 +205,7 @@ jobs:
           if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
             security delete-keychain "$SIGNING_KEYCHAIN" || true
           fi
-          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/import.p12"
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8 "$RUNNER_TEMP/import.p12" "$RUNNER_TEMP/app.provisionprofile"
+          if [ -n "${PROVISIONING_PROFILE_PATH:-}" ]; then
+            rm -f "$PROVISIONING_PROFILE_PATH"
+          fi
