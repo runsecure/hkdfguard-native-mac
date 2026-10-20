@@ -1,5 +1,5 @@
 #!/bin/sh
-# postinstall for com.hkdfguard.native.v1. Runs as root after the payload is
+# postinstall for com.hkdfguard.native. Runs as root after the payload is
 # in place. Its only job is the PATH symlink:
 #
 #   /usr/local/bin/hkdfguard
@@ -51,14 +51,19 @@ for dir in "$volume/usr/local" "$bin_dir"; do
     fi
 done
 
-owner="$(stat -f '%u' "$bin_dir")"
-mode="$(stat -f '%Lp' "$bin_dir")"
-if [ "$owner" != 0 ] || [ $(( 0$mode & 022 )) -ne 0 ]; then
-    log "warning: $bin_dir is not owned by root and writable by root alone (uid $owner, mode $mode);"
-    log "         anyone who can write it could replace a symlink there with their own program."
-    log "         No PATH symlink created. Call $cli by its full path when provisioning keys."
-    exit 0
-fi
+# Both folders, not just bin: whoever can write /usr/local can rename bin
+# away and put their own bin/hkdfguard in its place, or swap it for a
+# symlink between the checks here and the ln below.
+for dir in "$volume/usr/local" "$bin_dir"; do
+    owner="$(stat -f '%u' "$dir")"
+    mode="$(stat -f '%Lp' "$dir")"
+    if [ "$owner" != 0 ] || [ $(( 0$mode & 022 )) -ne 0 ]; then
+        log "warning: $dir is not owned by root and writable by root alone (uid $owner, mode $mode);"
+        log "         anyone who can write it could replace a symlink there with their own program."
+        log "         No PATH symlink created. Call $cli by its full path when provisioning keys."
+        exit 0
+    fi
+done
 
 # Replace our own (or any) symlink; never clobber a real file someone put there.
 if [ -e "$link" ] && [ ! -L "$link" ]; then

@@ -46,10 +46,11 @@
 //       --key-file-path|-kf <key-file-path> \
 //       --service-name|-sn <name> \
 //       ( --dek-stdin | --dek-file <path> ) \
-//       [--fingerprint|-fp <64 hex chars>] [--force|-f]
+//       [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]
 //
-// `provision` is idempotent: a second run against the same service reports
-// that the KEK already exists and exits 0.
+// `provision` is idempotent: a second run against the same service verifies
+// the existing KEK (hkdfguard_create_kek loads and rebuilds it), reports
+// "already provisioned ...; verified", and exits 0.
 //
 // `wrap` always prints the fingerprint of the KEK the payload was actually
 // wrapped under (bytes 0-31 of the payload the library returned), and with
@@ -64,14 +65,17 @@
 //
 // For `wrap`, exactly one DEK source is required:
 //   --dek-stdin        base64 DEK read from standard input (e.g. piped from
-//                      the pipeline or a secret store). At most 64 bytes;
-//                      one trailing newline (or CRLF) is ignored, nothing
-//                      else -- the Linux tool's rule, for both sources.
+//                      the pipeline or a secret store), never from an
+//                      interactive terminal. At most 64 bytes; one
+//                      trailing newline (or CRLF) and a leading UTF-8 BOM
+//                      are ignored, nothing else, and UTF-16 is refused --
+//                      the Linux tool's rules, for both sources.
 //   --dek-file <path>  base64 DEK read from a file. It must be a regular
 //                      file (not a symlink, FIFO, or device), owned by root
 //                      or by this process's user, granting no access to
-//                      group or others (mode 0400/0600) -- the Linux tool's
-//                      rule (see openDekFile).
+//                      group or others (mode 0400/0600), and not reached
+//                      through a symlinked folder -- the Linux tool's rule
+//                      (see openDekFile, openRealFolder).
 //
 // There is deliberately no way to pass the DEK itself as a command-line
 // argument: an argv value is visible to every other process on the host
@@ -80,7 +84,9 @@
 //
 // The wrapped payload is written to <key-file-path> with POSIX permissions
 // 0600 (owner read/write, no access for anyone else) -- set
-// atomically at file-creation time. With --force against a pre-existing
+// atomically at file-creation time -- or, with --group <name>, 0640 with
+// that group: the owner plus one group, read-only, as the Linux tool's
+// --group does (see resolveKeyFileGroup for the groups refused). With --force against a pre-existing
 // file, that file's old contents are securely overwritten in place (8
 // alternating all-zero/random passes) and then deleted before the new file
 // is created -- see secureOverwriteAndRemoveIfExists/writeWrappedKeyFile
@@ -286,6 +292,8 @@ struct WrapArgs {
     /// `--fingerprint`: the KEK the operator expects to wrap under. When set,
     /// the payload's embedded fingerprint must equal it or nothing is written.
     var expectedFingerprint: [UInt8]?
+    /// `--group`: who besides the owner may read the key file. nil: no one.
+    var groupName: String?
 }
 
 // How the operator confirms which KEK item `retire` may delete.
@@ -315,7 +323,8 @@ func printUsage() {
         Usage:
           \(programName) provision --service-name|-sn <name>
           \(programName) wrap --key-file-path|-kf <path> --service-name|-sn <name> \\
-                                    ( \(dekSourceFlags) ) [--fingerprint|-fp <hex>] [--force|-f]
+                                    ( \(dekSourceFlags) ) [--group|-g <name>]
+                                    [--fingerprint|-fp <hex>] [--force|-f]
           \(programName) retire --service-name|-sn <name> ( --fingerprint|-fp <hex> | --corrupt )
           \(programName) status --service-name|-sn <name>
 
@@ -343,6 +352,9 @@ func printUsage() {
           --dek-stdin         read the base64 DEK from standard input
           --dek-file <path>   read the base64 DEK from a file (a regular file, not a
                       symlink, owned by you or root, mode 0400 or 0600)
+          --group|-g <name>   also let this group read the file (mode 0640): a dedicated
+                      group for the service that unwraps it, which you belong to;
+                      broad groups (staff, everyone, admin, wheel, ...) are refused
           --fingerprint|-fp <hex>  refuse to write unless the KEK actually used has this
                       fingerprint (64 hex characters, as printed by provision)
           --force|-f          securely overwrite an existing <path>
@@ -354,25 +366,62 @@ func printUsage() {
     )
 }
 
-// `--service-name|-sn <name>`, shared by both commands' parsers.
-func parseServiceName(_ arg: String, _ iterator: inout IndexingIterator<[String]>) throws -> String {
+// The value after a flag that takes one: present, non-empty, and not
+// starting with "-". Without that last rule a forgotten value swallows the
+// next flag: `wrap -kf --force ...` would write a key file named "--force"
+// and silently drop --force. Flags themselves (-sn, -kf, -g, ...) are
+// unaffected; only what is consumed as a value is checked. No legitimate
+// value starts with "-": service names, groups and fingerprints can't, and
+// a path can be written ./-name. `longName` is the flag's long form, for
+// the messages.
+func flagValue(_ arg: String, _ longName: String, _ iterator: inout IndexingIterator<[String]>) throws -> String {
     guard let value = iterator.next() else {
         throw CLIError("\(arg) requires a value")
     }
     guard !value.isEmpty else {
-        throw CLIError("--service-name must not be empty")
+        throw CLIError("\(longName) must not be empty")
+    }
+    guard !value.hasPrefix("-") else {
+        throw CLIError("\(arg) requires a value, but the next argument is \"\(value)\"; a value can't start with \"-\" (write a path like that as ./\(value))")
     }
     return value
 }
 
+// `--service-name|-sn <name>`, shared by every command's parser.
+func parseServiceName(_ arg: String, _ iterator: inout IndexingIterator<[String]>) throws -> String {
+    try flagValue(arg, "--service-name", &iterator)
+}
+
+// Stores a flag's value, refusing a second one rather than letting the last
+// win: `-kf a.key ... -kf b.key` is ambiguous about which file the operator
+// meant, and silently picking one is how the wrong key file gets written or
+// the wrong service's KEK gets used. `flag` is the flag's long name. The
+// Linux tool's set_once.
+func setOnce<T>(_ slot: inout T?, _ flag: String, _ value: T) throws {
+    guard slot == nil else {
+        throw CLIError("give \(flag) at most once")
+    }
+    slot = value
+}
+
+// The same for a flag that takes no value.
+func setOnce(_ flag: inout Bool, _ name: String) throws {
+    guard !flag else {
+        throw CLIError("give \(name) at most once")
+    }
+    flag = true
+}
+
+let subcommandList = "`provision`, `wrap`, `retire` or `status`"
+
 func parseArgs(_ arguments: [String]) throws -> Command {
     var rest = Array(arguments.dropFirst()) // skip argv[0]
     guard !rest.isEmpty else {
-        throw CLIError("missing command: expected provision or wrap")
+        throw CLIError("missing subcommand: expected \(subcommandList)")
     }
     let command = rest.removeFirst()
     switch command {
-    case "--help", "-h":
+    case "--help", "-h", "help":
         return .help
     case "provision":
         return try parseProvision(rest)
@@ -383,7 +432,7 @@ func parseArgs(_ arguments: [String]) throws -> Command {
     case "status":
         return try parseStatus(rest)
     default:
-        throw CLIError("unknown command \"\(command)\": expected provision, wrap, retire, or status")
+        throw CLIError("unknown subcommand \"\(command)\": expected \(subcommandList)")
     }
 }
 
@@ -395,9 +444,9 @@ func parseStatus(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
         default:
-            throw CLIError("status: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `status`: \(arg)")
         }
     }
     guard let serviceName else { throw CLIError("status: missing required --service-name|-sn") }
@@ -415,16 +464,14 @@ func parseRetire(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
         case "--fingerprint", "-fp":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a value")
-            }
-            fingerprint = try parseFingerprintHex(value)
+            let value = try flagValue(arg, "--fingerprint", &iterator)
+            try setOnce(&fingerprint, "--fingerprint", parseFingerprintHex(value))
         case "--corrupt":
-            corrupt = true
+            try setOnce(&corrupt, "--corrupt")
         default:
-            throw CLIError("retire: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `retire`: \(arg)")
         }
     }
 
@@ -483,9 +530,11 @@ func parseProvision(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
+        case "--key-file-path", "-kf", "--dek-stdin", "--dek-file", "--force", "-f", "--group", "-g":
+            throw CLIError("\(arg) is not valid for `provision`; it belongs to `wrap`")
         default:
-            throw CLIError("provision: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `provision`: \(arg)")
         }
     }
 
@@ -496,9 +545,21 @@ func parseProvision(_ arguments: [String]) throws -> Command {
 func parseWrap(_ arguments: [String]) throws -> Command {
     var keyFilePath: String?
     var serviceName: String?
-    var dekSources: [DekSource] = []
+    var dekSource: DekSource?
     var force = false
     var expectedFingerprint: [UInt8]?
+    var groupName: String?
+
+    // Rejects a second DEK source rather than letting the last one win:
+    // silently ignoring one of two explicitly requested inputs is exactly
+    // the kind of ambiguity that leads to wrapping the wrong key. The Linux
+    // tool's message.
+    func setSource(_ source: DekSource) throws {
+        guard dekSource == nil else {
+            throw CLIError("give exactly one of --dek-stdin or --dek-file")
+        }
+        dekSource = source
+    }
 
     var iterator = arguments.makeIterator()
     while let arg = iterator.next() {
@@ -506,31 +567,23 @@ func parseWrap(_ arguments: [String]) throws -> Command {
         case "--help", "-h":
             return .help
         case "--force", "-f":
-            force = true
+            try setOnce(&force, "--force")
         case "--fingerprint", "-fp":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a value")
-            }
-            expectedFingerprint = try parseFingerprintHex(value)
+            let value = try flagValue(arg, "--fingerprint", &iterator)
+            try setOnce(&expectedFingerprint, "--fingerprint", parseFingerprintHex(value))
         case "--key-file-path", "-kf":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a path")
-            }
-            keyFilePath = value
+            let value = try flagValue(arg, "--key-file-path", &iterator)
+            try setOnce(&keyFilePath, "--key-file-path", value)
         case "--service-name", "-sn":
-            serviceName = try parseServiceName(arg, &iterator)
-        case "--generate", "-g":
-            // This tool only wraps a DEK the calling pipeline already has --
-            // the key its data was encrypted with. Generating one here
-            // would produce a key nothing has used.
-            throw CLIError("\(arg) is not supported: this tool wraps the pipeline's existing DEK; supply it with \(dekSourceFlags)")
+            try setOnce(&serviceName, "--service-name", parseServiceName(arg, &iterator))
+        case "--group", "-g":
+            let value = try flagValue(arg, "--group", &iterator)
+            try setOnce(&groupName, "--group", value)
         case "--dek-stdin":
-            dekSources.append(.stdin)
+            try setSource(.stdin)
         case "--dek-file":
-            guard let value = iterator.next(), !value.isEmpty else {
-                throw CLIError("\(arg) requires a path")
-            }
-            dekSources.append(.file(value))
+            let value = try flagValue(arg, "--dek-file", &iterator)
+            try setSource(.file(value))
         case "--dek", "-d":
             // Rejected explicitly, with the reason, rather than falling
             // through to a generic "unrecognized argument" -- anyone
@@ -543,26 +596,24 @@ func parseWrap(_ arguments: [String]) throws -> Command {
                 // than leaving the caller to guess what went wrong.
                 throw CLIError("wrap: unexpected argument \"\(arg)\" -- the key file path is given with --key-file-path|-kf <path>")
             }
-            throw CLIError("wrap: unrecognized argument: \(arg)")
+            throw CLIError("unrecognized argument for `wrap`: \(arg)")
         }
     }
 
     guard let keyFilePath else { throw CLIError("wrap: missing required --key-file-path|-kf") }
     guard let serviceName else { throw CLIError("wrap: missing required --service-name|-sn") }
-    guard !dekSources.isEmpty else {
-        throw CLIError("wrap: missing required DEK source: one of \(dekSourceFlags)")
-    }
-    guard dekSources.count == 1 else {
-        throw CLIError("wrap: conflicting DEK sources (\(dekSources.map(\.flag).joined(separator: ", "))): give exactly one of \(dekSourceFlags)")
+    guard let dekSource else {
+        throw CLIError("wrap: missing required --dek-stdin or --dek-file <path>")
     }
 
     return .wrap(
         WrapArgs(
             keyFilePath: keyFilePath,
             serviceName: serviceName,
-            dekSource: dekSources[0],
+            dekSource: dekSource,
             force: force,
-            expectedFingerprint: expectedFingerprint
+            expectedFingerprint: expectedFingerprint,
+            groupName: groupName
         )
     )
 }
@@ -616,21 +667,27 @@ func validateServiceCharset(_ service: String) throws {
 //
 // This is the only place in the tool that calls either function: `wrap`
 // never checks for or creates a KEK.
+// `provision`: the only place the setup calls are made. Always calls
+// hkdfguard_create_kek, whether or not the KEK exists, as the Linux and
+// Windows tools do: for an existing KEK that call loads the keychain item
+// and rebuilds the Secure Enclave key from it, so an item that exists but
+// can't be used (kekCorrupted, -19; an access denial, -18) fails here at
+// deployment rather than at the first wrap. kek_exists is still asked
+// first, only to report the outcome precisely -- "provisioned" versus
+// "already provisioned". Neither call changes an existing KEK. Returns
+// whether the KEK was newly created.
 func provisionKEK(service: String) throws -> Bool {
     var exists: Int32 = 0
     let existsStatus = service.withCString { hkdfguard_kek_exists($0, &exists) }
     guard existsStatus == HKDFGuardStatus.success.rawValue else {
         throw CLIError("hkdfguard_kek_exists failed: \(describeStatus(existsStatus))")
     }
-    if exists != 0 {
-        return false
-    }
 
     let createStatus = service.withCString { hkdfguard_create_kek($0) }
     guard createStatus == HKDFGuardStatus.success.rawValue else {
-        throw CLIError("hkdfguard_create_kek failed: \(describeStatus(createStatus))")
+        throw CLIError("hkdfguard_create_kek failed for service \"\(service)\": \(describeStatus(createStatus))")
     }
-    return true
+    return exists == 0
 }
 
 // The fingerprint of the KEK `service` resolves to, or the library's status
@@ -727,7 +784,7 @@ func retireKEK(service: String, expectedFingerprint: [UInt8]) throws {
     guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: item.blob) else {
         throw CLIError("the KEK item for service \"\(service)\" could not be reconstructed when re-read for deletion; nothing was deleted -- inspect it again before retiring")
     }
-    let itemFingerprint = Array(SHA256.hash(data: key.publicKey.rawRepresentation))
+    let itemFingerprint = Array(SHA256.hash(data: key.publicKey.x963Representation)) // the library's kekFingerprint: SHA-256 of 0x04 || x || y
     guard itemFingerprint == expectedFingerprint else {
         throw CLIError("the KEK item for service \"\(service)\" changed between checks (now \(hexString(itemFingerprint))); nothing was deleted")
     }
@@ -812,8 +869,9 @@ struct KEKItem {
     // The blob is the SEP-wrapped key credential; don't leave this process's
     // copy of it lying around once retire is done with it.
     mutating func scrub() {
-        _ = blob.withUnsafeMutableBytes { raw in
-            raw.initializeMemory(as: UInt8.self, repeating: 0)
+        blob.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress, raw.count > 0 else { return }
+            _ = memset_s(base, raw.count, 0, raw.count) // never elided as a dead store, unlike a plain fill
         }
     }
 }
@@ -976,6 +1034,163 @@ let maxDekInputLength = 64
 // or others.
 let forbidGroupOtherAccess: mode_t = 0o077
 
+// The folder `path` is named in must be a real folder at the place spelled:
+// no symbolic link anywhere in it, as the Linux tool requires (and as the
+// Windows tool refuses junctions). O_NOFOLLOW and O_EXCL only guard the
+// last component, so without this a symlinked folder above the path is
+// followed silently -- and whoever can plant one where the operator writes
+// could redirect an (often root) `wrap --force` into overwriting and
+// deleting a file in another folder, or make `--dek-file` read a DEK they
+// put somewhere else.
+//
+// One difference from Linux, for macOS's own layout: /tmp, /var and /etc
+// are symbolic links into /private. A link is accepted when only root can
+// have made it or can change it -- owned by root, in a root-owned folder no
+// one else can write -- and is followed to its real folder. Any other link
+// is refused.
+//
+// Returns the checked folder *open* (CheckedFolder), and callers do every
+// filesystem call that follows through its descriptor -- openat, fstatat,
+// unlinkat, fsync -- never by path, so nothing swapped after the check
+// (a folder replaced by a link, say) can redirect them. `.` and `..` in the
+// spelled path are removed as text first. `what` names the path in messages.
+struct CheckedFolder {
+    /// The folder the file is named in, reached by a chain of no-follow
+    /// openat() calls from "/": every later operation on the file goes
+    /// through this descriptor (openat, fstatat, unlinkat, fsync), so a
+    /// folder swapped for a symbolic link after the check cannot redirect
+    /// any of them -- the descriptor still names the folder that was checked.
+    let fd: Int32
+    /// That folder's path as walked, for messages.
+    let path: String
+    /// The file's name within it.
+    let leaf: String
+
+    var filePath: String { path == "/" ? "/" + leaf : path + "/" + leaf }
+    func close() { _ = Darwin.close(fd) }
+}
+
+func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
+    var components: [String] = []
+    // A relative path is resolved against the current folder, taken from
+    // getcwd() directly: FileManager's currentDirectoryPath returns "" when
+    // the folder no longer exists, which would make "out.key" into "/out.key".
+    let absolute: String
+    if path.hasPrefix("/") {
+        absolute = path
+    } else {
+        guard let cwd = getcwd(nil, 0) else {
+            throw CLIError("\(what) \(path) is relative, but the current folder can't be determined: \(String(cString: strerror(errno))) -- give an absolute path")
+        }
+        defer { free(cwd) }
+        absolute = String(cString: cwd) + "/" + path
+    }
+    for part in absolute.split(separator: "/", omittingEmptySubsequences: true) {
+        switch part {
+        case ".": continue
+        case "..": if !components.isEmpty { components.removeLast() }
+        default: components.append(String(part))
+        }
+    }
+    guard let leaf = components.popLast() else {
+        throw CLIError("\(what) \(path) has no file name")
+    }
+
+    // Walked one folder at a time, each opened *from the previous one's
+    // descriptor* with O_NOFOLLOW: what is checked is exactly what is held,
+    // with no path re-resolved later. An accepted link's target is pushed
+    // back onto the queue and walked the same way (never handed to
+    // realpath(), which would follow a further link inside it, a user's
+    // included), so every link on the way must itself be root-only. A `..`
+    // inside a link target is opened as ".." from the folder reached so
+    // far, which contains no links.
+    var dirFd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard dirFd >= 0 else {
+        throw CLIError("failed to open / to resolve \(what) \(path): \(String(cString: strerror(errno)))")
+    }
+    var current = "/"
+    func join(_ folder: String, _ name: String) -> String { folder == "/" ? "/" + name : folder + "/" + name }
+    func parentOf(_ folder: String) -> String {
+        guard folder != "/", let slash = folder.lastIndex(of: "/") else { return "/" }
+        return slash == folder.startIndex ? "/" : String(folder[..<slash])
+    }
+    func move(to newFd: Int32, _ newPath: String) {
+        _ = Darwin.close(dirFd)
+        dirFd = newFd
+        current = newPath
+    }
+
+    var remaining = components[...]
+    var linksFollowed = 0
+    do {
+        while let name = remaining.popFirst() {
+            switch name {
+            case ".":
+                continue
+            case "..":
+                let up = openat(dirFd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                guard up >= 0 else {
+                    throw CLIError("failed to resolve the folder of \(what) \(path): \(String(cString: strerror(errno)))")
+                }
+                move(to: up, parentOf(current))
+                continue
+            default:
+                break
+            }
+            let candidate = join(current, name)
+            var st = stat()
+            guard fstatat(dirFd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw CLIError("failed to resolve the folder of \(what) \(path): \(candidate): \(String(cString: strerror(errno)))")
+            }
+            switch st.st_mode & S_IFMT {
+            case S_IFDIR:
+                let next = openat(dirFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard next >= 0 else {
+                    let err = errno
+                    if err == ELOOP {
+                        throw CLIError("\(what) \(path): the folder \(candidate) became a symbolic link while it was being checked; refusing to use it")
+                    }
+                    throw CLIError("failed to open the folder \(candidate) of \(what) \(path): \(String(cString: strerror(err)))")
+                }
+                move(to: next, candidate)
+            case S_IFLNK:
+                var parent = stat()
+                let rootOnly = st.st_uid == 0 && fstat(dirFd, &parent) == 0 && parent.st_uid == 0
+                    && parent.st_mode & (S_IWGRP | S_IWOTH) == 0
+                guard rootOnly else {
+                    throw CLIError("\(what) \(path): the folder \(candidate) is a symbolic link; the path must be a real path with no links in it (macOS's own root-owned links, such as /tmp and /var, are accepted)")
+                }
+                linksFollowed += 1
+                guard linksFollowed <= 32 else { // the kernel's own ELOOP limit
+                    throw CLIError("\(what) \(path): too many symbolic links in its folders")
+                }
+                var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) + 1)
+                let length = readlinkat(dirFd, name, &buffer, Int(MAXPATHLEN))
+                guard length > 0 else {
+                    throw CLIError("\(what) \(path): could not read the link \(candidate): \(String(cString: strerror(errno)))")
+                }
+                let target = String(decoding: buffer[0..<length].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                if target.hasPrefix("/") {
+                    let root = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                    guard root >= 0 else {
+                        throw CLIError("failed to open / to resolve \(what) \(path): \(String(cString: strerror(errno)))")
+                    }
+                    move(to: root, "/")
+                }
+                remaining = (target.split(separator: "/", omittingEmptySubsequences: true).map(String.init) + remaining)[...]
+            default:
+                throw CLIError("\(what) \(path): \(candidate) is not a folder")
+            }
+        }
+    } catch {
+        _ = Darwin.close(dirFd)
+        throw error
+    }
+    return CheckedFolder(fd: dirFd, path: current, leaf: leaf)
+}
+
+
+
 // Opens a --dek-file with the same hardening as the Linux tool's
 // read_dek_file: O_NOFOLLOW so a symlink fails the open outright, O_NONBLOCK
 // so a FIFO fails the regular-file check below instead of blocking the open,
@@ -983,8 +1198,14 @@ let forbidGroupOtherAccess: mode_t = 0o077
 // rather than the path, so nothing can be swapped between the check and the
 // read. The file must be a regular file owned by root or this process's
 // effective user, granting no access to group or others (0400/0600).
-func openDekFile(_ path: String) throws -> Int32 {
-    let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+func openDekFile(_ spelledPath: String) throws -> Int32 {
+    // No symbolic link in the folders above it either (see openRealFolder);
+    // O_NOFOLLOW below covers the file itself, opened within the checked
+    // folder so nothing can be swapped in between.
+    let folder = try openRealFolder(spelledPath, what: "--dek-file")
+    defer { folder.close() }
+    let path = spelledPath
+    let fd = openat(folder.fd, folder.leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
     guard fd >= 0 else {
         let err = errno
         if err == ELOOP {
@@ -1012,65 +1233,90 @@ func openDekFile(_ path: String) throws -> Int32 {
     guard offending == 0 else {
         throw CLIError("--dek-file \(path) permissions are too broad (mode \(String(st.st_mode & 0o7777, radix: 8)); bits \(String(offending, radix: 8)) must be clear)")
     }
+    // Mode bits aren't the whole story on macOS: an access control list can
+    // grant read to anyone regardless of a 0600 mode. Refuse any ACL at all.
+    if let acl = acl_get_fd(fd) {
+        acl_free(UnsafeMutableRawPointer(acl))
+        throw CLIError("--dek-file \(path) has an access control list, which can grant access beyond its mode bits; remove it (chmod -N \(path)) or use a file without one")
+    }
     ok = true
     return fd
 }
 
-// The value of each standard-base64 character (RFC 4648 section 4), or nil.
-func base64Value(_ c: UInt8) -> UInt8? {
-    switch c {
-    case 0x41...0x5A: return c - 0x41      // A-Z
-    case 0x61...0x7A: return c - 0x61 + 26 // a-z
-    case 0x30...0x39: return c - 0x30 + 52 // 0-9
-    case 0x2B: return 62                   // +
-    case 0x2F: return 63                   // /
-    default: return nil
-    }
-}
 
-// How many bytes `text` decodes to as strict, padded standard base64, or nil
-// if it is not that: the length is a multiple of 4, '=' appears only as the
-// last one or two characters, and the bits padding leaves unused are zero.
-// The rules of the Linux tool's decoder (the base64 crate's STANDARD
-// engine) -- stricter than Foundation's Data(base64Encoded:), which accepts
-// padding mid-text and runs of '='.
-func strictBase64DecodedLength(_ text: UnsafeRawBufferPointer) -> Int? {
-    guard !text.isEmpty, text.count % 4 == 0 else { return nil }
-    var padding = 0
-    if text[text.count - 1] == 0x3D { padding += 1 }
-    if text[text.count - 2] == 0x3D { padding += 1 }
-    let dataEnd = text.count - padding
-    for i in 0..<dataEnd where base64Value(text[i]) == nil {
-        return nil
-    }
-    // The last data character's bits that padding leaves unused must be 0.
-    if padding > 0, let last = base64Value(text[dataEnd - 1]) {
-        let unusedBits: UInt8 = padding == 2 ? 0b1111 : 0b11
-        guard last & unusedBits == 0 else { return nil }
-    }
-    return text.count / 4 * 3 - padding
-}
+// The Linux and Windows tools' messages, word for word.
+//
+// Deliberately fixed: it names no character, offset or bit pattern, so a
+// mistyped DEK never puts part of itself into a log.
+let invalidBase64DekMessage = "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)"
+// A DEK typed or pasted at a terminal is echoed and stays in the scrollback.
+let terminalDekMessage = "refusing to read the DEK from an interactive terminal, where it would be echoed and kept in the scrollback; pipe it in instead, e.g. printf '%s' \"$DEK_B64\" | hkdfguard wrap ... --dek-stdin"
+// The fix is on the sending side, so say what it is.
+let utf16DekMessage = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text (in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)"
 
-// Decodes text already accepted by strictBase64DecodedLength into `out`,
-// which must be exactly that many bytes. Writes only into `out`.
-func strictBase64Decode(_ text: UnsafeRawBufferPointer, into out: UnsafeMutableRawBufferPointer) {
+// Branch-free helpers for decodeBase64ConstantTime. Every one returns 0 or 1
+// (or a masked value) using wrapping arithmetic on UInt32, with no
+// data-dependent branch or table lookup.
+@inline(__always) func ctEq(_ a: UInt32, _ b: UInt32) -> UInt32 { ((a ^ b) &- 1) >> 31 }
+@inline(__always) func ctInRange(_ c: UInt32, _ lo: UInt32, _ hi: UInt32) -> UInt32 {
+    (((lo &- 1) &- c) & (c &- (hi &+ 1))) >> 31 & 1
+}
+@inline(__always) func ctMask(_ bit: UInt32) -> UInt32 { 0 &- bit }
+
+// Decodes strict, padded, standard base64 (RFC 4648 section 4: the `+/`
+// alphabet, a length that is a multiple of 4, `=` only as the last one or
+// two characters, and zero in the bits the padding leaves unused) into
+// `out`, and returns how many bytes it decodes to -- or nil if `text` is
+// not that. The rules of the Linux tool's decoder (base64ct) and the
+// Windows tool's.
+//
+// Constant time with respect to the text, as both of theirs are: the only
+// branches are on its length, which is public; every character is
+// classified and accumulated with mask arithmetic, so how long this takes
+// says nothing about which character, if any, was wrong. Bytes are written
+// to `out` at fixed positions only, up to its size; the caller checks the
+// returned length.
+func decodeBase64ConstantTime(_ text: UnsafeRawBufferPointer, into out: UnsafeMutableRawBufferPointer) -> Int? {
+    let n = text.count
+    guard n > 0, n % 4 == 0 else { return nil }
+
+    let pad1 = ctEq(UInt32(text[n - 1]), 0x3D)        // '=' last
+    let pad2 = ctEq(UInt32(text[n - 2]), 0x3D) & pad1 // and '=' before it
+    var valid: UInt32 = 1
+    var lastValue2: UInt32 = 0 // the value at n-2: the last data character when one '='
+    var lastValue3: UInt32 = 0 // the value at n-3: the last data character when two
     var o = 0
-    var i = 0
-    while i < text.count {
-        var quad: UInt32 = 0
-        var chars = 0
-        for j in 0..<4 {
-            if let v = base64Value(text[i + j]) {
-                quad |= UInt32(v) << (18 - 6 * j)
-                chars += 1
+    var quad: UInt32 = 0
+    for i in 0..<n {
+        let c = UInt32(text[i])
+        let isPad = (ctEq(UInt32(i), UInt32(n - 1)) & pad1) | (ctEq(UInt32(i), UInt32(n - 2)) & pad2)
+        let upper = ctInRange(c, 0x41, 0x5A)
+        let lower = ctInRange(c, 0x61, 0x7A)
+        let digit = ctInRange(c, 0x30, 0x39)
+        let plus = ctEq(c, 0x2B)
+        let slash = ctEq(c, 0x2F)
+        let value = ((c &- 0x41) & ctMask(upper)) | ((c &- (0x61 - 26)) & ctMask(lower))
+            | ((c &+ (52 - 0x30)) & ctMask(digit)) | (62 & ctMask(plus)) | (63 & ctMask(slash))
+        valid &= upper | lower | digit | plus | slash | isPad
+        let v = value & ~ctMask(isPad) & 0x3F // a pad contributes zero bits
+        lastValue2 = (lastValue2 & ~ctMask(ctEq(UInt32(i), UInt32(n - 2)))) | (v & ctMask(ctEq(UInt32(i), UInt32(n - 2))))
+        lastValue3 = (lastValue3 & ~ctMask(ctEq(UInt32(i), UInt32(n - 3)))) | (v & ctMask(ctEq(UInt32(i), UInt32(n - 3))))
+        quad = (quad << 6) | v
+        if i % 4 == 3 { // public: the position, not the data
+            for k in 0..<3 where o < out.count {
+                out[o] = UInt8(truncatingIfNeeded: quad >> (16 - 8 * UInt32(k)))
+                o += 1
             }
+            quad = 0
         }
-        for k in 0..<(chars - 1) where o < out.count {
-            out[o] = UInt8(truncatingIfNeeded: quad >> (16 - 8 * k))
-            o += 1
-        }
-        i += 4
     }
+    // '=' anywhere but the end is not a pad, so it already failed above.
+    // The unused bits: 2 under one '=' (n-2's low 2), 4 under two (n-3's low 4).
+    let oneBad = (pad1 & (pad2 ^ 1)) & (ctEq(lastValue2 & 0x3, 0) ^ 1)
+    let twoBad = pad2 & (ctEq(lastValue3 & 0xF, 0) ^ 1)
+    valid &= (oneBad | twoBad) ^ 1
+    let length = n / 4 * 3 - Int(pad1 + pad2)
+    return valid == 1 ? length : nil
 }
 
 // Reads the base64 DEK for `source`, decodes it, and hands the decoded bytes
@@ -1114,6 +1360,12 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     let what: String
     switch source {
     case .stdin:
+        // A DEK typed or pasted at a terminal is echoed and stays in the
+        // scrollback: refuse a terminal outright rather than read it, as the
+        // Linux and Windows tools do.
+        guard isatty(STDIN_FILENO) != 1 else {
+            throw CLIError(terminalDekMessage)
+        }
         fd = STDIN_FILENO
         what = "standard input"
     case .file(let path):
@@ -1137,6 +1389,11 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
         total += n
     }
     guard total <= maxDekInputLength else {
+        // UTF-16 doubles the text, so it is over the limit long before the
+        // decoder could say why: name it here instead.
+        if total >= 2 && ((input[0] == 0xFF && input[1] == 0xFE) || (input[0] == 0xFE && input[1] == 0xFF)) {
+            throw CLIError(utf16DekMessage)
+        }
         throw CLIError("\(flag): \(what) is longer than \(maxDekInputLength) bytes; expected base64 of a \(dekLen)-byte DEK")
     }
 
@@ -1144,8 +1401,17 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     // written by `printf '%s\n'` or an editor still works -- nothing else,
     // as in the Linux tool: leading or other trailing whitespace is part of
     // the input and fails to decode.
+    // A leading UTF-8 byte-order mark, which some Windows tools (PowerShell,
+    // .NET) prepend, is skipped; a UTF-16 one is refused as such, since the
+    // fix is on the sending side -- the Linux and Windows tools' rules.
     let bytes = UnsafeRawBufferPointer(rebasing: input[0..<total])
-    let start = 0
+    var start = 0
+    if total >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        start = 3
+    }
+    if total - start >= 2 && ((bytes[start] == 0xFF && bytes[start + 1] == 0xFE) || (bytes[start] == 0xFE && bytes[start + 1] == 0xFF)) {
+        throw CLIError(utf16DekMessage)
+    }
     var end = total
     if end > start && bytes[end - 1] == 0x0A {
         end -= 1
@@ -1159,13 +1425,18 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     }
 
     let text = UnsafeRawBufferPointer(rebasing: bytes[start..<end])
-    guard let decodedLength = strictBase64DecodedLength(text) else {
-        throw CLIError("\(flag): the DEK is not valid base64")
+    guard let decodedLength = decodeBase64ConstantTime(text, into: decoded) else {
+        throw CLIError("\(flag): \(invalidBase64DekMessage)")
     }
     guard decodedLength == dekLen else {
         throw CLIError("\(flag): the DEK must decode to exactly \(dekLen) bytes, got \(decodedLength)")
     }
-    strictBase64Decode(text, into: decoded)
+    // The base64 text has served its only purpose: zero it now, before the
+    // wrap, rather than when this function returns -- as the Linux tool
+    // does. Only the decoded DEK stays, for `body`.
+    if let inputBase = input.baseAddress {
+        _ = memset_s(inputBase, input.count, 0, input.count)
+    }
     return try body(UnsafeRawBufferPointer(decoded))
 }
 
@@ -1175,6 +1446,78 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
 // read/write, no access for anyone else (POSIX 0600). The user who wraps
 // must be the user whose keychain holds the KEK, so the same user unwraps.
 let keyFilePermissions: mode_t = 0o600
+// With --group: rw-r-----, the owner plus that one group, read-only -- the
+// Linux tool's 0640 and the Windows tool's owner-plus-group DACL.
+let keyFileGroupPermissions: mode_t = 0o640
+
+// Groups --group refuses: each covers essentially every account on a Mac
+// (staff, everyone, localaccounts), its administrators (admin, wheel), or
+// nobody in particular (nobody, nogroup). Granting one read access is no
+// narrower than world-readable for this purpose. Matched by resolved gid,
+// so a numeric gid can't dodge the list; gid 0 is refused whatever its
+// name. The Linux and Windows tools refuse their own equivalents.
+let overBroadGroups = ["wheel", "admin", "staff", "everyone", "localaccounts", "netaccounts", "nobody", "nogroup"]
+
+// Looks a group up by name, or by gid when `spec` is all digits. nil when
+// no such group exists; throws when the lookup itself failed.
+func lookupGroup(_ spec: String) throws -> (gid: gid_t, name: String)? {
+    let byGid = !spec.isEmpty && spec.utf8.allSatisfy { $0 >= 0x30 && $0 <= 0x39 }
+    var gid: gid_t = 0
+    if byGid {
+        guard let parsed = gid_t(spec) else {
+            throw CLIError("--group \(spec) is not a valid gid")
+        }
+        gid = parsed
+    }
+    var size = 16 * 1024
+    while size <= 1024 * 1024 {
+        var entry = group()
+        var result: UnsafeMutablePointer<group>?
+        var buffer = [CChar](repeating: 0, count: size)
+        let rc = byGid
+            ? getgrgid_r(gid, &entry, &buffer, size, &result)
+            : getgrnam_r(spec, &entry, &buffer, size, &result)
+        if rc == ERANGE {
+            size *= 2 // a large directory group's member list didn't fit
+            continue
+        }
+        guard rc == 0 else {
+            throw CLIError("could not look up group \(spec): \(String(cString: strerror(rc)))")
+        }
+        guard let found = result, let namePtr = found.pointee.gr_name else {
+            return nil
+        }
+        return (found.pointee.gr_gid, String(cString: namePtr))
+    }
+    throw CLIError("could not look up group \(spec): its entry is too large")
+}
+
+// Resolves --group to the gid the key file is given, refusing a group that
+// doesn't exist or is over-broad. Done before the DEK is read or the Secure
+// Enclave is used, so a bad --group costs nothing. The Linux tool's
+// resolve_key_file_group.
+func resolveKeyFileGroup(_ spec: String) throws -> (gid: gid_t, name: String) {
+    guard let found = try lookupGroup(spec) else {
+        throw CLIError("--group \"\(spec)\" does not name a group on this host")
+    }
+    let (gid, name) = (found.gid, found.name)
+    // Fails closed: if a listed group can't be looked up, whether it is this
+    // gid can't be ruled out, so --group is refused rather than allowed.
+    var listed = overBroadGroups.contains(name)
+    for broad in overBroadGroups where !listed {
+        do {
+            if let broadGroup = try lookupGroup(broad), broadGroup.gid == gid {
+                listed = true
+            }
+        } catch {
+            throw CLIError("--group \"\(spec)\": can't confirm it isn't the over-broad group \"\(broad)\" (\(error)); refusing")
+        }
+    }
+    if gid == 0 || listed {
+        throw CLIError("--group \"\(spec)\" (\(name), gid \(gid)) is an over-broad group (it covers essentially every account, or the host's administrators); name a dedicated group for the service that unwraps this key")
+    }
+    return (gid, name)
+}
 
 // Number of secure-overwrite passes secureOverwriteAndRemoveIfExists below
 // performs on a pre-existing file before deleting it, alternating an
@@ -1251,6 +1594,11 @@ func requireRegularFile(_ st: stat, path: String) throws {
         guard st.st_nlink <= 1 else {
             throw CLIError("\(path) has \(st.st_nlink) hard links; refusing to overwrite it, since that would also destroy the other linked file -- remove \(path) yourself if it should be replaced")
         }
+        // A wrapped key is 125 bytes; something far bigger at the key path
+        // isn't one. The Linux tool's MAX_REPLACEABLE_KEY_FILE_LEN.
+        guard st.st_size <= off_t(maxReplaceableKeyFileSize) else {
+            throw CLIError("\(path) is \(st.st_size) bytes, far larger than any wrapped key; refusing to overwrite it")
+        }
     case S_IFLNK:
         throw CLIError("\(path) is a symbolic link; refusing to overwrite through it -- remove the link, or point <key-file-path> at a regular file")
     default:
@@ -1258,25 +1606,50 @@ func requireRegularFile(_ st: stat, path: String) throws {
     }
 }
 
+// Largest existing file --force will overwrite: 64 KiB, as on Linux.
+let maxReplaceableKeyFileSize = 64 * 1024
+
+
 // Fail-fast twin of the checks secureOverwriteAndRemoveIfExists enforces at
 // open time: with --force, refuse before any Secure Enclave or keychain
 // work if <key-file-path> exists and is a symlink or anything other than a
 // regular file. `lstat`, not `stat`, so a symlink is judged as itself, not
 // as its target. Advisory only -- the path can change between here and the
 // open -- the O_NOFOLLOW/fstat checks at open time are the guarantee.
-func refuseUnlessAbsentOrRegularFile(path: String) throws {
+func refuseUnlessAbsentOrRegularFile(_ folder: CheckedFolder, display: String) throws {
     var st = stat()
-    guard lstat(path, &st) == 0 else {
+    guard fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
         if errno == ENOENT {
             return
         }
-        throw CLIError("failed to stat \(path): \(String(cString: strerror(errno)))")
+        throw CLIError("failed to stat \(display): \(String(cString: strerror(errno)))")
     }
-    try requireRegularFile(st, path: path)
+    try requireRegularFile(st, path: display)
 }
 
-func secureOverwriteAndRemoveIfExists(path: String) throws {
-    let fd = open(path, O_WRONLY | O_NOFOLLOW | O_NONBLOCK)
+// Whether anything at all -- a dangling symlink included -- occupies the
+// key file's name in its checked folder.
+func keyFileNameIsTaken(_ folder: CheckedFolder) -> Bool {
+    var st = stat()
+    return fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0
+}
+
+// Removes `folder.leaf` -- but only while that name still refers to the
+// file open as `fd` (same device and inode): a file someone put at the name
+// in the meantime is left alone. The Linux tool's remove_created_file.
+func unlinkIfStillSame(_ folder: CheckedFolder, fd: Int32) -> Bool {
+    var opened = stat()
+    var named = stat()
+    guard fstat(fd, &opened) == 0, fstatat(folder.fd, folder.leaf, &named, AT_SYMLINK_NOFOLLOW) == 0,
+          opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
+        return false
+    }
+    return unlinkat(folder.fd, folder.leaf, 0) == 0
+}
+
+
+func secureOverwriteAndRemoveIfExists(_ folder: CheckedFolder, display path: String) throws {
+    let fd = openat(folder.fd, folder.leaf, O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     guard fd >= 0 else {
         let err = errno
         if err == ENOENT {
@@ -1287,13 +1660,15 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
         }
         if err == EACCES || err == EPERM {
             // Can't write to it -- skip the overwrite passes and go
-            // straight to trying to remove it, but still only if it is a
-            // regular file.
+            // straight to removing it, but only once it is confirmed to be a
+            // regular file (one link, within the size cap). If it can't even
+            // be examined, nothing is removed.
             var st = stat()
-            if lstat(path, &st) == 0 {
-                try requireRegularFile(st, path: path)
+            guard fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw CLIError("failed to stat \(path): \(String(cString: strerror(errno))); refusing to remove it")
             }
-            if unlink(path) != 0 && errno != ENOENT {
+            try requireRegularFile(st, path: path)
+            if unlinkat(folder.fd, folder.leaf, 0) != 0 && errno != ENOENT {
                 throw CLIError("failed to remove \(path): \(String(cString: strerror(errno)))")
             }
             return
@@ -1356,7 +1731,7 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
                     // Fresh CSPRNG bytes for every chunk, so no two regions
                     // of the file receive the same random pattern -- same
                     // source as every other random value this project
-                    // generates (nonces, ephemeral keys).
+                    // generates (salts, nonces).
                     let status = chunk.withUnsafeMutableBytes { raw in
                         SecRandomCopyBytes(kSecRandomDefault, count, raw.baseAddress!)
                     }
@@ -1373,8 +1748,9 @@ func secureOverwriteAndRemoveIfExists(path: String) throws {
         }
     }
 
-    guard unlink(path) == 0 else {
-        throw CLIError("failed to remove \(path) after secure overwrite: \(String(cString: strerror(errno)))")
+    // Only while the name still refers to the file just overwritten.
+    guard unlinkIfStillSame(folder, fd: fd) else {
+        throw CLIError("failed to remove \(path) after secure overwrite: it was moved or replaced, or \(String(cString: strerror(errno)))")
     }
 }
 
@@ -1393,20 +1769,14 @@ func flushToStorage(fd: Int32, context: String) throws {
 // a crash after the file's data is flushed can still lose the name that
 // points at it. A filesystem that cannot sync a directory at all (EINVAL /
 // ENOTSUP) is accepted: there is nothing further this tool can do there.
-func flushParentDirectory(of path: String) throws {
-    var dir = (path as NSString).deletingLastPathComponent
-    if dir.isEmpty { dir = "." }
-    let dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-    guard dfd >= 0 else {
-        throw CLIError("failed to open \(dir) to flush it: \(String(cString: strerror(errno)))")
-    }
-    defer { close(dfd) }
-    if fcntl(dfd, F_FULLFSYNC) == 0 { return }
-    if fsync(dfd) == 0 { return }
+func flushFolder(_ folder: CheckedFolder) throws {
+    if fcntl(folder.fd, F_FULLFSYNC) == 0 { return }
+    if fsync(folder.fd) == 0 { return }
     let err = errno
     if err == EINVAL || err == ENOTSUP { return }
-    throw CLIError("failed to flush directory \(dir) to storage: \(String(cString: strerror(err)))")
+    throw CLIError("failed to flush directory \(folder.path) to storage: \(String(cString: strerror(err)))")
 }
+
 
 // Writes `bytes` to a new file at `path` with `keyFilePermissions`, durably,
 // or leaves no file behind.
@@ -1425,12 +1795,37 @@ func flushParentDirectory(of path: String) throws {
 //    refers to the very inode this call created (same st_dev/st_ino), so a
 //    file someone else put at that path in the meantime is never deleted. A
 //    truncated payload left behind would also block a retry with EEXIST.
-func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool) throws {
+//
+// With `group`, the file is given that group on the open descriptor
+// (fchown) before its mode widens to 0640 and before a byte is written, so
+// the payload never sits in it under any other group -- as the Linux tool
+// does. A caller who isn't root can only give a group they belong to: the
+// kernel's rule, reported plainly, and the empty file removed.
+// Removes the file's access control list, if it has one, and confirms it is
+// gone. acl_set_fd with an empty ACL clears the extended ACL on APFS/HFS+;
+// the re-read is the guarantee, whatever the call did.
+func stripACL(fd: Int32, path: String) throws {
+    if let existing = acl_get_fd(fd) {
+        acl_free(UnsafeMutableRawPointer(existing))
+        if let empty = acl_init(0) {
+            defer { acl_free(UnsafeMutableRawPointer(empty)) }
+            _ = acl_set_fd(fd, empty)
+        }
+        if let still = acl_get_fd(fd) {
+            acl_free(UnsafeMutableRawPointer(still))
+            throw CLIError("\(path) inherited an access control list from its folder that could not be removed; the file's permissions would not be what was asked for -- use a folder without an inheritable ACL (ls -lde shows it; chmod -N removes it)")
+        }
+    }
+}
+
+func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
     if force {
-        try secureOverwriteAndRemoveIfExists(path: path)
+        try secureOverwriteAndRemoveIfExists(folder, display: path)
     }
 
-    let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, keyFilePermissions)
+    // O_CREAT | O_EXCL never follows a link at the name, and openat() keeps
+    // it in the checked folder.
+    let fd = openat(folder.fd, folder.leaf, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, keyFilePermissions)
     guard fd >= 0 else {
         let err = errno
         if err == EEXIST {
@@ -1439,35 +1834,37 @@ func writeWrappedKeyFile(path: String, bytes: [UInt8], force: Bool) throws {
         throw CLIError("failed to open \(path) for writing: \(String(cString: strerror(err)))")
     }
 
-    var created = stat()
-    guard fstat(fd, &created) == 0 else {
-        let err = errno
-        close(fd)
-        throw CLIError("failed to stat \(path) after creating it: \(String(cString: strerror(err))); remove \(path) before retrying")
-    }
-
     var committed = false
     defer {
-        close(fd)
         if !committed {
-            var now = stat()
-            if lstat(path, &now) == 0, now.st_dev == created.st_dev, now.st_ino == created.st_ino {
-                unlink(path)
-            }
+            _ = unlinkIfStillSame(folder, fd: fd) // only the file this call created
         }
+        close(fd)
     }
 
-    guard fchmod(fd, keyFilePermissions) == 0 else {
+    if let group {
+        guard fchown(fd, uid_t.max, group.gid) == 0 else { // uid -1: the owner stays as it is
+            throw CLIError("could not give \(path) to group \"\(group.name)\": \(String(cString: strerror(errno))) (only root, or a member of the group, can)")
+        }
+    }
+    guard fchmod(fd, group == nil ? keyFilePermissions : keyFileGroupPermissions) == 0 else {
         throw CLIError("failed to set permissions on \(path): \(String(cString: strerror(errno)))")
     }
+    // A folder with an inheritable access control entry passes it to the new
+    // file, and neither the 0600 at creation nor fchmod touches it -- so the
+    // file could be readable (or deletable) by principals the mode doesn't
+    // show. Strip any ACL before a byte is written, and confirm it's gone;
+    // if it can't be, nothing is written and the empty file is removed.
+    try stripACL(fd: fd, path: path)
 
     try bytes.withUnsafeBufferPointer { buf in
         try writeAll(fd: fd, bytes: buf, context: path)
     }
     try flushToStorage(fd: fd, context: path)
-    try flushParentDirectory(of: path)
+    try flushFolder(folder)
     committed = true
 }
+
 
 // MARK: - Run
 
@@ -1478,13 +1875,15 @@ func runProvision(_ args: ProvisionArgs) throws {
     guard status == HKDFGuardStatus.success.rawValue else {
         throw CLIError("the KEK for service \"\(args.serviceName)\" exists but its fingerprint could not be read: \(describeStatus(status))")
     }
+    // The Linux and Windows tools' wording, plus the keychain mode and the
+    // fingerprint, which only this platform reports.
     if created {
-        print("provisioned KEK for service \"\(args.serviceName)\" (keychain: \(keychainModeName()))")
+        print("KEK provisioned for service \"\(args.serviceName)\" (keychain: \(keychainModeName()))")
         print("fingerprint: \(hexString(fingerprint)) -- record this; retire requires it")
     } else {
         // A KEK this operator didn't create could have been planted by another
         // process; the fingerprint is how to tell.
-        print("KEK already exists for service \"\(args.serviceName)\" (keychain: \(keychainModeName())); nothing to do")
+        print("KEK already provisioned for service \"\(args.serviceName)\"; verified, nothing to do (keychain: \(keychainModeName()))")
         print("fingerprint: \(hexString(fingerprint)) -- confirm it matches the one recorded when this service was provisioned")
     }
 }
@@ -1531,14 +1930,22 @@ func runStatus(serviceName: String) throws {
     }
 }
 
-func runWrap(_ args: WrapArgs) throws {
+func runWrap(_ spelledArgs: WrapArgs) throws {
+    // The key file's folder must be a real folder with no symbolic link in
+    // it (openRealFolder), checked first, before any Secure Enclave or
+    // keychain work. It is held open, and every filesystem call below goes
+    // through it; messages name the path as the operator spelled it.
+    let args = spelledArgs
+    let keyFolder = try openRealFolder(spelledArgs.keyFilePath, what: "--key-file-path")
+    defer { keyFolder.close() }
+
     // Fast, friendly pre-check: fail before ever touching the Secure
     // Enclave/Keychain if the output path obviously already exists,
     // rather than making the caller pay for a full wrap operation just to
     // find out at the very end. writeWrappedKeyFile's O_EXCL is the actual
     // correctness guarantee against the exists-then-create race; this is
     // purely a fail-fast convenience on top of it.
-    if !args.force && FileManager.default.fileExists(atPath: args.keyFilePath) {
+    if !args.force && keyFileNameIsTaken(keyFolder) { // a dangling symlink counts
         throw CLIError("\(args.keyFilePath) already exists; pass --force|-f to overwrite")
     }
     // Same fail-fast idea for --force: a symlink or non-regular file at the
@@ -1546,13 +1953,17 @@ func runWrap(_ args: WrapArgs) throws {
     // first means no Secure Enclave/keychain work is spent on a command
     // that cannot complete.
     if args.force {
-        try refuseUnlessAbsentOrRegularFile(path: args.keyFilePath)
+        try refuseUnlessAbsentOrRegularFile(keyFolder, display: args.keyFilePath)
     }
 
     // `args.serviceName` is not secret -- it's a logical identifier, not key
     // material -- so no special scoping is needed for it. Validated before
     // any DEK is read.
     try validateServiceCharset(args.serviceName)
+
+    // Resolved before the DEK is read or the Secure Enclave is used, so a
+    // bad --group fails fast and costs nothing. Without --group: owner-only.
+    let group = try args.groupName.map(resolveKeyFileGroup)
 
     // `wrap` never checks for or creates a KEK -- hkdfguard_kek_exists and
     // hkdfguard_create_kek belong to the `provision` command alone. With no
@@ -1585,9 +1996,11 @@ func runWrap(_ args: WrapArgs) throws {
         throw CLIError("fingerprint mismatch for service \"\(args.serviceName)\": the KEK in the keychain is \(hexString(usedFingerprint)), not \(hexString(expected)); nothing was written -- the DEK was NOT committed to that key")
     }
 
-    try writeWrappedKeyFile(path: args.keyFilePath, bytes: wrapped, force: args.force)
+    try writeWrappedKeyFile(keyFolder, display: args.keyFilePath, bytes: wrapped, force: args.force, group: group)
 
-    print("wrapped key written to \(args.keyFilePath) (\(wrapped.count) bytes, permissions 0600, service \"\(args.serviceName)\", keychain: \(keychainModeName()))")
+    // The Linux tool's wording for who can read it.
+    let access = group.map { "owner read/write + \($0.name) read-only" } ?? "owner read/write"
+    print("wrapped key written to \(spelledArgs.keyFilePath) (\(wrapped.count) bytes, \(access), service \"\(args.serviceName)\", keychain: \(keychainModeName()))")
     print("fingerprint: \(hexString(usedFingerprint))\(args.expectedFingerprint == nil ? " -- confirm it matches the one recorded when this service was provisioned" : " (confirmed)")")
 }
 

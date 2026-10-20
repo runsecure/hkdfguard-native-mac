@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the signed, notarized installer package from build-dist.sh's output:
 #
-#   dist/hkdfguard-native-macos-v1-<version>-osx-arm64.pkg   (+ .sha256)
+#   dist/hkdfguard-native-macos-<version>-osx-arm64.pkg   (+ .sha256)
 #
 # The package installs, root:wheel, into /Library/Application Support/HkdfGuard/v1/:
 #
@@ -56,7 +56,8 @@ DYLIB_NAME="libhkdfguard.dylib"
 HEADER_NAME="hkdfguard.h"
 CLI_NAME="hkdfguard"
 APP_NAME="hkdfguard.app"
-PKG_ID="com.hkdfguard.native.v1"
+# The package ID macOS records the installation under (pkgutil --pkg-info).
+PKG_ID="com.hkdfguard.native"
 INSTALL_LOCATION="/Library/Application Support/HkdfGuard"
 
 fail() { echo "error: $*" >&2; exit 1; }
@@ -84,10 +85,10 @@ if [ -z "$TEAM_ID" ]; then
 fi
 
 if [ "$UNSIGNED" = 1 ]; then
-    OUT_NAME="hkdfguard-native-macos-v1-$VERSION-osx-arm64-UNSIGNED.pkg"
+    OUT_NAME="hkdfguard-native-macos-$VERSION-osx-arm64-UNSIGNED.pkg"
     echo "note: HKDFGUARD_PKG_UNSIGNED=1 -- unsigned, unnotarized; for local layout testing only" >&2
 else
-    OUT_NAME="hkdfguard-native-macos-v1-$VERSION-osx-arm64.pkg"
+    OUT_NAME="hkdfguard-native-macos-$VERSION-osx-arm64.pkg"
     [ -n "$NOTARY_PROFILE" ] || fail "set HKDFGUARD_NOTARY_PROFILE (or HKDFGUARD_PKG_UNSIGNED=1 for a local test build)"
     IDENTITY="${HKDFGUARD_INSTALLER_IDENTITY:-}"
     identities="$(security find-identity -v)"
@@ -111,6 +112,22 @@ trap 'rm -rf "$STAGE"' EXIT
 # Input: the dist/ build
 # ---------------------------------------------------------------------------
 
+# Asserts `file`'s signature carries exactly the given top-level
+# entitlements -- none at all when no keys are given. An allowlist, not a
+# list of known-bad keys: get-task-allow (debugger attach),
+# cs.disable-library-validation, cs.allow-dyld-environment-variables, or
+# anything else added later fails the build, since each would undo part of
+# what the hardened runtime and the signature checks promise.
+assert_entitlements() {
+    local file="$1" actual expected
+    shift
+    actual="$(codesign -d --entitlements - "$file" 2>/dev/null \
+        | awk '/^\t\[Key\] /{sub(/^\t\[Key\] /, ""); print}' | sort)"
+    expected="$(printf '%s\n' "$@" | sed '/^$/d' | sort)"
+    [ "$actual" = "$expected" ] \
+        || fail "$file: entitlements are [$(tr '\n' ' ' <<<"$actual")], expected [$(tr '\n' ' ' <<<"$expected")]"
+}
+
 echo "==> Checking dist/ input"
 for f in "$DYLIB_NAME" "$HEADER_NAME" "$CLI_NAME" SHA256SUMS; do
     [ -f "$LIB_DIR/$f" ] || fail "missing $LIB_DIR/$f -- run build-dist.sh first"
@@ -127,11 +144,31 @@ for f in "$LIB_DIR/$DYLIB_NAME" "$LIB_DIR/$CLI_NAME" "$APP_SRC"; do
     # Hardened runtime: library validation and no DYLD_* overrides, as
     # build-dist.sh signed it. Re-checked here in case dist/ was touched.
     grep -q 'flags=0x10000(runtime)' <<<"$info" || fail "$f: hardened runtime flag missing"
+    if [ "$f" = "$LIB_DIR/$CLI_NAME" ]; then
+        # The bare CLI must look for its dylib in its own folder and nowhere
+        # else: any other rpath (a toolchain path under /Applications, say,
+        # which the admin group can write) would be searched first.
+        rpaths="$(otool -l "$f" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}')"
+        [ "$rpaths" = "@executable_path" ] \
+            || fail "$f must have exactly one rpath, @executable_path; found: $(tr '\n' ' ' <<<"$rpaths")"
+    fi
     if [ "$UNSIGNED" != 1 ]; then
         grep -q '^Authority=Developer ID Application:' <<<"$info" \
             || fail "$f: not Developer ID signed -- package only a HKDFGUARD_RELEASE=1 build"
     fi
 done
+# No debug entitlements in anything shipped: the bare dylib and CLI and the
+# app's embedded dylib carry none; the app only its keychain identity
+# (build-dist.sh adds get-task-allow to a development export, which a
+# signed package must never contain).
+assert_entitlements "$LIB_DIR/$DYLIB_NAME"
+assert_entitlements "$LIB_DIR/$CLI_NAME"
+assert_entitlements "$APP_SRC/Contents/Frameworks/$DYLIB_NAME"
+app_entitlements=(com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups)
+if [ "$UNSIGNED" = 1 ] && codesign -d --entitlements - "$APP_SRC" 2>/dev/null | grep -q 'get-task-allow'; then
+    app_entitlements+=(com.apple.security.get-task-allow) # a local layout test of a development build only
+fi
+assert_entitlements "$APP_SRC/Contents/MacOS/$CLI_NAME" "${app_entitlements[@]}"
 if [ "$UNSIGNED" != 1 ]; then
     # The bare dylib and CLI can't carry a stapled ticket; check that Apple's
     # ticket service publishes theirs, as build-dist.sh does, rather than
@@ -216,7 +253,7 @@ DIST_XML="$STAGE/distribution.xml"
 cat >"$DIST_XML" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-    <title>HkdfGuard Native v1</title>
+    <title>HkdfGuard Native</title>
     <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
     <allowed-os-versions>

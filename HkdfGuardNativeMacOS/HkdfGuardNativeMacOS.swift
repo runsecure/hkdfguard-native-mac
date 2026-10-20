@@ -18,64 +18,127 @@ private let hkdfguardDekLength = 32
 /// wrapped payload — see `kekFingerprint` below.
 private let hkdfguardFingerprintLength = 32
 
-/// The HPKE (RFC 9180) ciphersuite every payload is sealed with, and the one
-/// byte that names it in the payload: DHKEM(P-256, HKDF-SHA256),
-/// HKDF-SHA256, AES-256-GCM, base mode. The byte is the hook for a future
-/// suite (a post-quantum hybrid KEM, say) to be recognised at parse time
-/// rather than by a new file format; this build implements exactly one.
-private let hkdfguardCiphersuite = HPKE.Ciphersuite.P256_SHA256_AES_GCM_256
+/// The one byte that names the payload's construction (see "Wrap" below):
+/// ECDH(KEK, hashed per-payload point) -> HKDF-SHA512 -> AES-256-GCM, the
+/// Linux and Windows libraries' construction. The hook for a future one to
+/// be recognised at parse time; this build implements exactly one.
 private let hkdfguardSuiteId: UInt8 = 0x01
 private let hkdfguardSuiteIdLength = 1
 
-/// Length of the suite's encapsulated key: an uncompressed X9.63 P-256
-/// point, 0x04 || x || y.
-private let hkdfguardEncapsulatedKeyLength = 65
+/// The per-payload random salt: it selects the payload's ECDH point (see
+/// `payloadECDHPoint`) and is HKDF's salt. Linux's SALT_LEN.
+private let hkdfguardSaltLength = 32
 
-/// AES-GCM tag length, as fixed by the suite's AEAD. HPKE derives the nonce
-/// from the key schedule, so none is stored.
+/// The AES-GCM nonce, random per payload. Linux's NONCE_LEN.
+private let hkdfguardNonceLength = 12
+
+/// AES-GCM tag length.
 private let hkdfguardGCMTagLength = 16
 
 /// The exact length of every wrapped payload:
-///   fingerprint || suite id || encapsulated key || ciphertext (DEK length) || tag
-/// = 32 + 1 + 65 + 32 + 16 = 146 bytes. Known up front, so both wrap and
+///   fingerprint || suite id || salt || nonce || ciphertext (DEK length) || tag
+/// = 32 + 1 + 32 + 12 + 32 + 16 = 125 bytes. Known up front, so both wrap and
 /// unwrap can reject a wrong-sized buffer before any keychain or Secure
 /// Enclave work.
 private let hkdfguardWrappedLength =
-    hkdfguardFingerprintLength + hkdfguardSuiteIdLength + hkdfguardEncapsulatedKeyLength
+    hkdfguardFingerprintLength + hkdfguardSuiteIdLength + hkdfguardSaltLength + hkdfguardNonceLength
     + hkdfguardDekLength + hkdfguardGCMTagLength
 
-/// Offsets of each field within a payload.
+/// Offsets of each field within a payload. Everything before the
+/// ciphertext is the header, authenticated as a whole (see `wrapDekCore`).
 private let hkdfguardSuiteIdOffset = hkdfguardFingerprintLength
-private let hkdfguardEncapsulatedKeyOffset = hkdfguardSuiteIdOffset + hkdfguardSuiteIdLength
-private let hkdfguardCiphertextOffset = hkdfguardEncapsulatedKeyOffset + hkdfguardEncapsulatedKeyLength
+private let hkdfguardSaltOffset = hkdfguardSuiteIdOffset + hkdfguardSuiteIdLength
+private let hkdfguardNonceOffset = hkdfguardSaltOffset + hkdfguardSaltLength
+private let hkdfguardCiphertextOffset = hkdfguardNonceOffset + hkdfguardNonceLength
+private let hkdfguardHeaderLength = hkdfguardCiphertextOffset
 private let hkdfguardCiphertextLength = hkdfguardDekLength + hkdfguardGCMTagLength
 
-/// Label at the front of the HPKE `info` string, binding every derived key
-/// to this scheme so it can never be reused as a key for anything else.
-/// Platform-neutral on purpose: the sibling Linux and Windows libraries
-/// share this payload format, so they must derive with the same `info`.
-private let hkdfguardInfoLabel = Data("com.hkdfguard.hpke.v1".utf8)
+/// HKDF `info` prefix and the salt-to-point hash's domain, byte for byte
+/// the Linux library's (HKDF_INFO_PREFIX, PAYLOAD_POINT_DOMAIN). Payloads
+/// are host-only, so nothing requires the labels to match; matching keeps
+/// the three implementations reviewable as one design.
+private let hkdfguardHKDFInfoPrefix = Data("hkdfguard-wrap-v1:".utf8)
+private let hkdfguardPayloadPointDomain = Data("HkdfGuard-P256-payload-ECDH-point-v1:".utf8)
 
-/// The HPKE `info` for `service`: label || 0x00 || service. Folded into the
-/// key schedule, so a payload sealed for one service cannot be opened under
-/// another even when (by misuse) both resolve to the same KEK. The service
-/// is validated ASCII (letters, digits, '.') before it gets here, so the
-/// 0x00 separator is unambiguous.
-private func hpkeInfo(service: String) -> Data {
-    var info = hkdfguardInfoLabel
-    info.append(0)
-    info.append(contentsOf: service.utf8)
+/// HKDF `info` for one payload: prefix || len(service) as u16 little-endian
+/// || service || header. The length prefix keeps the concatenation
+/// unambiguous, so no two distinct (service, header) pairs give the same
+/// `info`; the header binds the fingerprint, suite, salt and nonce into the
+/// key itself. Linux's `derive_wrapping_key`.
+func wrappingKeyInfo(service: String, header: Data) -> Data { // internal: the forgery tests rebuild payloads with it
+    let serviceBytes = Data(service.utf8) // validated ASCII, at most 128 bytes
+    var info = hkdfguardHKDFInfoPrefix
+    info.append(UInt8(truncatingIfNeeded: serviceBytes.count))
+    info.append(UInt8(truncatingIfNeeded: serviceBytes.count >> 8))
+    info.append(serviceBytes)
+    info.append(header)
     return info
 }
 
-/// The AEAD's additional authenticated data: the payload's own header,
-/// fingerprint || suite id -- every byte that precedes the encapsulated key.
-/// The tag therefore covers the suite byte the parser dispatches on as well
-/// as the fingerprint, so neither can be rewritten without failing the open.
-private func hpkeAAD(fingerprint: Data) -> Data {
-    var aad = fingerprint
-    aad.append(hkdfguardSuiteId)
-    return aad
+/// Hashes `salt` to a P-256 point: the first `X = SHA-256(domain || salt ||
+/// counter)` that is a valid x-coordinate, with the even-Y point (compressed
+/// 0x02 || X). Linux's `payload_ecdh_point`, byte for byte.
+///
+/// Why: the wrapping key comes from `ECDH(KEK_priv, H)`. Nobody knows the
+/// discrete log of a hash output, so computing it takes the KEK's private
+/// key, which never leaves the Secure Enclave -- only this host can create
+/// a payload, as well as open one. An ephemeral sender key (HPKE base mode,
+/// ECIES) would let anyone holding the KEK's *public* key derive the same
+/// secret and mint a payload carrying a DEK of their choosing. One point
+/// per payload, rather than one fixed point, makes the shared secret unique
+/// to the payload: capturing it once opens that payload, not the service's
+/// whole history.
+///
+/// Roughly half of all candidates are on the curve, so 255 failures has
+/// probability 2^-255. Not constant-time, and need not be: the salt is
+/// public. P-256 has cofactor 1, so any point that decompresses is in the
+/// prime-order group. CryptoKit validates the point while decompressing.
+func payloadECDHPoint(salt: Data) -> P256.KeyAgreement.PublicKey? {
+    for counter in UInt8(0)..<UInt8.max {
+        var hasher = SHA256()
+        hasher.update(data: hkdfguardPayloadPointDomain)
+        hasher.update(data: salt)
+        hasher.update(data: [counter])
+        var compressed = Data([0x02])
+        compressed.append(contentsOf: hasher.finalize())
+        if let point = try? P256.KeyAgreement.PublicKey(compressedRepresentation: compressed) {
+            return point
+        }
+    }
+    return nil
+}
+
+/// The AES-256 wrapping key for one payload: the Secure Enclave computes
+/// `ECDH(KEK_priv, payloadECDHPoint(salt))`, and HKDF-SHA512 (salt = the
+/// payload salt, `info` = `wrappingKeyInfo`) turns it into 32 bytes. The raw
+/// shared secret stays inside CryptoKit's `SharedSecret` and never becomes
+/// a buffer here. Throws if the enclave refuses (CRYPTO_ERROR); nil only if
+/// no point exists for the salt.
+private func deriveWrappingKey(
+    enclaveKey: SecureEnclave.P256.KeyAgreement.PrivateKey,
+    service: String,
+    header: Data
+) throws -> SymmetricKey? {
+    let salt = header[hkdfguardSaltOffset..<hkdfguardNonceOffset]
+    guard let point = payloadECDHPoint(salt: Data(salt)) else {
+        return nil
+    }
+    let shared = try enclaveKey.sharedSecretFromKeyAgreement(with: point)
+    return shared.hkdfDerivedSymmetricKey(
+        using: SHA512.self,
+        salt: salt,
+        sharedInfo: wrappingKeyInfo(service: service, header: header),
+        outputByteCount: 32
+    )
+}
+
+private func randomBytes(_ count: Int) -> Data? {
+    var bytes = Data(count: count)
+    let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
+        guard let base = raw.baseAddress else { return errSecParam }
+        return SecRandomCopyBytes(kSecRandomDefault, count, base)
+    }
+    return status == errSecSuccess ? bytes : nil
 }
 
 // MARK: - Keychain mode (hybrid)
@@ -169,10 +232,15 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     case outputBufferTooSmall = -2
     /// HKDFGUARD_ERR_PROVIDER_UNAVAILABLE: no Secure Enclave on this machine.
     case enclaveUnavailable = -3
-    /// HKDFGUARD_ERR_CRYPTO_ERROR: the RNG or HPKE sealing failed.
+    /// HKDFGUARD_ERR_CRYPTO_ERROR: the RNG failed, the Secure Enclave refused
+    /// the key agreement (wrap or unwrap), or AES-GCM sealing failed.
     case encryptionFailed = -5
-    /// HKDFGUARD_ERR_INTERNAL_ERROR: the library produced output of a length
-    /// it never should. Points at a bug here, not at the caller's input.
+    /// HKDFGUARD_ERR_INTERNAL_ERROR: an internal failure the library
+    /// detected itself -- output of a length it never should produce, or a
+    /// buffer that should exist not existing. Points at a bug here, not at
+    /// the caller's input. (Linux also returns it for a caught panic; a
+    /// Swift runtime trap can't be caught, so this library is written to
+    /// have none on its export paths -- see `copyOut`.)
     case unexpectedOutputLength = -6
     /// HKDFGUARD_ERR_INVALID_SERVICE_NAME
     case invalidServiceIdentifier = -8
@@ -192,8 +260,8 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: the payload's suite byte names a
     /// ciphersuite this build does not implement — a payload written by a
     /// newer or different build, not a tampered one. Returned by
-    /// hkdfguard_unwrap_dek and hkdfguard_open_file before any keychain or
-    /// Secure Enclave work.
+    /// hkdfguard_unwrap_dek before any keychain or Secure Enclave work
+    /// (hkdfguard_open_file reports the same file as `fileMalformed`, -38).
     case unsupportedCiphersuite = -12
 
     // MARK: KEK
@@ -219,7 +287,10 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// headless-daemon case), the item's ACL denied this process or the user
     /// declined the access prompt (`errSecAuthFailed`, `errSecUserCanceled`),
     /// or this process lacks a required entitlement
-    /// (`errSecMissingEntitlement`). Deliberately distinct from
+    /// (`errSecMissingEntitlement`). Also: the keychain handed the item over
+    /// but the Secure Enclave won't load keys in this session (keybag
+    /// locked, e.g. SSH after `security unlock-keychain`), proven by a
+    /// throwaway probe key failing too. Deliberately distinct from
     /// `kekNotFound`/`kekCorrupted`: a key very likely *does* exist, and
     /// treating this as "no key" or "corrupt key" would invite a caller to
     /// create a replacement or an operator to delete a healthy one.
@@ -227,7 +298,8 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
 
     /// HKDFGUARD_ERR_KEK_INVALID: a keychain item exists under this service,
     /// but its stored data representation could not be reconstructed into a
-    /// usable Secure Enclave key — a corrupt or foreign entry. Deliberately
+    /// usable Secure Enclave key — a corrupt or foreign entry — while the
+    /// enclave demonstrably works in this session. Deliberately
     /// never "healed" by generating a replacement: that would silently
     /// orphan whatever the original key protected.
     case kekCorrupted = -19
@@ -250,11 +322,10 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// can't be read by this process (`EACCES`, `EPERM`).
     case fileAccessDenied = -33
 
-    /// HKDFGUARD_ERR_FILE_IO: the path names a symbolic link, directory,
-    /// FIFO, socket, or device rather than a regular file, or `open`,
-    /// `fstat`, or `read` failed for any other reason. A symlink is refused
-    /// rather than followed (`O_NOFOLLOW`), and a FIFO is opened non-blocking
-    /// so it can't hang the caller.
+    /// HKDFGUARD_ERR_FILE_IO: the path names a directory, FIFO, socket, or
+    /// device rather than a regular file, or `open`, `fstat`, or `read`
+    /// failed for any other reason. A FIFO is opened non-blocking so it
+    /// can't hang the caller. (A symbolic link is `fileInsecure`.)
     case fileIO = -34
 
     /// HKDFGUARD_ERR_FILE_TOO_SHORT: fewer bytes than a wrapped payload —
@@ -277,19 +348,24 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     case fileUnprotectedKey = -37
 
     /// HKDFGUARD_ERR_FILE_MALFORMED: exactly the payload's length, but not a
-    /// payload: its encapsulated key is not a valid P-256 point, or its KEK
-    /// fingerprint is all zeros.
+    /// payload this build can read: its KEK fingerprint is all zeros, or its
+    /// suite byte names a construction this build does not implement. As on
+    /// Linux and Windows, every format problem in a key file is this one
+    /// code; hkdfguard_unwrap_dek, given the same bytes, reports the suite
+    /// as `unsupportedCiphersuite` (-12).
     case fileMalformed = -38
 
-    /// HKDFGUARD_ERR_FILE_UNTRUSTED: the file is owned by someone other than
-    /// this process's effective user or root, is writable by group or
-    /// others, or has more than one hard link — so a party other than its
-    /// owner could have replaced its contents or linked an older payload
-    /// into its place. Root is accepted so an administrator or MDM can
-    /// deploy key files a service account reads; root can already alter
-    /// anything on the machine, so this adds no new party who could tamper
-    /// with the file. The CLI's `wrap` writes owner-only, 0600, one link,
-    /// which always passes.
+    /// HKDFGUARD_ERR_FILE_UNTRUSTED: the path's last component is a symbolic
+    /// link (refused, never followed: `O_NOFOLLOW`), or the file is owned by
+    /// someone other than this process's effective user or root, or is
+    /// writable by group or others; or a folder above it, up to `/`, is
+    /// owned by someone else or writable by group or others without being
+    /// sticky (see `keyFileFoldersAreTrusted`) — so a party other than its
+    /// owner could have replaced its contents or renamed another file over
+    /// it. Root is accepted so an administrator or MDM can deploy key files
+    /// a service account reads; root can already alter anything on the
+    /// machine, so this adds no new party who could tamper with the file.
+    /// The CLI's `wrap` writes owner-only, 0600, which always passes.
     case fileInsecure = -39
 
     // MARK: macOS-specific — each refines HKDFGUARD_ERR_PROVIDER_ERROR (-4).
@@ -383,6 +459,24 @@ private func secureZero(_ bytes: inout Data) {
     }
 }
 
+/// Copies the first `count` bytes of `bytes` to `out`, or reports that it
+/// couldn't. Never traps: Swift can't catch a runtime trap the way the
+/// Linux build catches a panic at every export (and Windows an exception),
+/// so a trap here would end the host process instead of returning a status.
+/// The library therefore has no force-unwrap, `try!`, `fatalError` or
+/// `precondition` on any path an export can reach (the
+/// `theLibraryHasNoTrapsOnItsExportPaths` test enforces it); a failure
+/// that "can't happen" becomes INTERNAL_ERROR (-6) instead.
+private func copyOut<Bytes: ContiguousBytes>(_ bytes: Bytes, to out: UnsafeMutablePointer<UInt8>, count: Int) -> Bool {
+    bytes.withUnsafeBytes { raw in
+        guard count > 0, count <= raw.count, let source = raw.baseAddress else {
+            return false
+        }
+        memcpy(out, source, count)
+        return true
+    }
+}
+
 private func secureZero(_ bytes: inout [UInt8]) {
     bytes.withUnsafeMutableBytes { raw in
         guard let base = raw.baseAddress, raw.count > 0 else { return }
@@ -469,7 +563,7 @@ private func validServiceName(service: String) -> Bool {
 /// Service names are case-insensitive (`"Com.Example.App"` and
 /// `"com.example.app"` resolve to the same KEK); the returned string is
 /// the one normalized form that `validServiceName` re-checks downstream,
-/// the keychain query/store calls use, and the HPKE `info` is built from. Returns `nil` when the name is invalid — the
+/// the keychain query/store calls use, and the HKDF `info` is built from. Returns `nil` when the name is invalid — the
 /// caller maps that to `invalidServiceIdentifier`.
 ///
 /// The terminator is looked for in at most 129 bytes (`strnlen`), as on
@@ -522,11 +616,55 @@ private func loadKEKDataRepresentation(service: String, mode: KeychainMode) -> K
     }
 }
 
+/// What a stored KEK blob turned out to be.
+enum KEKReconstruction {
+    case key(SecureEnclave.P256.KeyAgreement.PrivateKey)
+    /// Not a usable key for this device, though the enclave works:
+    /// `HKDFGuardStatus.kekCorrupted`.
+    case corrupt
+    /// The enclave would not load even a key made just now under the same
+    /// policy, so this blob's failure says nothing about the blob: reported
+    /// as `HKDFGuardStatus.keychainAccessDenied` (a KEK very likely exists).
+    case enclaveRefused
+}
+
 /// Reconstructs a Secure Enclave key from a keychain item's stored data.
-/// `nil` means the item is present but is not (or is no longer) a usable
-/// key for this device — `HKDFGuardStatus.kekCorrupted`.
-private func reconstructKEK(_ data: Data) -> SecureEnclave.P256.KeyAgreement.PrivateKey? {
-    try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data)
+///
+/// A blob can fail to load for two very different reasons: it is not (or
+/// no longer) a key for this device, or this session's keybag is locked --
+/// an SSH login after `security unlock-keychain`, say, where the keychain
+/// hands the item over but the enclave refuses keys bound to "when
+/// unlocked". Reporting the second as corrupt would point an operator at
+/// deleting a healthy KEK, and every DEK under it with it. So on failure
+/// the enclave is probed, and only a failure the probe survives is corrupt.
+func reconstructKEK(
+    _ data: Data,
+    enclaveIsUsable: () -> Bool = secureEnclaveIsUsableNow
+) -> KEKReconstruction {
+    if let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data) {
+        return .key(key)
+    }
+    return enclaveIsUsable() ? .corrupt : .enclaveRefused
+}
+
+/// Whether the Secure Enclave and this user's keybag can use keys in this
+/// session: a throwaway key is created under the KEK's own access policy,
+/// reconstructed from its data representation exactly as a stored KEK is,
+/// and used once. Nothing is stored. Only run when a stored blob has
+/// already failed to load, so a healthy KEK never pays for it.
+func secureEnclaveIsUsableNow() -> Bool {
+    guard SecureEnclave.isAvailable,
+          let access = makeAccessControl(),
+          let probe = try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access) else {
+        return false
+    }
+    var blob = probe.dataRepresentation
+    defer { secureZero(&blob) }
+    guard let reloaded = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) else {
+        return false
+    }
+    let peer = P256.KeyAgreement.PrivateKey().publicKey
+    return (try? reloaded.sharedSecretFromKeyAgreement(with: peer)) != nil
 }
 
 @discardableResult
@@ -560,11 +698,16 @@ func kekExists(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (
         return (HKDFGuardStatus.keychainAccessDenied.rawValue, false)
     case .failed:
         return (HKDFGuardStatus.keychainReadFailed.rawValue, false)
-    case .found(let existing):
-        guard reconstructKEK(existing) != nil else {
+    case .found(var existing):
+        defer { secureZero(&existing) } // the SEP-wrapped blob is the credential: don't leave this copy behind
+        switch reconstructKEK(existing) {
+        case .key:
+            return (HKDFGuardStatus.success.rawValue, true)
+        case .corrupt:
             return (HKDFGuardStatus.kekCorrupted.rawValue, false)
+        case .enclaveRefused:
+            return (HKDFGuardStatus.keychainAccessDenied.rawValue, false)
         }
-        return (HKDFGuardStatus.success.rawValue, true)
     }
 }
 
@@ -589,13 +732,18 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
     // process simply can't see, and generating a replacement on top of it
     // would orphan whatever that key protects.
     switch loadKEKDataRepresentation(service: service, mode: mode) {
-    case .found(let existing):
-        guard reconstructKEK(existing) != nil else {
-            // Item exists but cannot be reconstructed.
-            // Do NOT generate a replacement key.
+    case .found(var existing):
+        defer { secureZero(&existing) } // the SEP-wrapped blob is the credential: don't leave this copy behind
+        // An item that can't be reconstructed is never replaced, whichever
+        // the reason.
+        switch reconstructKEK(existing) {
+        case .key:
+            return HKDFGuardStatus.success.rawValue
+        case .corrupt:
             return HKDFGuardStatus.kekCorrupted.rawValue
+        case .enclaveRefused:
+            return HKDFGuardStatus.keychainAccessDenied.rawValue
         }
-        return HKDFGuardStatus.success.rawValue
     case .accessDenied:
         return HKDFGuardStatus.keychainAccessDenied.rawValue
     case .failed:
@@ -640,12 +788,20 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
 
         // Verify store/reload/reconstruct succeeds.
         switch loadKEKDataRepresentation(service: service, mode: mode) {
-        case .found(let stored) where reconstructKEK(stored) != nil:
-            auditKekCreated(service: service, mode: mode)
-            return HKDFGuardStatus.success.rawValue
+        case .found(var stored):
+            defer { secureZero(&stored) }
+            switch reconstructKEK(stored) {
+            case .key:
+                auditKekCreated(service: service, mode: mode)
+                return HKDFGuardStatus.success.rawValue
+            case .corrupt:
+                return HKDFGuardStatus.kekVerificationFailed.rawValue
+            case .enclaveRefused:
+                return HKDFGuardStatus.keychainAccessDenied.rawValue
+            }
         case .accessDenied:
             return HKDFGuardStatus.keychainAccessDenied.rawValue
-        case .found, .notFound, .failed:
+        case .notFound, .failed:
             return HKDFGuardStatus.kekVerificationFailed.rawValue
         }
 
@@ -656,11 +812,16 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
         // process, its item's ACL may deny this one — that is
         // keychainAccessDenied, not a corrupt item.
         switch loadKEKDataRepresentation(service: service, mode: mode) {
-        case .found(let existing):
-            guard reconstructKEK(existing) != nil else {
+        case .found(var existing):
+            defer { secureZero(&existing) }
+            switch reconstructKEK(existing) {
+            case .key:
+                return HKDFGuardStatus.success.rawValue
+            case .corrupt:
                 return HKDFGuardStatus.kekCorrupted.rawValue
+            case .enclaveRefused:
+                return HKDFGuardStatus.keychainAccessDenied.rawValue
             }
-            return HKDFGuardStatus.success.rawValue
         case .accessDenied:
             return HKDFGuardStatus.keychainAccessDenied.rawValue
         case .notFound, .failed:
@@ -702,48 +863,57 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
         return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
     case .failed:
         return (HKDFGuardStatus.keychainReadFailed.rawValue, nil)
-    case .found(let existing):
-        guard let key = reconstructKEK(existing) else {
+    case .found(var existing):
+        defer { secureZero(&existing) } // best effort: `key` keeps CryptoKit's own copy
+        switch reconstructKEK(existing) {
+        case .key(let key):
+            return (HKDFGuardStatus.success.rawValue, key)
+        case .corrupt:
             return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+        case .enclaveRefused:
+            return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
         }
-        return (HKDFGuardStatus.success.rawValue, key)
     }
 }
 
 /// Computes the "fingerprint" embedded at the front of every wrapped
-/// payload: a SHA-256 hash of the KEK's public key raw representation.
+/// payload: a SHA-256 hash of the KEK's public key, uncompressed X9.63
+/// (0x04 || x || y) -- the encoding Linux and Windows hash.
 /// Not a secret value — the public key it hashes isn't secret either —
 /// so the explicit equality check against it in `hkdfguard_unwrap_dek`
 /// exists purely to fail fast, cheaply, on "this payload wasn't wrapped
 /// under the KEK I just resolved for this service" *before* spending any
-/// effort on ECDH/AES-GCM. It is also folded into the AES-GCM AAD (see
-/// `wrapDekCore`/`hkdfguard_unwrap_dek`) alongside `service`, so the tag
-/// itself authenticates it too.
-private func kekFingerprint(publicKeyRaw: Data) -> Data {
-    Data(SHA256.hash(data: publicKeyRaw))
+/// effort on ECDH/AES-GCM. It is also in the authenticated header (see
+/// `wrapDekCore`), so the derived key and the tag commit to it too.
+func kekFingerprint(_ publicKey: P256.KeyAgreement.PublicKey) -> Data {
+    Data(SHA256.hash(data: publicKey.x963Representation))
 }
 
 // MARK: - Wrap (seal) a DEK under the Secure Enclave KEK
 //
 // Wrapped format: [KEK fingerprint, 32-byte SHA-256 of the KEK's public key]
 //                  [suite id, 1 byte: 0x01]
-//                  [HPKE encapsulated key, 65 bytes: X9.63 P-256 point]
+//                  [salt, 32 random bytes]
+//                  [nonce, 12 random bytes]
 //                  [AES-256-GCM ciphertext || 16-byte tag, 48 bytes]
 //
-// Sealing is HPKE (RFC 9180) in base mode, one message per context: CryptoKit
-// generates the ephemeral key pair, runs the key schedule (DHKEM(P-256),
-// HKDF-SHA256) and the AEAD, and derives the nonce, so this file holds no
-// KDF or nonce handling of its own. `info` binds the scheme label and the
-// service; the payload header (fingerprint || suite id) is the AEAD's
-// additional authenticated data.
-// Base mode authenticates nothing about the sender: anyone holding the KEK's
-// public key can produce a valid payload (see "Sender authentication" in the
-// README for the Auth-mode design that would change that).
+// The Linux and Windows construction: the Secure Enclave computes
+// Z = ECDH(KEK_priv, H(salt)), where H hashes the salt to a P-256 point
+// (`payloadECDHPoint`); HKDF-SHA512 turns Z into the AES-256 key
+// (`deriveWrappingKey`); AES-256-GCM seals the DEK. Wrapping needs the
+// KEK's private key as much as unwrapping does, so only this host -- not
+// anyone who has seen the public key -- can create a payload.
+//
+// The header (fingerprint || suite id || salt || nonce: every byte before
+// the ciphertext) is bound twice, as on Linux: into the key, through HKDF's
+// `info` with the service name, and into the tag, as the AEAD's additional
+// authenticated data. Neither the fingerprint nor the suite byte can be
+// rewritten, and a payload sealed for one service cannot be opened under
+// another even when (by misuse) both resolve to the same KEK.
 //
 // The fingerprint identifies *which* KEK this payload was wrapped under —
 // checked against the current KEK's own public key by hkdfguard_unwrap_dek
-// before any key agreement is attempted (see `kekFingerprint`), and covered
-// by the AEAD tag too, so tampering with it fails both checks independently.
+// before any key agreement is attempted (see `kekFingerprint`).
 
 /// `@_cdecl` entry points below.
 private func wrapDekCore(
@@ -758,43 +928,52 @@ private func wrapDekCore(
         return getStatus
     }
 
-    let fingerprint = kekFingerprint(publicKeyRaw: enclaveKey.publicKey.rawRepresentation)
-
-    let encapsulated: Data
-    let ciphertext: Data
-    do {
-        var sender = try HPKE.Sender(
-            recipientKey: enclaveKey.publicKey,
-            ciphersuite: hkdfguardCiphersuite,
-            info: hpkeInfo(service: service)
-        )
-        ciphertext = try sender.seal(
-            UnsafeRawBufferPointer(start: dekPtr, count: Int(dekLen)),
-            authenticating: hpkeAAD(fingerprint: fingerprint)
-        )
-        encapsulated = sender.encapsulatedKey
-    } catch {
-        return HKDFGuardStatus.encryptionFailed.rawValue
+    guard let salt = randomBytes(hkdfguardSaltLength),
+          let nonceBytes = randomBytes(hkdfguardNonceLength),
+          let nonce = try? AES.GCM.Nonce(data: nonceBytes) else {
+        return HKDFGuardStatus.encryptionFailed.rawValue // the RNG failed
     }
 
-    guard encapsulated.count == hkdfguardEncapsulatedKeyLength,
-          ciphertext.count == hkdfguardCiphertextLength else {
+    var header = kekFingerprint(enclaveKey.publicKey)
+    header.append(hkdfguardSuiteId)
+    header.append(salt)
+    header.append(nonceBytes)
+    guard header.count == hkdfguardHeaderLength else {
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
 
-    var payload = Data(capacity: hkdfguardWrappedLength)
-    payload.append(fingerprint)
-    payload.append(hkdfguardSuiteId)
-    payload.append(encapsulated)
-    payload.append(ciphertext)
+    let sealed: AES.GCM.SealedBox
+    do {
+        guard let key = try deriveWrappingKey(enclaveKey: enclaveKey, service: service, header: header) else {
+            return HKDFGuardStatus.encryptionFailed.rawValue // no point for this salt (probability 2^-255)
+        }
+        // Sealed straight from the caller's buffer: no copy of the DEK is made.
+        sealed = try AES.GCM.seal(
+            UnsafeRawBufferPointer(start: dekPtr, count: Int(dekLen)),
+            using: key,
+            nonce: nonce,
+            authenticating: header
+        )
+    } catch {
+        return HKDFGuardStatus.encryptionFailed.rawValue // the enclave refused the key agreement, or sealing failed
+    }
+
+    guard sealed.ciphertext.count == hkdfguardDekLength,
+          sealed.tag.count == hkdfguardGCMTagLength else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
+    }
+
+    var payload = header
+    payload.append(sealed.ciphertext)
+    payload.append(sealed.tag)
     guard payload.count == hkdfguardWrappedLength else {
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
 
-    _ = payload.withUnsafeBytes { raw in
-        memcpy(outPtr, raw.baseAddress!, payload.count)
+    guard copyOut(payload, to: outPtr, count: hkdfguardWrappedLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
-    outLen.pointee = Int32(payload.count)
+    outLen.pointee = Int32(hkdfguardWrappedLength)
 
     return HKDFGuardStatus.success.rawValue
 }
@@ -886,7 +1065,7 @@ private let auditExecutable: String = {
     var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
     let length = proc_pidpath(getpid(), &buffer, UInt32(buffer.count))
     guard length > 0 else { return auditQuote(Array("(unknown)".utf8)) }
-    return auditQuote(buffer[0..<Int(length)].map { UInt8(bitPattern: $0) })
+    return auditQuote(buffer[0..<min(Int(length), buffer.count)].map { UInt8(bitPattern: $0) })
 }()
 
 /// A double-quoted field value, exactly as Linux quotes one: printable ASCII
@@ -933,7 +1112,7 @@ func auditKekCreated(service: String, mode: KeychainMode) {
 }
 
 /// A DEK was wrapped (`op` is wrap or generateAndWrap) or unwrapped
-/// (`unwrap`). `payload` is the 146-byte payload produced or consumed:
+/// (`unwrap`). `payload` is the 125-byte payload produced or consumed:
 /// public bytes, the first 32 of which are the KEK fingerprint.
 func auditDekOperation(_ op: AuditOp, service: String, payload: UnsafeBufferPointer<UInt8>) {
     let unwrap = op == .unwrap
@@ -1012,20 +1191,97 @@ struct SetupCallCounter {
 
 private let setupCalls = OSAllocatedUnfairLock(initialState: SetupCallCounter())
 
-/// Called on every setup call that names a valid service.
-func auditNoteSetupCall() {
+/// Called on every setup call that names a valid service, inside the
+/// setup gate (see `gatedSetup`).
+func auditNoteSetupCall(floor: Duration) {
     if setupCalls.withLock({ $0.record() }) {
-        auditSetupCallsExceeded()
+        auditSetupCallsExceeded(floorMs: floor.wholeMilliseconds)
     }
 }
 
-func auditSetupCallsExceeded() {
+func auditSetupCallsExceeded(floorMs: Int64) {
     let calls = auditSetupCallsWarnAt
     auditEmit(
         .warning, .setupCallsExceeded,
-        fields: "calls=\(calls)",
-        message: "more than \(calls) hkdfguard_create_kek / hkdfguard_kek_exists calls in this process; these are meant to run once per application startup -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
+        fields: "calls=\(calls) setup_min_delay_ms=\(floorMs)",
+        message: "more than \(calls) hkdfguard_create_kek / hkdfguard_kek_exists / hkdfguard_kek_fingerprint calls in this process; these are meant to run once per application startup, and each costs a Secure Enclave round trip plus at least \(floorMs) ms -- call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek"
     )
+}
+
+// MARK: - Setup gate
+
+/// The least wall-clock time each setup call (`hkdfguard_create_kek`,
+/// `hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`) takes, whatever its outcome -- the Linux and
+/// Windows default. Fixed on macOS: there is no policy file or
+/// administrator setting to tune it (Linux reads
+/// `startup_behavior.setup_min_delay_ms`, Windows
+/// `HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs`).
+///
+/// Setup calls are meant to run once per application startup. Holding
+/// each to a floor, serialized across threads, caps how fast a caller --
+/// a bug looping on them, or code probing which services have a KEK --
+/// can drive the Secure Enclave and keychain through them: at most one
+/// per second per process. And "exists" and "doesn't exist" take the same
+/// time.
+let setupMinDelay: Duration = .milliseconds(1_000)
+
+/// Test-only override of `setupMinDelay`: `nil` (the default, and always
+/// in production) uses `setupMinDelay`. The test suites that make setup
+/// calls set it to zero so their many calls don't each cost a second;
+/// the tests of the floor itself set it explicitly. Internal, so only
+/// `@testable import` can reach it -- never part of the C ABI.
+let setupMinDelayOverrideForTests = OSAllocatedUnfairLock<Duration?>(initialState: nil)
+
+func effectiveSetupMinDelay() -> Duration {
+    setupMinDelayOverrideForTests.withLock { $0 } ?? setupMinDelay
+}
+
+/// Serializes every setup call, so that together with the floor their
+/// aggregate rate is capped regardless of how many threads call in. A
+/// blocking lock rather than an unfair lock: it is held across a keychain
+/// round trip and a sleep.
+private let setupGate = NSLock()
+
+/// Runs `body` (the keychain-touching part of a setup call) under the
+/// setup gate: serialized against every other setup call, and not
+/// returning until at least `effectiveSetupMinDelay()` has passed since
+/// entry -- whatever `body` returned, and however quickly. Argument
+/// validation happens before callers reach this, so a NULL pointer or an
+/// invalid service name still fails immediately; only calls that would
+/// reach the keychain pay the floor. The counterpart of Linux's
+/// `gated_setup` and Windows' `GatedSetup`.
+/// `floor` is a parameter only so the tests of the gate itself can pass
+/// their own without racing other suites over the override.
+func gatedSetup<T>(floor: Duration? = nil, _ body: () -> T) -> T {
+    setupGate.lock()
+    defer { setupGate.unlock() }
+    let clock = ContinuousClock()
+    let entered = clock.now
+    let floor = floor ?? effectiveSetupMinDelay()
+    // Waited out on every exit path, after `body`'s result is in hand.
+    defer {
+        let remaining = floor - (clock.now - entered)
+        if remaining > .zero {
+            Thread.sleep(forTimeInterval: remaining.secondsAsDouble)
+        }
+    }
+
+    let result = body()
+    auditNoteSetupCall(floor: floor)
+    return result
+}
+
+extension Duration {
+    /// Whole milliseconds, truncated.
+    var wholeMilliseconds: Int64 {
+        let (s, attos) = components
+        return s * 1_000 + attos / 1_000_000_000_000_000
+    }
+
+    var secondsAsDouble: Double {
+        let (s, attos) = components
+        return Double(s) + Double(attos) / 1e18
+    }
 }
 
 /// The normalized service name a C caller passed, or nil when it isn't a
@@ -1203,7 +1459,8 @@ public func hkdfguard_keychain_mode(
 /// without creating one — `*outExists` is always written, on every return
 /// path (1 if a valid KEK exists, 0 otherwise, including when the status
 /// isn't `success`, in which case existence couldn't be determined), so
-/// the caller's variable is never left in an undefined state.
+/// the caller's variable is never left in an undefined state. A setup
+/// call: held to `setupMinDelay` and serialized (see `gatedSetup`).
 @_cdecl("hkdfguard_kek_exists")
 public func hkdfguard_kek_exists(
     servicePtr: UnsafePointer<CChar>?,
@@ -1220,8 +1477,7 @@ public func hkdfguard_kek_exists(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    auditNoteSetupCall()
-    let (status, exists) = kekExists(service: service)
+    let (status, exists) = gatedSetup { kekExists(service: service) }
     outExists.pointee = exists ? 1 : 0
     if status != HKDFGuardStatus.success.rawValue {
         auditOperationFailed(.kekExists, service: service, code: status)
@@ -1233,7 +1489,11 @@ public func hkdfguard_kek_exists(
 /// `service` currently resolves to -- the same value embedded at the front
 /// of every payload wrapped under it. Public-key material only, so safe to
 /// expose; lets an operator pin which KEK a service uses and confirm it
-/// before retiring it. Never creates a KEK.
+/// before retiring it. Never creates a KEK. A setup call: held to
+/// `setupMinDelay` and serialized (see `gatedSetup`) like
+/// `hkdfguard_kek_exists`, since "found" vs `kekNotFound` answers the same
+/// question -- which services have a KEK -- and would otherwise let it be
+/// asked as fast as the keychain answers.
 @_cdecl("hkdfguard_kek_fingerprint")
 public func hkdfguard_kek_fingerprint(
     servicePtr: UnsafePointer<CChar>?,
@@ -1251,17 +1511,21 @@ public func hkdfguard_kek_fingerprint(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    let (status, maybeKey) = getKEK(service: service)
-    guard let key = maybeKey else {
+    // The key itself stays inside the gate; only its public fingerprint
+    // leaves it.
+    let (status, maybeFingerprint) = gatedSetup { () -> (Int32, Data?) in
+        let (status, maybeKey) = getKEK(service: service)
+        return (status, maybeKey.map { kekFingerprint($0.publicKey) })
+    }
+    guard let fingerprint = maybeFingerprint else {
         auditOperationFailed(.kekFingerprint, service: service, code: status)
         return status
     }
 
-    let fingerprint = kekFingerprint(publicKeyRaw: key.publicKey.rawRepresentation)
-    _ = fingerprint.withUnsafeBytes { raw in
-        memcpy(outPtr, raw.baseAddress!, fingerprint.count)
+    guard copyOut(fingerprint, to: outPtr, count: hkdfguardFingerprintLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
-    outLen.pointee = Int32(fingerprint.count)
+    outLen.pointee = Int32(hkdfguardFingerprintLength)
     return HKDFGuardStatus.success.rawValue
 }
 
@@ -1269,7 +1533,8 @@ public func hkdfguard_kek_fingerprint(
 /// exist. Paired with `hkdfguard_kek_exists` above so a caller can decide
 /// for itself whether creation is needed — e.g. prompting for user
 /// consent, or provisioning on a schedule — rather than have that decision
-/// made implicitly inside a single combined "ensure" call.
+/// made implicitly inside a single combined "ensure" call. A setup call:
+/// held to `setupMinDelay` and serialized (see `gatedSetup`).
 @_cdecl("hkdfguard_create_kek")
 public func hkdfguard_create_kek(
     servicePtr: UnsafePointer<CChar>?
@@ -1278,8 +1543,7 @@ public func hkdfguard_create_kek(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    auditNoteSetupCall()
-    let status = createKEK(service: service)
+    let status = gatedSetup { createKEK(service: service) }
     if status != HKDFGuardStatus.success.rawValue {
         auditOperationFailed(.createKek, service: service, code: status)
     }
@@ -1301,7 +1565,7 @@ public func hkdfguard_wrap_dek(
 
 /// The payload a successful wrap wrote to `out`, for its audit record.
 private func writtenPayload(_ status: Int32, _ outPtr: UnsafeMutablePointer<UInt8>?, _ outLen: UnsafeMutablePointer<Int32>?) -> UnsafeBufferPointer<UInt8>? {
-    guard status == HKDFGuardStatus.success.rawValue, let outPtr, let outLen else { return nil }
+    guard status == HKDFGuardStatus.success.rawValue, let outPtr, let outLen, outLen.pointee >= 0 else { return nil }
     return UnsafeBufferPointer(start: outPtr, count: Int(outLen.pointee))
 }
 
@@ -1315,8 +1579,8 @@ private func writtenPayload(_ status: Int32, _ outPtr: UnsafeMutablePointer<UInt
 /// - An invalid service: -8.
 /// - NULL `out` with a positive capacity (somewhere declared, nowhere to
 ///   write): -1.
-/// - A capacity under 146 -- including the 0 of a size probe, which may pass
-///   a NULL `out`: -2 with `*out_len` = 146. The payload size is a constant,
+/// - A capacity under 125 -- including the 0 of a size probe, which may pass
+///   a NULL `out`: -2 with `*out_len` = 125. The payload size is a constant,
 ///   so no ciphertext is ever produced for a caller who can't receive it.
 private func wrapDekChecked(
     servicePtr: UnsafePointer<CChar>?,
@@ -1350,8 +1614,9 @@ private func wrapDekChecked(
 
 private func generateRandomDek() -> Data? {
     var bytes = Data(count: hkdfguardDekLength)
-    let status = bytes.withUnsafeMutableBytes { raw in
-        SecRandomCopyBytes(kSecRandomDefault, hkdfguardDekLength, raw.baseAddress!)
+    let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
+        guard raw.count == hkdfguardDekLength, let base = raw.baseAddress else { return errSecParam }
+        return SecRandomCopyBytes(kSecRandomDefault, hkdfguardDekLength, base)
     }
     guard status == errSecSuccess else { return nil }
     return bytes
@@ -1382,10 +1647,13 @@ private func generateAndWrapCore(
     defer { secureZero(&dek) }
 
     return dek.withUnsafeBytes { raw -> Int32 in
-        wrapDekChecked(
+        guard let dekPtr = raw.bindMemory(to: UInt8.self).baseAddress, raw.count == hkdfguardDekLength else {
+            return HKDFGuardStatus.unexpectedOutputLength.rawValue
+        }
+        return wrapDekChecked(
             servicePtr: servicePtr,
-            dekPtr: raw.bindMemory(to: UInt8.self).baseAddress!,
-            dekLen: Int32(dek.count),
+            dekPtr: dekPtr,
+            dekLen: Int32(hkdfguardDekLength),
             outPtr: outPtr,
             outLen: outLen
         )
@@ -1469,10 +1737,12 @@ private func unwrapDekCore(
         return HKDFGuardStatus.payloadMalformed.rawValue
     }
 
-    let storedFingerprint = Data(bytes: wrappedPtr, count: hkdfguardFingerprintLength)
+    let header = Data(bytes: wrappedPtr, count: hkdfguardHeaderLength)
+    let storedFingerprint = header.prefix(hkdfguardFingerprintLength)
     let suiteId = wrappedPtr[hkdfguardSuiteIdOffset]
-    let encapsulated = Data(bytes: wrappedPtr + hkdfguardEncapsulatedKeyOffset, count: hkdfguardEncapsulatedKeyLength)
-    let ciphertext = Data(bytes: wrappedPtr + hkdfguardCiphertextOffset, count: hkdfguardCiphertextLength)
+    let nonceBytes = Data(bytes: wrappedPtr + hkdfguardNonceOffset, count: hkdfguardNonceLength)
+    let ciphertext = Data(bytes: wrappedPtr + hkdfguardCiphertextOffset, count: hkdfguardDekLength)
+    let tag = Data(bytes: wrappedPtr + hkdfguardCiphertextOffset + hkdfguardDekLength, count: hkdfguardGCMTagLength)
 
     // A payload of a suite this build does not implement is reported as
     // such, before the keychain is consulted: it is a version or build
@@ -1494,24 +1764,35 @@ private func unwrapDekCore(
         // is a fast, specific "wrong/stale KEK" signal that fails ahead of
         // the AEAD tag check below, which also covers this same fingerprint
         // (it is in the AAD) and would catch a tampered one anyway.
-        let currentFingerprint = kekFingerprint(publicKeyRaw: enclaveKey.publicKey.rawRepresentation)
+        let currentFingerprint = kekFingerprint(enclaveKey.publicKey)
         guard currentFingerprint == storedFingerprint else {
             return HKDFGuardStatus.fingerprintMismatch.rawValue
         }
 
-        // HPKE base mode: the Secure Enclave performs its half of the key
-        // agreement inside Recipient.init; the key schedule and AEAD open
-        // follow. Any failure -- an encapsulated key that is not a point on
-        // the curve, a locked enclave, a tag that does not verify -- is one
-        // outcome: the payload cannot be opened under this KEK.
+        // The fixed-length fields always form a box; failing that is a bug.
+        guard let nonce = try? AES.GCM.Nonce(data: nonceBytes),
+              let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag) else {
+            return HKDFGuardStatus.unexpectedOutputLength.rawValue
+        }
+
+        // Re-derive the payload's key -- the Secure Enclave's ECDH against
+        // the point its salt hashes to, then HKDF over the same header and
+        // service -- and open. The two failures are kept apart, as on Linux:
+        // the enclave refusing the key agreement (locked, unavailable) is a
+        // CRYPTO_ERROR about this machine, not a verdict on the payload;
+        // only a tag that doesn't verify is PAYLOAD_AUTH_FAILED (tampered,
+        // or sealed for a different service).
+        let key: SymmetricKey
         do {
-            var recipient = try HPKE.Recipient(
-                privateKey: enclaveKey,
-                ciphersuite: hkdfguardCiphersuite,
-                info: hpkeInfo(service: service),
-                encapsulatedKey: encapsulated
-            )
-            plaintext = try recipient.open(ciphertext, authenticating: hpkeAAD(fingerprint: currentFingerprint))
+            guard let derived = try deriveWrappingKey(enclaveKey: enclaveKey, service: service, header: header) else {
+                return HKDFGuardStatus.encryptionFailed.rawValue // no point for this salt (probability 2^-255)
+            }
+            key = derived
+        } catch {
+            return HKDFGuardStatus.encryptionFailed.rawValue
+        }
+        do {
+            plaintext = try AES.GCM.open(box, using: key, authenticating: header)
         } catch {
             return HKDFGuardStatus.decryptionFailed.rawValue
         }
@@ -1528,10 +1809,10 @@ private func unwrapDekCore(
         return HKDFGuardStatus.outputBufferTooSmall.rawValue
     }
 
-    _ = plaintext.withUnsafeBytes { raw in
-        memcpy(outPtr, raw.baseAddress!, plaintext.count)
+    guard copyOut(plaintext, to: outPtr, count: hkdfguardDekLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
-    outLen.pointee = Int32(plaintext.count)
+    outLen.pointee = Int32(hkdfguardDekLength)
 
     return HKDFGuardStatus.success.rawValue
 }
@@ -1545,13 +1826,173 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
         return .fileNotFound
     case EACCES, EPERM:
         return .fileAccessDenied
+    case ELOOP:
+        // O_NOFOLLOW found a symbolic link as the final component (or the
+        // path loops through links): a link is refused as untrusted, as the
+        // Windows build refuses any reparse point -- not as an I/O failure.
+        return .fileInsecure
     default:
-        // Including ELOOP (O_NOFOLLOW found a symbolic link as the final
-        // component, or the path loops) and EOPNOTSUPP (the path names a
-        // socket): HKDFGUARD_ERR_FILE_IO covers "not a regular file" and
-        // "could not be read" alike.
+        // Including EOPNOTSUPP (the path names a socket): HKDFGUARD_ERR_FILE_IO
+        // covers "not a regular file" and "could not be read" alike.
         return .fileIO
     }
+}
+
+/// Whether the key file's folder, open as `folderFd`, and every folder above
+/// it up to `/` are ones nobody untrusted can rename, replace or
+/// delete entries in: a directory owned by root or this process's
+/// effective user, and not writable by group or others unless sticky
+/// (`/tmp`-style: the kernel then lets only an entry's owner, or the
+/// folder's, rename or remove it, and the file's own owner has just been
+/// checked). Write bits are ignored on a read-only volume. Linux's
+/// `check_dir_chain_for_existing_file`, with the same rules.
+///
+/// The folder is the one the path names the file in, opened by
+/// `readWrappedFile` before the file, which is then opened *within* it
+/// (`openat`): so the file read is that folder's entry, whatever other
+/// names (hard links) it has elsewhere, and the folder checked is where it
+/// was found -- Linux's "folder the path names it in". (Working back from
+/// the open file instead, with F_GETPATH, fails for a hard-linked file:
+/// macOS reports whichever of its names was looked up last.) As on Linux,
+/// folders that symlinks inside the path live in are not walked: someone
+/// able to retarget one could at most send the path to a different file
+/// that itself passes every check here.
+///
+/// A folder writable by the `admin` group (`/Applications`, say) fails,
+/// as a group-writable folder does on Linux: every administrator could
+/// replace the key there without root.
+func keyFileFoldersAreTrusted(folderFd: Int32) -> Bool {
+    // Walked by descriptor, from the key file's own folder up through
+    // openat(fd, "..") until a folder is its own parent (/): no path string
+    // is decoded, split or looked up again, so neither an odd folder name
+    // (one starting with a combining mark fuses with the "/" before it in a
+    // Swift String, and its parent would be skipped) nor a folder renamed
+    // mid-walk can make a folder be skipped or judged in its stead.
+    var current = dup(folderFd)
+    guard current >= 0 else {
+        return false
+    }
+    defer { close(current) }
+
+    let uid = geteuid()
+    for _ in 0..<Int(MAXPATHLEN) { // a path has at most this many folders
+        var info = stat()
+        guard fstat(current, &info) == 0,
+              info.st_mode & S_IFMT == S_IFDIR,
+              info.st_uid == 0 || info.st_uid == uid,
+              !onVolumeIgnoringOwnership(current),
+              !aclGrantsOthersAChange(fd: current, isFolder: true) else {
+            return false
+        }
+        let writable = info.st_mode & (S_IWGRP | S_IWOTH) != 0
+        let sticky = info.st_mode & S_ISVTX != 0
+        if writable && !sticky && !onSealedSystemVolume(current) {
+            return false
+        }
+
+        let parent = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard parent >= 0 else {
+            return false
+        }
+        var parentInfo = stat()
+        guard fstat(parent, &parentInfo) == 0 else {
+            close(parent)
+            return false
+        }
+        if parentInfo.st_dev == info.st_dev && parentInfo.st_ino == info.st_ino {
+            close(parent) // "/" is its own parent: the whole chain passed
+            return true
+        }
+        close(current)
+        current = parent
+    }
+    return false
+}
+
+/// Whether `fd` is on a volume mounted with ownership ignored (the default
+/// for disk images and removable media a user mounts). There the kernel
+/// reports every file and folder as owned by whoever asks, so the owner
+/// checks above would pass for anything on it, whoever wrote it.
+private func onVolumeIgnoringOwnership(_ fd: Int32) -> Bool {
+    var fs = statfs()
+    guard fstatfs(fd, &fs) == 0 else {
+        return true // can't tell: treat as untrusted
+    }
+    return fs.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) != 0
+}
+
+/// Whether `fd` is on the sealed, read-only system volume, the one place
+/// write bits on a folder can be ignored: nothing on it can change. Any
+/// other read-only volume -- a disk image someone built and mounted, say --
+/// gets no exemption, since whoever built it chose its contents.
+private func onSealedSystemVolume(_ fd: Int32) -> Bool {
+    var fs = statfs()
+    guard fstatfs(fd, &fs) == 0 else {
+        return false
+    }
+    let required = UInt32(MNT_RDONLY) | UInt32(MNT_ROOTFS)
+    return fs.f_flags & required == required
+}
+
+/// Whether the access control list on `fd` grants anyone other than root or
+/// this user a right that could change what the key path reads. Mode bits
+/// alone miss this: on macOS an ACL can grant write to anyone regardless of
+/// a 0600 or 0755 mode.
+///
+/// For a file: writing or appending its data, deleting it, or changing its
+/// permissions, owner, ACL or attributes. For a folder: adding, removing or
+/// renaming entries (add_file, add_subdirectory, delete_child), and changing
+/// its permissions, owner or ACL. Deny entries only take rights away, so
+/// only allow entries count -- the standard "everyone deny delete" on home
+/// folders passes. Entries for root or this user are harmless. An ACL that
+/// can't be read, or an entry whose principal can't be resolved, counts as
+/// granting (fail closed).
+private func aclGrantsOthersAChange(fd: Int32, isFolder: Bool) -> Bool {
+    guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+        return errno != ENOENT // no ACL at all; any other failure fails closed
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+
+    let risky: [acl_perm_t] = isFolder
+        ? [ACL_ADD_FILE, ACL_ADD_SUBDIRECTORY, ACL_DELETE_CHILD, ACL_DELETE,
+           ACL_WRITE_SECURITY, ACL_CHANGE_OWNER]
+        : [ACL_WRITE_DATA, ACL_APPEND_DATA, ACL_DELETE, ACL_WRITE_ATTRIBUTES,
+           ACL_WRITE_EXTATTRIBUTES, ACL_WRITE_SECURITY, ACL_CHANGE_OWNER]
+    let uid = geteuid()
+
+    var entry: acl_entry_t?
+    var which = ACL_FIRST_ENTRY.rawValue
+    while acl_get_entry(acl, Int32(which), &entry) == 0, let current = entry {
+        which = ACL_NEXT_ENTRY.rawValue
+        var tag = ACL_UNDEFINED_TAG
+        guard acl_get_tag_type(current, &tag) == 0 else {
+            return true
+        }
+        guard tag == ACL_EXTENDED_ALLOW else {
+            continue // deny entries can only take rights away
+        }
+        var permset: acl_permset_t?
+        guard acl_get_permset(current, &permset) == 0, let perms = permset else {
+            return true
+        }
+        guard risky.contains(where: { acl_get_perm_np(perms, $0) == 1 }) else {
+            continue // grants only reading or listing
+        }
+        // Who is granted it: harmless if root or this user, else refuse.
+        guard let qualifier = acl_get_qualifier(current) else {
+            return true
+        }
+        defer { acl_free(qualifier) }
+        var id: id_t = 0
+        var type: Int32 = 0
+        let resolved = qualifier.withMemoryRebound(to: UInt8.self, capacity: 16) {
+            mbr_uuid_to_id($0, &id, &type) == 0
+        }
+        guard resolved, type == ID_TYPE_UID, id == 0 || id == uid else {
+            return true
+        }
+    }
+    return false
 }
 
 /// Reads at most `buffer.count` bytes of the regular file at `path` into
@@ -1561,16 +2002,43 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
 /// DEK.
 private func readWrappedFile(
     path: UnsafePointer<CChar>,
+    length: Int, // the path's length, already bounded by openFileCore
     into buffer: inout [UInt8]
 ) -> (status: HKDFGuardStatus, count: Int) {
-    // O_NOFOLLOW: a symlink as the final component is refused, not followed
-    // (symlinks in directory components still resolve, so /etc and /tmp --
-    // themselves symlinks into /private -- work). O_NONBLOCK: a FIFO with
-    // no writer would otherwise block here; it has no effect on the regular
-    // files actually accepted. O_CLOEXEC: never inherited by a child.
+    // The path is split, as bytes, into the folder it names and its last
+    // component. The folder is opened first and the file then opened within
+    // it (openat), so the file read is exactly that folder's entry and the
+    // folder is the one checked below -- never inferred back from the file,
+    // which a hard link makes ambiguous (see keyFileFoldersAreTrusted).
+    var lastSlash = -1
+    for i in 0..<length where path[i] == 0x2F { // '/'
+        lastSlash = i
+    }
+    guard lastSlash + 1 < length else {
+        return (.fileIO, 0) // ends in '/': names a folder, not a file
+    }
+    let folderPath: [CChar] = lastSlash < 0
+        ? [0x2E, 0] // "." -- a bare file name is in the current folder
+        : lastSlash == 0 ? [0x2F, 0] : Array(UnsafeBufferPointer(start: path, count: lastSlash)) + [0]
+
+    // Symlinks in the folder part resolve as usual, so /etc and /tmp --
+    // themselves symlinks into /private -- work.
+    var folderFd: Int32
+    repeat {
+        folderFd = open(folderPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    } while folderFd < 0 && errno == EINTR
+    guard folderFd >= 0 else {
+        return (fileOpenStatus(errno: errno), 0)
+    }
+    defer { close(folderFd) }
+
+    // O_NOFOLLOW: a symlink as the final component is refused, not followed.
+    // O_NONBLOCK: a FIFO with no writer would otherwise block here; it has
+    // no effect on the regular files actually accepted. O_CLOEXEC: never
+    // inherited by a child.
     var fd: Int32
     repeat {
-        fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        fd = openat(folderFd, path + lastSlash + 1, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     } while fd < 0 && errno == EINTR
     guard fd >= 0 else {
         return (fileOpenStatus(errno: errno), 0)
@@ -1586,16 +2054,36 @@ private func readWrappedFile(
     guard info.st_mode & S_IFMT == S_IFREG else {
         return (.fileIO, 0)
     }
-    // Same rules the CLI's `wrap` writes to (0600, one link) and the
-    // install scripts apply to the library itself: nobody but the owner can
-    // have put these bytes here, and the owner is either this user or root
-    // (an admin- or MDM-deployed file; root can alter anything anyway). A
-    // file linked in from elsewhere (st_nlink > 1) could be an older payload
-    // replayed.
+    // Same rules the CLI's `wrap` writes to (0600) and the install scripts
+    // apply to the library itself: nobody but the owner can have put these
+    // bytes here, and the owner is either this user or root (an admin- or
+    // MDM-deployed file; root can alter anything anyway).
+    //
+    // A file with more than one hard link is accepted, as on Linux and
+    // Windows. Another name for the file only matters if someone could use
+    // it to put an older payload where the service looks -- and that takes
+    // creating an entry in the key's own folder: the folder the file was
+    // just opened within, which `keyFileFoldersAreTrusted` below limits to
+    // the owner and root.
     guard info.st_uid == geteuid() || info.st_uid == 0,
           info.st_mode & (S_IWGRP | S_IWOTH) == 0,
-          info.st_nlink == 1 else {
+          // On a volume ignoring ownership, st_uid above is whoever asked.
+          !onVolumeIgnoringOwnership(fd),
+          // Nor may an ACL let anyone else rewrite, replace or re-permission it.
+          !aclGrantsOthersAChange(fd: fd, isFolder: false) else {
         return (.fileInsecure, 0)
+    }
+    // And the folders that decide what the path names, as on Linux --
+    // otherwise someone else could rename a file of their choosing over the
+    // key, and the checks above would pass on whatever they put there.
+    guard keyFileFoldersAreTrusted(folderFd: folderFd) else {
+        return (.fileInsecure, 0)
+    }
+    // Exactly a DEK's size: a plaintext key, refused from its size alone,
+    // never read into this process -- as on Linux (key_file.rs). A 32-byte
+    // file rewritten mid-call is still caught on its contents below.
+    guard info.st_size != off_t(hkdfguardDekLength) else {
+        return (.fileUnprotectedKey, 0)
     }
     guard info.st_size <= off_t(hkdfguardWrappedLength) else {
         return (.fileTooLong, 0)
@@ -1605,8 +2093,11 @@ private func readWrappedFile(
     // may change between the two, and the bytes actually read decide.
     var count = 0
     let status: HKDFGuardStatus = buffer.withUnsafeMutableBytes { raw in
+        guard let base = raw.baseAddress else {
+            return .unexpectedOutputLength
+        }
         while count < raw.count {
-            let n = read(fd, raw.baseAddress! + count, raw.count - count)
+            let n = read(fd, base + count, raw.count - count)
             let readErrno = errno // captured before anything else can run
             if n > 0 {
                 count += n
@@ -1621,52 +2112,127 @@ private func readWrappedFile(
     return (status, status == .success ? count : 0)
 }
 
+/// Longest text form of a DEK recognised, surrounding whitespace included --
+/// the Linux and Windows limit. Every length up to it is below a payload's,
+/// so no payload can be mistaken for a plaintext key.
+private let hkdfguardMaxPlaintextTextLength = 96
+
+// Branch-free byte classification for `looksLikePlaintextDek`. Every helper
+// returns 0 or 1 and is straight-line arithmetic on UInt32 (`&-`, `&+`:
+// wrapping, never trapping), with no data-dependent branch or table lookup.
+// The Linux build's `ct` module, step for step.
+
+/// 1 if a == b, else 0 (inputs below 2^31).
+@inline(__always) private func ctEq(_ a: UInt32, _ b: UInt32) -> UInt32 {
+    ((a ^ b) &- 1) >> 31
+}
+
+/// 1 if lo <= c <= hi, else 0 (inputs below 2^31): both differences wrap
+/// negative exactly when c is inside.
+@inline(__always) private func ctInRange(_ c: UInt32, _ lo: UInt32, _ hi: UInt32) -> UInt32 {
+    (((lo &- 1) &- c) & (c &- (hi &+ 1))) >> 31 & 1
+}
+
+/// a if cond is 1, b if it is 0.
+@inline(__always) private func ctSelect(_ cond: UInt32, _ a: UInt32, _ b: UInt32) -> UInt32 {
+    b ^ ((a ^ b) & (0 &- cond))
+}
+
+/// What Rust's trim_ascii removes: space, tab, LF, form feed, CR.
+@inline(__always) private func ctIsWhitespace(_ c: UInt32) -> UInt32 {
+    ctEq(c, 0x20) | ctEq(c, 0x09) | ctEq(c, 0x0A) | ctEq(c, 0x0C) | ctEq(c, 0x0D)
+}
+
+@inline(__always) private func ctIsHex(_ c: UInt32) -> UInt32 {
+    ctInRange(c, 0x30, 0x39) | ctInRange(c, 0x61, 0x66) | ctInRange(c, 0x41, 0x46) // 0-9 a-f A-F
+}
+
+/// (member, 6-bit value) of `c` in the base64 alphabet whose 62nd and 63rd
+/// characters are `c62` and `c63`.
+@inline(__always) private func ctBase64(_ c: UInt32, _ c62: UInt32, _ c63: UInt32) -> (member: UInt32, value: UInt32) {
+    let upper = ctInRange(c, 0x41, 0x5A) // A-Z
+    let lower = ctInRange(c, 0x61, 0x7A) // a-z
+    let digit = ctInRange(c, 0x30, 0x39) // 0-9
+    let s62 = ctEq(c, c62)
+    let s63 = ctEq(c, c63)
+    let value = ((c &- 0x41) & (0 &- upper)) | ((c &- (0x61 - 26)) & (0 &- lower))
+        | ((c &+ (52 - 0x30)) & (0 &- digit)) | (62 & (0 &- s62)) | (63 & (0 &- s63))
+    return (upper | lower | digit | s62 | s63, value)
+}
+
 /// True when `bytes` look like a bare 32-byte DEK rather than a wrapped
-/// payload: exactly 32 raw bytes, or — ignoring surrounding ASCII
-/// whitespace, as the CLI's `--dek-file` accepts — the 44-character padded
-/// or 43-character unpadded base64 (standard or URL alphabet), or the
-/// 64-character hex, encoding of 32 bytes. Checked on length and alphabet
-/// only, so nothing is decoded and no further copy of a key is made.
-private func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool {
+/// payload: exactly 32 raw bytes, or -- with any surrounding whitespace an
+/// editor or `echo` adds -- the 64-digit hex (either case) or base64
+/// (standard or URL-safe, with or without its one `=` of padding) of 32
+/// bytes. The same set the Linux and Windows builds recognise: base64 is
+/// 43 characters, or 44 ending in `=`, all in one alphabet, whose last
+/// character's 2 unused bits are zero.
+///
+/// Constant-time in the contents, as on Linux and Windows: the only
+/// branches are on the length, which the file's size already gives away.
+/// Every byte is visited twice (once to find the text between the
+/// surrounding whitespace, once to test it against all three alphabets at
+/// once) and every decision is mask arithmetic, so how long this takes says
+/// nothing about where in a would-be key the first non-matching byte sits.
+/// Nothing is decoded, so the key is never reassembled.
+func looksLikePlaintextDek(_ bytes: ArraySlice<UInt8>) -> Bool { // internal: tested directly
     if bytes.count == hkdfguardDekLength {
         return true
     }
-
-    func isWhitespace(_ byte: UInt8) -> Bool {
-        byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
-    }
-    func isHex(_ byte: UInt8) -> Bool {
-        (0x30...0x39).contains(byte) || (0x41...0x46).contains(byte) || (0x61...0x66).contains(byte)
-    }
-    func isBase64(_ byte: UInt8) -> Bool {
-        (0x30...0x39).contains(byte) || (0x41...0x5A).contains(byte) || (0x61...0x7A).contains(byte)
-            || byte == 0x2B || byte == 0x2F || byte == 0x2D || byte == 0x5F // + / - _
-    }
-
-    guard let first = bytes.firstIndex(where: { !isWhitespace($0) }),
-          let last = bytes.lastIndex(where: { !isWhitespace($0) }) else {
+    if bytes.count > hkdfguardMaxPlaintextTextLength {
         return false
     }
-    let text = bytes[first...last]
+    let base = bytes.startIndex
 
-    switch text.count {
-    case hkdfguardDekLength * 2:
-        return text.allSatisfy(isHex)
-    case 44:
-        return text.last == 0x3D && text.dropLast().allSatisfy(isBase64) // trailing '='
-    case 43:
-        return text.allSatisfy(isBase64)
-    default:
-        return false
+    // Pass 1: the first and last non-whitespace positions.
+    var seen: UInt32 = 0, start: UInt32 = 0, end: UInt32 = 0
+    for offset in 0..<bytes.count {
+        let i = UInt32(offset)
+        let text = ctIsWhitespace(UInt32(bytes[base + offset])) ^ 1
+        start = ctSelect(text & (seen ^ 1), i, start)
+        end = ctSelect(text, i, end)
+        seen |= text
     }
+    let textLength = ((end &- start) &+ 1) & (0 &- seen)
+
+    // Pass 2: every byte between them against every alphabet, plus the
+    // values of the last two (the last may be the `=` of padding).
+    var hexOK: UInt32 = 1, stdOK: UInt32 = 1, urlOK: UInt32 = 1, padded: UInt32 = 0
+    var stdLast: UInt32 = 0, stdPrev: UInt32 = 0, urlLast: UInt32 = 0, urlPrev: UInt32 = 0
+    for offset in 0..<bytes.count {
+        let i = UInt32(offset)
+        let c = UInt32(bytes[base + offset])
+        let outside = (ctInRange(i, start, end) & seen) ^ 1
+        let isEnd = ctEq(i, end)
+        let isPrev = ctEq(i &+ 1, end)
+        let pad = isEnd & ctEq(c, 0x3D) // '='
+        let std = ctBase64(c, 0x2B, 0x2F) // + /
+        let url = ctBase64(c, 0x2D, 0x5F) // - _
+        hexOK &= ctIsHex(c) | outside
+        stdOK &= std.member | pad | outside
+        urlOK &= url.member | pad | outside
+        padded |= pad
+        stdLast = ctSelect(isEnd, std.value, stdLast)
+        stdPrev = ctSelect(isPrev, std.value, stdPrev)
+        urlLast = ctSelect(isEnd, url.value, urlLast)
+        urlPrev = ctSelect(isPrev, url.value, urlPrev)
+    }
+
+    // 43 data characters carry 258 bits: the last one's low 2 must be 0.
+    let shape = (ctEq(textLength, 43) & (padded ^ 1)) | (ctEq(textLength, 44) & padded)
+    let stdCanonical = ctEq(ctSelect(padded, stdPrev, stdLast) & 3, 0)
+    let urlCanonical = ctEq(ctSelect(padded, urlPrev, urlLast) & 3, 0)
+    let hex = hexOK & ctEq(textLength, UInt32(hkdfguardDekLength * 2))
+    let base64 = shape & ((stdOK & stdCanonical) | (urlOK & urlCanonical))
+    return seen & (hex | base64) == 1
 }
 
-/// Reads the wrapped payload stored at `path` — the 146-byte file the CLI's
+/// Reads the wrapped payload stored at `path` — the 125-byte file the CLI's
 /// `wrap` writes — validates it, and copies it to `out`, ready for
 /// `hkdfguard_unwrap_dek`. Never touches the keychain or the Secure
 /// Enclave, and never unwraps anything.
 ///
-/// `*outLen` is the capacity on entry. It is written only with 146: on
+/// `*outLen` is the capacity on entry. It is written only with 125: on
 /// success, and on `outputBufferTooSmall` (the required size, reported
 /// before the file is opened). Every other failure leaves it as the caller
 /// set it, as on Linux and as wrap and unwrap do. File contents are
@@ -1697,7 +2263,7 @@ private func openFileCore(
 ) -> Int32 {
     // Argument checks in Linux's open_file_impl order, before the file is
     // opened. As on Linux (and as wrap and unwrap do), `*out_len` is written
-    // only on success (146) and on buffer-too-small (the size to retry
+    // only on success (125) and on buffer-too-small (the size to retry
     // with); every other failure leaves it as the caller set it.
     guard let outLen else {
         return HKDFGuardStatus.invalidInputLength.rawValue
@@ -1707,6 +2273,14 @@ private func openFileCore(
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
     guard let pathPtr, pathPtr.pointee != 0 else {
+        return HKDFGuardStatus.invalidInputLength.rawValue
+    }
+    // The terminator is looked for in at most PATH_MAX bytes, as on Linux
+    // (cstr_to_path): no NUL in that range -- an unterminated buffer, or a
+    // path no open could take -- is an argument error, and nothing past it
+    // is ever read.
+    let pathLength = strnlen(pathPtr, Int(PATH_MAX))
+    guard pathLength < Int(PATH_MAX) else {
         return HKDFGuardStatus.invalidInputLength.rawValue
     }
     // Too small for a payload -- including the 0 of a size probe, which may
@@ -1725,7 +2299,7 @@ private func openFileCore(
     var buffer = [UInt8](repeating: 0, count: hkdfguardWrappedLength + 1)
     defer { secureZero(&buffer) }
 
-    let (readStatus, count) = readWrappedFile(path: pathPtr, into: &buffer)
+    let (readStatus, count) = readWrappedFile(path: pathPtr, length: pathLength, into: &buffer)
     guard readStatus == .success else {
         return readStatus.rawValue
     }
@@ -1743,25 +2317,21 @@ private func openFileCore(
 
     // Structural checks only -- authenticity is the AEAD's job at unwrap.
     // A SHA-256 fingerprint of all zeros does not occur in practice (checked
-    // first, so an all-zero file is "malformed", not "newer suite"); the
-    // suite byte must be one this build implements; and the encapsulated
-    // key must be a point on P-256 (checked in its X9.63 form, which
-    // CryptoKit validates -- `PublicKey(rawRepresentation:)` would accept
-    // any 64 bytes) for any unwrap to succeed.
+    // first), and the suite byte must be one this build implements. Either
+    // failure is `fileMalformed`, as Linux and Windows report every format
+    // problem in a key file; unwrap, given the same bytes, still names an
+    // unknown suite specifically (-12). The salt, nonce and ciphertext are
+    // random-looking by design; nothing more can be checked without the KEK.
     let fingerprint = buffer[0..<hkdfguardFingerprintLength]
     guard fingerprint.contains(where: { $0 != 0 }) else {
         return HKDFGuardStatus.fileMalformed.rawValue
     }
     guard buffer[hkdfguardSuiteIdOffset] == hkdfguardSuiteId else {
-        return HKDFGuardStatus.unsupportedCiphersuite.rawValue
-    }
-    let encapsulated = buffer[hkdfguardEncapsulatedKeyOffset..<hkdfguardCiphertextOffset]
-    guard (try? P256.KeyAgreement.PublicKey(x963Representation: encapsulated)) != nil else {
         return HKDFGuardStatus.fileMalformed.rawValue
     }
 
-    buffer.withUnsafeBytes { raw in
-        _ = memcpy(outPtr, raw.baseAddress!, hkdfguardWrappedLength)
+    guard copyOut(buffer, to: outPtr, count: hkdfguardWrappedLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
     outLen.pointee = Int32(hkdfguardWrappedLength)
     return HKDFGuardStatus.success.rawValue
