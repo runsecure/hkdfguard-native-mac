@@ -100,8 +100,10 @@ case "${HKDFGUARD_APP_EXPORT:-}" in
 esac
 
 APP_SCHEME="hkdfguard-app"
+APP_TARGET="hkdfguard-app"
 APP_NAME="hkdfguard.app"
 APP_EXECUTABLE="hkdfguard"
+APP_BUNDLE_ID="com.hkdfguard.cli"
 ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
 
 # Credentials. None are stored in this script or the repository; each input
@@ -119,7 +121,20 @@ ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
 #                            in to Xcode. KEY_PATH is the path to the .p8 file;
 #                            keep that file outside the repository. When
 #                            unset, xcodebuild uses the account signed in to
-#                            Xcode (Settings > Accounts).
+#                            Xcode (Settings > Accounts). Not used with
+#                            HKDFGUARD_APP_PROFILE.
+#   HKDFGUARD_APP_PROFILE    optional name of an installed Developer ID
+#                            provisioning profile for the bundled CLI
+#                            ($APP_BUNDLE_ID). When set, the bundle is archived
+#                            and exported with manual signing -- the
+#                            HKDFGUARD_SIGN_IDENTITY certificate and this
+#                            profile -- and xcodebuild never contacts Apple to
+#                            create or download a certificate or profile.
+#                            Requires a Developer ID HKDFGUARD_SIGN_IDENTITY.
+#                            Install the profile with Xcode > Settings >
+#                            Accounts > Download Manual Profiles. (Double-
+#                            clicking the file does not put it where Xcode
+#                            looks.)
 #   HKDFGUARD_NOTARY_PROFILE optional name of a notarytool keychain profile.
 #                            Create it once with
 #                              xcrun notarytool store-credentials <name>
@@ -129,6 +144,7 @@ ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
 #                            is notarized and stapled; requires developer-id.
 TEAM_ID="${HKDFGUARD_TEAM_ID:-}"
 NOTARY_PROFILE="${HKDFGUARD_NOTARY_PROFILE:-}"
+APP_PROFILE="${HKDFGUARD_APP_PROFILE:-}"
 
 XCODE_AUTH_ARGS=()
 if [ -n "${HKDFGUARD_ASC_KEY_PATH:-}" ]; then
@@ -159,6 +175,15 @@ is_developer_id() { [[ "$SIGN_IDENTITY" == "Developer ID Application"* ]]; }
 if [ -n "$NOTARY_PROFILE" ] && ! is_developer_id; then
     echo "error: HKDFGUARD_NOTARY_PROFILE is set, but HKDFGUARD_SIGN_IDENTITY is '$SIGN_IDENTITY'; notarization requires a \"Developer ID Application\" identity" >&2
     exit 2
+fi
+
+# A Developer ID profile only works with a Developer ID certificate and a
+# developer-id export.
+if [ -n "$APP_PROFILE" ]; then
+    is_developer_id \
+        || { echo "error: HKDFGUARD_APP_PROFILE is set, but HKDFGUARD_SIGN_IDENTITY is '$SIGN_IDENTITY'; a Developer ID profile needs a \"Developer ID Application\" identity" >&2; exit 2; }
+    [ "$APP_EXPORT" = "developer-id" ] \
+        || { echo "error: HKDFGUARD_APP_PROFILE is set, but HKDFGUARD_APP_EXPORT is $APP_EXPORT; it requires developer-id" >&2; exit 2; }
 fi
 
 if [ "${HKDFGUARD_RELEASE:-}" = "1" ]; then
@@ -476,30 +501,60 @@ build_app() {
         strict_conditions=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) HKDFGUARD_STRICT_HARDENING')
     fi
 
-    echo "==> Archiving $APP_SCHEME (Release, arm64, team $TEAM_ID)"
+    # Automatic signing lets xcodebuild create or download what it needs
+    # (-allowProvisioningUpdates). With HKDFGUARD_APP_PROFILE the archive is
+    # signed manually, with the Developer ID certificate and the named
+    # profile, and nothing is fetched. These settings apply to every target
+    # the scheme builds, including the dylib, which can't take a profile, so
+    # the profile is looked up by target name: only $APP_TARGET resolves one,
+    # every other target gets an empty specifier.
+    local provisioning_args=(-allowProvisioningUpdates ${XCODE_AUTH_ARGS[@]+"${XCODE_AUTH_ARGS[@]}"})
+    local manual_signing=()
+    if [ -n "$APP_PROFILE" ]; then
+        provisioning_args=()
+        local profile_key
+        profile_key="HKDFGUARD_PROFILE_FOR_$(tr -c 'A-Za-z0-9_\n' '_' <<<"$APP_TARGET")"
+        manual_signing=(
+            CODE_SIGN_STYLE=Manual
+            "CODE_SIGN_IDENTITY=$SIGN_IDENTITY"
+            'PROVISIONING_PROFILE_SPECIFIER=$(HKDFGUARD_PROFILE_FOR_$(TARGET_NAME:c99extidentifier))'
+            "$profile_key=$APP_PROFILE"
+        )
+    fi
+
+    echo "==> Archiving $APP_SCHEME (Release, arm64, team $TEAM_ID, signing: ${APP_PROFILE:+manual, profile $APP_PROFILE}${APP_PROFILE:-automatic})"
     xcodebuild archive \
         -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
         -scheme "$APP_SCHEME" \
         -configuration Release \
         -destination "generic/platform=macOS" \
         -archivePath "$archive" \
-        -allowProvisioningUpdates \
-        ${XCODE_AUTH_ARGS[@]+"${XCODE_AUTH_ARGS[@]}"} \
+        ${provisioning_args[@]+"${provisioning_args[@]}"} \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
         DEVELOPMENT_TEAM="$TEAM_ID" \
+        ${manual_signing[@]+"${manual_signing[@]}"} \
         ${strict_conditions[@]+"${strict_conditions[@]}"}
 
     echo "==> Exporting ($APP_EXPORT)"
     plutil -create xml1 "$options"
     plutil -insert method -string "$APP_EXPORT" "$options"
     plutil -insert teamID -string "$TEAM_ID" "$options"
-    plutil -insert signingStyle -string automatic "$options"
+    if [ -n "$APP_PROFILE" ]; then
+        plutil -insert signingStyle -string manual "$options"
+        plutil -insert signingCertificate -string "$SIGN_IDENTITY" "$options"
+        # PlistBuddy, not plutil: the bundle ID's dots would read as a key path.
+        /usr/libexec/PlistBuddy \
+            -c "Add :provisioningProfiles dict" \
+            -c "Add :provisioningProfiles:$APP_BUNDLE_ID string $APP_PROFILE" \
+            "$options"
+    else
+        plutil -insert signingStyle -string automatic "$options"
+    fi
     xcodebuild -exportArchive \
         -archivePath "$archive" \
         -exportPath "$export_dir" \
         -exportOptionsPlist "$options" \
-        -allowProvisioningUpdates \
-        ${XCODE_AUTH_ARGS[@]+"${XCODE_AUTH_ARGS[@]}"}
+        ${provisioning_args[@]+"${provisioning_args[@]}"}
 
     local app="$export_dir/$APP_NAME"
     local exe="$app/Contents/MacOS/$APP_EXECUTABLE"
@@ -560,6 +615,10 @@ build_app() {
     security cms -D -i "$profile" >"$profile_plist" 2>/dev/null || fail "$profile: could not decode"
     [ "$(plist_value "$profile_plist" TeamIdentifier.0)" = "$TEAM_ID" ] \
         || fail "$profile: not issued for team $TEAM_ID"
+    if [ -n "$APP_PROFILE" ]; then
+        [ "$(plist_value "$profile_plist" Name)" = "$APP_PROFILE" ] \
+            || fail "$profile: is '$(plist_value "$profile_plist" Name)', expected HKDFGUARD_APP_PROFILE '$APP_PROFILE'"
+    fi
     local profile_group
     profile_group="$(plist_value "$profile_plist" Entitlements.keychain-access-groups.0)"
     [ "$profile_group" = "$expected_group" ] || [ "$profile_group" = "$TEAM_ID.*" ] \
@@ -642,6 +701,52 @@ testing on registered Macs only.
 EOF
 )"
     fi
+
+    [ -z "$APP_PROFILE" ] || preflight_profile
+}
+
+# Finds the installed profile named HKDFGUARD_APP_PROFILE -- where Xcode 16
+# and later keep profiles, and where older versions did -- and checks it
+# before anything is built: exactly one with that name, a Developer ID
+# profile for this team and $APP_BUNDLE_ID, granting the production access
+# group, and not expired.
+preflight_profile() {
+    local dir file name matches=()
+    for dir in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+               "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+        [ -d "$dir" ] || continue
+        for file in "$dir"/*.provisionprofile; do
+            [ -f "$file" ] || continue
+            name="$(security cms -D -i "$file" 2>/dev/null | plutil -extract Name raw -o - - 2>/dev/null)" || continue
+            [ "$name" = "$APP_PROFILE" ] && matches+=("$file")
+        done
+    done
+    [ "${#matches[@]}" -gt 0 ] || fail "$(cat <<EOF
+no installed provisioning profile named "$APP_PROFILE" (HKDFGUARD_APP_PROFILE).
+Install it with Xcode > Settings > Accounts > (your team) > Download Manual
+Profiles; double-clicking the file does not put it where Xcode looks.
+EOF
+)"
+    [ "${#matches[@]}" -eq 1 ] \
+        || fail "found ${#matches[@]} installed profiles named \"$APP_PROFILE\"; remove the stale ones: ${matches[*]}"
+
+    local plist="$WORK/preflight-profile.plist"
+    security cms -D -i "${matches[0]}" >"$plist" 2>/dev/null || fail "${matches[0]}: could not decode"
+    echo "==> Provisioning profile: $APP_PROFILE (${matches[0]})"
+    [ "$(plist_value "$plist" TeamIdentifier.0)" = "$TEAM_ID" ] \
+        || fail "profile \"$APP_PROFILE\" is not issued for team $TEAM_ID"
+    [ "$(plist_value "$plist" ProvisionsAllDevices)" = "true" ] \
+        || fail "profile \"$APP_PROFILE\" is not a Developer ID profile (it does not provision all devices)"
+    [ "$(plist_value "$plist" Entitlements.com\\.apple\\.application-identifier)" = "$TEAM_ID.$APP_BUNDLE_ID" ] \
+        || fail "profile \"$APP_PROFILE\" is for '$(plist_value "$plist" Entitlements.com\\.apple\\.application-identifier)', expected '$TEAM_ID.$APP_BUNDLE_ID'"
+    local group
+    group="$(plist_value "$plist" Entitlements.keychain-access-groups.0)"
+    [ "$group" = "$TEAM_ID.$ACCESS_GROUP_SUFFIX" ] || [ "$group" = "$TEAM_ID.*" ] \
+        || fail "profile \"$APP_PROFILE\" does not grant the keychain access group '$TEAM_ID.$ACCESS_GROUP_SUFFIX' (grants '$group')"
+    local expires
+    expires="$(plist_value "$plist" ExpirationDate)"
+    [[ "$expires" > "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ]] \
+        || fail "profile \"$APP_PROFILE\" expired at $expires"
 }
 
 preflight_app
