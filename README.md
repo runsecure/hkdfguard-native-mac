@@ -88,7 +88,11 @@ the tag (AES-GCM additional data). No header byte can be changed without the
 open failing.
 
 The fingerprint identifies *which* KEK a payload was wrapped under. It hashes
-the uncompressed public key (`0x04 || x || y`), as Linux and Windows do. On
+the uncompressed public key (`0x04 || x || y`), as Linux does. Windows hashes
+the raw `x || y`, without the `0x04` prefix, so the same key would fingerprint
+differently there; that is harmless, since a payload is only ever opened on the
+machine that wrapped it, but a fingerprint is only meaningful on the platform
+that produced it. On
 unwrap it is compared to the current KEK's public key **before** any key
 agreement or decryption is attempted, so "wrong or rotated KEK" is reported
 as `fingerprintMismatch` (-16) rather than as a generic decryption failure.
