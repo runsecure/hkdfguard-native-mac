@@ -654,7 +654,13 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
   made from Terminal, `sudo` included, would be unusable by the service's
   daemons. `provision` and `wrap` hand that step to a short-lived system job
   running the same `hkdfguard` executable. The DEK goes to it through a FIFO
-  in a root-only folder, so it never touches disk. The job runs only if the
+  in a root-only folder, so it never touches disk. That folder is made in
+  `/Library/Application Support/HkdfGuard/v1/jobs`, and the job runs only if
+  it and every folder above it are owned and writable by root alone, so no
+  other account can swap the job's definition, its DEK channel or its answer.
+  If the CLI dies before sending the DEK, the job gives up after 30 seconds
+  and removes its folder; a folder left by a crashed run is removed on the
+  next one. The job runs only if the
   `hkdfguard` executable and the library it loaded are root's and writable
   only by root, which the installed package's are; a build run from a
   source tree is refused.
