@@ -63,6 +63,13 @@
 // through a separate hkdfguard_kek_fingerprint call, so there is no window
 // between "which KEK?" and "wrap under it".
 //
+// --fingerprint is the normal way to wrap: in legacy keychain mode any
+// process running as the same user can create the service's KEK item
+// before `provision` does, and `provision` would then report that planted
+// key as "already provisioned". Without --fingerprint, `wrap --force` over
+// an existing wrapped key is pinned to that file's KEK instead (refusing a
+// different one), and a wrap with neither pin prints a warning.
+//
 // For `wrap`, exactly one DEK source is required:
 //   --dek-stdin        base64 DEK read from standard input (e.g. piped from
 //                      the pipeline or a secret store), never from an
@@ -374,8 +381,10 @@ func printUsage() {
                       group for the service that unwraps it, which you belong to;
                       broad groups (staff, everyone, admin, wheel, ...) are refused
           --fingerprint|-fp <hex>  refuse to write unless the KEK actually used has this
-                      fingerprint (64 hex characters, as printed by provision)
-          --force|-f          securely overwrite an existing <path>
+                      fingerprint (64 hex characters, as printed by provision).
+                      Recommended on every wrap, and the only check on a first wrap
+          --force|-f          securely overwrite an existing <path>; without --fingerprint,
+                      only if the KEK used is the one <path> was wrapped under
 
         The DEK is never accepted as a command-line argument (it would be visible
         to other processes via ps and recorded in shell history).
@@ -1659,6 +1668,37 @@ func keyFileNameIsTaken(_ folder: CheckedFolder) -> Bool {
     return fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0
 }
 
+// A wrapped payload's length, and its suite id byte (see hkdfguard.h).
+let wrappedPayloadLength = 125
+let wrappedPayloadSuiteV1: UInt8 = 0x01
+
+// The KEK fingerprint embedded in the key file `--force` is about to
+// replace, or nil when there is nothing there that reads as a wrapped key
+// (absent, unreadable, wrong length, unknown suite, zero fingerprint). That
+// is the KEK the service's existing payload was sealed to: when the
+// keychain item now resolves to a different one -- planted ahead of
+// `provision` or swapped since -- `wrap` refuses unless the operator names
+// the new KEK with --fingerprint. Read through the checked folder without
+// following a link; only a regular file is examined. Not a guarantee: the
+// file can change before the overwrite, but whoever can change it is the
+// owning user, already inside the trust boundary.
+func existingKeyFileFingerprint(_ folder: CheckedFolder) -> [UInt8]? {
+    let fd = openat(folder.fd, folder.leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var st = stat()
+    guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_size == off_t(wrappedPayloadLength) else {
+        return nil
+    }
+    var payload = [UInt8](repeating: 0, count: wrappedPayloadLength)
+    let count = payload.withUnsafeMutableBytes { pread(fd, $0.baseAddress, wrappedPayloadLength, 0) }
+    guard count == wrappedPayloadLength, payload[fingerprintLength] == wrappedPayloadSuiteV1 else {
+        return nil
+    }
+    let fingerprint = Array(payload.prefix(fingerprintLength))
+    return fingerprint.contains(where: { $0 != 0 }) ? fingerprint : nil
+}
+
 // Removes `folder.leaf` -- but only while that name still refers to the
 // file open as `fd` (same device and inode): a file someone put at the name
 // in the meantime is left alone. The Linux tool's remove_created_file.
@@ -1999,6 +2039,9 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     if args.force {
         try refuseUnlessAbsentOrRegularFile(keyFolder, display: args.keyFilePath)
     }
+    // The KEK the file being replaced was wrapped under, if it is a wrapped
+    // key: the pin when --fingerprint isn't given (see the check below).
+    let replacedFingerprint = args.force ? existingKeyFileFingerprint(keyFolder) : nil
 
     // `args.serviceName` is not secret -- it's a logical identifier, not key
     // material -- so no special scoping is needed for it. Validated before
@@ -2051,13 +2094,39 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     if let expected = args.expectedFingerprint, usedFingerprint != expected {
         throw CLIError("fingerprint mismatch for service \"\(args.serviceName)\": the KEK in the keychain is \(hexString(usedFingerprint)), not \(hexString(expected)); nothing was written -- the DEK was NOT committed to that key")
     }
+    // Without --fingerprint, a re-wrap is pinned to the KEK of the key file
+    // it replaces. A different KEK under the same service name means the
+    // keychain item is not the one the existing payload was sealed to: in
+    // legacy mode, any process running as this user can create or replace
+    // that item. Checked before the secure overwrite, so the old file is
+    // left intact. A deliberate change of KEK (re-provisioned after
+    // `retire`) is confirmed by naming the new one with --fingerprint.
+    if args.expectedFingerprint == nil, let replaced = replacedFingerprint, usedFingerprint != replaced {
+        throw CLIError("fingerprint mismatch for service \"\(args.serviceName)\": the KEK in the keychain is \(hexString(usedFingerprint)), but \(args.keyFilePath) was wrapped under \(hexString(replaced)); nothing was written -- the DEK was NOT committed to that key. If the service's KEK was deliberately replaced, pass --fingerprint with the new KEK's value as printed by provision")
+    }
 
     try writeWrappedKeyFile(keyFolder, display: args.keyFilePath, bytes: wrapped, force: args.force, group: group)
 
     // The Linux tool's wording for who can read it.
     let access = group.map { "owner read/write + \($0.name) read-only" } ?? "owner read/write"
     print("wrapped key written to \(spelledArgs.keyFilePath) (\(wrapped.count) bytes, \(access), service \"\(args.serviceName)\", \(machine ? "scope: machine" : "keychain: \(keychainModeName())"))")
-    print("fingerprint: \(hexString(usedFingerprint))\(args.expectedFingerprint == nil ? " -- confirm it matches the one recorded when this service was provisioned" : " (confirmed)")")
+    switch (args.expectedFingerprint, replacedFingerprint) {
+    case (_?, let replaced?) where replaced != usedFingerprint:
+        print("fingerprint: \(hexString(usedFingerprint)) (confirmed; replaced a key file wrapped under \(hexString(replaced)))")
+    case (_?, _):
+        print("fingerprint: \(hexString(usedFingerprint)) (confirmed)")
+    case (nil, _?):
+        print("fingerprint: \(hexString(usedFingerprint)) (confirmed: same KEK as the key file it replaced)")
+    case (nil, nil):
+        print("fingerprint: \(hexString(usedFingerprint)) -- confirm it matches the one recorded when this service was provisioned")
+        // A machine KEK file is root's alone; a user-scoped keychain item
+        // is not, so a first wrap there should name the KEK it expects.
+        if !machine {
+            let mode = keychainModeName()
+            let planters = mode == "legacy" ? "any process running as this user" : "any app in the same keychain access group"
+            FileHandle.standardError.write(Data("warning: this wrap was not pinned to a KEK -- no --fingerprint, and no existing key file to compare with. In \(mode) keychain mode \(planters) could have created the service's KEK item before provision did; pass --fingerprint <value printed by provision> on the first wrap\n".utf8))
+        }
+    }
 }
 
 // MARK: - Machine-scoped services (production mode; see MachineScope.swift)

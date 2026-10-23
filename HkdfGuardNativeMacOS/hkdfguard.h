@@ -258,6 +258,14 @@ extern "C" {
 //       approves every program that interpreter runs as the same user.
 //       Prefer data-protection mode, or a service shipped as its own signed
 //       executable (see the README's "What the legacy-mode ACL checks").
+//       The ACL also does not control who creates the item: any process
+//       running as the same user can plant a KEK item of its own under a
+//       service name before hkdfguard_create_kek runs, and the library
+//       then uses it. Legacy mode trusts every process running as that
+//       user. Record the fingerprint at provisioning, and compare it with
+//       the first 32 bytes of every payload hkdfguard_wrap_dek returns
+//       before storing it (see the README's "A KEK item can be planted
+//       ahead of time").
 //
 // The two keychains are disjoint, so the process that provisions a
 // service's KEK and every process that unwraps under it MUST run in the
