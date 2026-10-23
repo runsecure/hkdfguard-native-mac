@@ -69,6 +69,13 @@ jobs:
             || { echo "::error::MARKETING_VERSION differs between targets: $(tr '\n' ' ' <<<"$versions")"; exit 1; }
           [ "$GITHUB_REF_NAME" = "v$versions" ] \
             || { echo "::error::tag $GITHUB_REF_NAME does not match MARKETING_VERSION $versions"; exit 1; }
+          # The language ports read the library's version from its Mach-O header (LC_ID_DYLIB
+          # current_version, i.e. DYLIB_CURRENT_VERSION) to refuse releases older than their
+          # minimum, so that header must carry the release version.
+          dylib_versions="$(grep -o 'DYLIB_CURRENT_VERSION = [^;]*;' HkdfGuardNativeMacOS.xcodeproj/project.pbxproj \
+            | sed 's/DYLIB_CURRENT_VERSION = //; s/;//' | sort -u)"
+          [ "$dylib_versions" = "$versions" ] \
+            || { echo "::error::DYLIB_CURRENT_VERSION ($(tr '\n' ' ' <<<"$dylib_versions")) must equal MARKETING_VERSION $versions"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
             || { echo "::error::tag $GITHUB_REF_NAME is not on main"; exit 1; }
 
