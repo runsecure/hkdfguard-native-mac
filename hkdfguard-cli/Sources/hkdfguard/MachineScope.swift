@@ -226,6 +226,49 @@ struct SystemJobResult {
 
 private let systemJobTimeout: TimeInterval = 30
 
+/// Where the one-off system jobs keep their folders. Every folder from / down
+/// to here must be root's and writable by root alone: the root CLI creates
+/// the job's definition, its DEK channel and reads its answer here by path,
+/// so a folder anyone else could write -- as /private/var/run is to the
+/// daemon group -- would let them swap the job folder for one of their own.
+let systemJobsFolder = "/Library/Application Support/HkdfGuard/v1/jobs"
+
+/// A job folder older than this was left by a run that died; it is removed.
+private let staleJobAge: TimeInterval = 10 * 60
+
+/// Whether `path` is a real folder (not a link), root's, and closed to
+/// everyone else.
+private func isRootOnlyFolder(_ path: String) -> Bool {
+    var info = stat()
+    return lstat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR && info.st_uid == 0 && info.st_mode & 0o077 == 0
+}
+
+/// Creates the jobs folder if needed and refuses to go on unless it, and
+/// every folder above it, is root's alone. Removes job folders a crashed
+/// run left behind.
+private func prepareSystemJobsFolder() throws {
+    let parent = (systemJobsFolder as NSString).deletingLastPathComponent
+    if mkdir(parent, 0o755) != 0 && errno != EEXIST {
+        throw CLIError("can't create \(parent): \(String(cString: strerror(errno)))")
+    }
+    if mkdir(systemJobsFolder, 0o700) != 0 && errno != EEXIST {
+        throw CLIError("can't create \(systemJobsFolder): \(String(cString: strerror(errno)))")
+    }
+    guard rootControls(systemJobsFolder), isRootOnlyFolder(systemJobsFolder) else {
+        throw CLIError("\(systemJobsFolder), and every folder above it, must be owned by root and writable by root alone (the folder itself mode 0700); refusing to run a system job there")
+    }
+    let now = Date()
+    for entry in (try? FileManager.default.contentsOfDirectory(atPath: systemJobsFolder)) ?? [] where entry.hasPrefix("job.") {
+        let path = "\(systemJobsFolder)/\(entry)"
+        var info = stat()
+        guard lstat(path, &info) == 0 else { continue }
+        let modified = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec))
+        if now.timeIntervalSince(modified) > staleJobAge {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+    }
+}
+
 private func launchctl(_ arguments: [String]) -> Int32 {
     var pid: pid_t = 0
     let argv = (["/bin/launchctl"] + arguments).map { strdup($0) } + [nil]
@@ -248,11 +291,15 @@ private func xmlEscaped(_ text: String) -> String {
 func runSystemJob(_ operation: SystemJobOperation, service: String, dek: UnsafeRawBufferPointer? = nil) throws -> SystemJobResult {
     let executable = try rootOwnedSelf()
 
-    var template = Array("/private/var/run/hkdfguard.XXXXXX".utf8CString)
+    try prepareSystemJobsFolder()
+    var template = Array("\(systemJobsFolder)/job.XXXXXX".utf8CString)
     guard let made = mkdtemp(&template) else {
         throw CLIError("can't create the system job's folder: \(String(cString: strerror(errno)))")
     }
     let folder = String(cString: made)
+    guard isRootOnlyFolder(folder) else {
+        throw CLIError("the system job's folder \(folder) is not a root-only folder")
+    }
     let label = "com.hkdfguard.job.\(UInt64.random(in: .min ... .max))"
     defer {
         _ = launchctl(["bootout", "system/\(label)"])
@@ -336,9 +383,11 @@ func runSystemJobSide(folder: String) throws {
     guard geteuid() == 0 else {
         throw CLIError("__system-job is internal to hkdfguard and runs only as root")
     }
-    var info = stat()
-    guard lstat(folder, &info) == 0, info.st_mode & S_IFMT == S_IFDIR, info.st_uid == 0, info.st_mode & 0o077 == 0 else {
-        throw CLIError("__system-job: \(folder) is not a root-only folder")
+    // Only a folder the CLI made in the jobs folder: root's alone, as is
+    // every folder above it.
+    guard (folder as NSString).deletingLastPathComponent == systemJobsFolder,
+          isRootOnlyFolder(folder), rootControls(folder) else {
+        throw CLIError("__system-job: \(folder) is not a root-only folder in \(systemJobsFolder)")
     }
     guard let data = FileManager.default.contents(atPath: "\(folder)/request.plist"),
           let request = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
@@ -353,7 +402,11 @@ func runSystemJobSide(folder: String) throws {
         result = ["status": Int(service.withCString { hkdfguard_create_kek($0) })]
     case .wrap:
         // The library's own status goes back to the CLI, which explains it.
-        result = try withDekFromFifo("\(folder)/dek.fifo") { dek -> [String: Any] in
+        result = try withDekFromFifo("\(folder)/dek.fifo", timeout: systemJobTimeout, abandon: {
+            // The CLI never sent the DEK, so it died or gave up: nobody will
+            // read an answer, and this folder would only be left behind.
+            try? FileManager.default.removeItem(atPath: folder)
+        }) { dek -> [String: Any] in
             var out = [UInt8](repeating: 0, count: initialWrappedCapacity)
             var length = Int32(out.count)
             let status = service.withCString { servicePtr in
@@ -376,8 +429,11 @@ func runSystemJobSide(folder: String) throws {
     }
 }
 
-/// Reads the 32-byte DEK from the FIFO into a locked, zeroed-after buffer.
-private func withDekFromFifo<T>(_ path: String, _ body: (UnsafeRawBufferPointer) throws -> T) throws -> T {
+/// Reads the 32-byte DEK from the FIFO into a locked, zeroed-after buffer,
+/// waiting at most `timeout` for the CLI to send it. If the CLI died before
+/// sending, the job runs `abandon` and fails instead of blocking for ever.
+func withDekFromFifo<T>(_ path: String, timeout: TimeInterval, abandon: () -> Void = {},
+                        _ body: (UnsafeRawBufferPointer) throws -> T) throws -> T {
     let pageSize = Int(getpagesize())
     let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: pageSize, alignment: pageSize)
     guard let base = buffer.baseAddress else {
@@ -390,20 +446,33 @@ private func withDekFromFifo<T>(_ path: String, _ body: (UnsafeRawBufferPointer)
         if locked { munlock(base, pageSize) }
         buffer.deallocate()
     }
-    let fd = open(path, O_RDONLY | O_CLOEXEC)
+    // Opened read-write, which never blocks on a FIFO and keeps a writer
+    // (this process) attached, so a read can't see end-of-file before the
+    // CLI connects; poll then bounds the wait. A blocking read-only open
+    // would wait for ever if the CLI died before opening its end.
+    let fd = open(path, O_RDWR | O_CLOEXEC)
     guard fd >= 0 else {
+        abandon()
         throw CLIError("__system-job: can't open the DEK channel")
     }
+    defer { close(fd) }
+    let deadline = Date().addingTimeInterval(timeout)
     var filled = 0
     while filled < dekLen {
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { break }
+        var pollFd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        let ready = poll(&pollFd, 1, Int32(min(remaining * 1000, Double(Int32.max))))
+        if ready < 0 && errno == EINTR { continue }
+        if ready <= 0 { break }
         let count = read(fd, base + filled, dekLen - filled)
         if count < 0 && errno == EINTR { continue }
         if count <= 0 { break }
         filled += count
     }
-    close(fd)
     guard filled == dekLen else {
-        throw CLIError("__system-job: the DEK channel delivered \(filled) bytes, not \(dekLen)")
+        abandon()
+        throw CLIError("__system-job: the DEK channel delivered \(filled) bytes, not \(dekLen), within \(Int(timeout)) s")
     }
     return try body(UnsafeRawBufferPointer(start: base, count: dekLen))
 }

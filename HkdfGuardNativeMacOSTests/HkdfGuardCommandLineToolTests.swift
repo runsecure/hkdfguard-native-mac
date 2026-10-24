@@ -820,7 +820,7 @@ struct HkdfGuardCommandLineToolTests {
         let stdin = Data((Data(Self.randomDEK()).base64EncodedString() + "\n").utf8)
         let result = try Self.runCLI(["wrap", "--key-file-path", keyFilePath, "--service-name", service, "--dek-stdin"], stdin: stdin)
         #expect(result.exitCode == 0, "CLI failed: \(result.stderr)")
-        #expect(!result.stderr.contains("warning:"))
+        #expect(!result.stderr.contains("could not lock"), "the DEK buffer's mlock must succeed; stderr: \(result.stderr)")
         let wrapped = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
         #expect(wrapped.count == 125)
     }
@@ -1771,6 +1771,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(unpinned.exitCode == 0, "wrap failed: \(unpinned.stderr)")
         #expect(Self.fingerprintLine(in: unpinned.stdout) == fingerprint, "stdout: \(unpinned.stdout)")
         #expect(unpinned.stdout.contains("confirm it matches"), "stdout: \(unpinned.stdout)")
+        #expect(unpinned.stderr.contains("not pinned to a KEK"), "a first wrap without --fingerprint warns; stderr: \(unpinned.stderr)")
         let payload = try Data(contentsOf: URL(fileURLWithPath: unpinnedPath))
         let embedded = payload.prefix(32).map { String(format: "%02x", $0) }.joined()
         #expect(embedded == fingerprint)
@@ -1784,7 +1785,65 @@ struct HkdfGuardCommandLineToolTests {
         )
         #expect(pinned.exitCode == 0, "pinned wrap failed: \(pinned.stderr)")
         #expect(pinned.stdout.contains("fingerprint: \(fingerprint) (confirmed)"), "stdout: \(pinned.stdout)")
+        #expect(!pinned.stderr.contains("not pinned"), "stderr: \(pinned.stderr)")
         #expect(FileManager.default.fileExists(atPath: pinnedPath))
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliForceWithoutFingerprintIsPinnedToTheReplacedKeyFilesKek() throws {
+        // Two services stand in for one service whose keychain item was
+        // replaced (planted ahead of provision, or swapped since): the key
+        // file was wrapped under `original`'s KEK, and `swapped`'s KEK is a
+        // different one.
+        let original = "com.hkdfguard.tests.cli.wrap.pin.original"
+        let swapped = "com.hkdfguard.tests.cli.wrap.pin.swapped"
+        defer { Self.deleteKEK(service: original) }
+        defer { Self.deleteKEK(service: swapped) }
+
+        let provisionOriginal = try Self.runCLI(["provision", "-sn", original])
+        #expect(provisionOriginal.exitCode == 0, "provision failed: \(provisionOriginal.stderr)")
+        let originalFingerprint = try #require(Self.fingerprint(fromProvisionOutput: provisionOriginal.stdout))
+        let provisionSwapped = try Self.runCLI(["provision", "-sn", swapped])
+        #expect(provisionSwapped.exitCode == 0, "provision failed: \(provisionSwapped.stderr)")
+        let swappedFingerprint = try #require(Self.fingerprint(fromProvisionOutput: provisionSwapped.stdout))
+
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        let first = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", original, "--dek-stdin", "-fp", originalFingerprint],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(first.exitCode == 0, "wrap failed: \(first.stderr)")
+        let existing = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
+
+        // A different KEK, no --fingerprint: refused before the overwrite.
+        let refused = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", swapped, "--dek-stdin", "--force"],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(refused.exitCode == 1)
+        #expect(refused.stderr.contains("fingerprint mismatch"), "stderr: \(refused.stderr)")
+        #expect(refused.stderr.contains("was wrapped under \(originalFingerprint)"), "stderr: \(refused.stderr)")
+        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)) == existing, "the old file is left intact")
+
+        // The same KEK, no --fingerprint: confirmed by the file it replaces.
+        let same = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", original, "--dek-stdin", "--force"],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(same.exitCode == 0, "re-wrap failed: \(same.stderr)")
+        #expect(same.stdout.contains("same KEK as the key file it replaced"), "stdout: \(same.stdout)")
+        #expect(!same.stderr.contains("not pinned"), "stderr: \(same.stderr)")
+
+        // A deliberate change of KEK, named with --fingerprint: allowed.
+        let moved = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", swapped, "--dek-stdin", "--force", "-fp", swappedFingerprint],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(moved.exitCode == 0, "pinned re-wrap failed: \(moved.stderr)")
+        #expect(moved.stdout.contains("replaced a key file wrapped under \(originalFingerprint)"), "stdout: \(moved.stdout)")
+        let embedded = try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).prefix(32).map { String(format: "%02x", $0) }.joined()
+        #expect(embedded == swappedFingerprint)
     }
 
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))

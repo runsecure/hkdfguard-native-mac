@@ -85,7 +85,7 @@ extern "C" {
  *    -16 ..  -31   KEK
  *    -32 ..  -63   key file (hkdfguard_open_file); -40..-63 reserved
  *    -64 ..  -79   Windows-specific
- *    -80 ..  -95   Linux-specific (none defined yet)
+ *    -80 ..  -95   Linux-specific
  *    -96 .. -111   macOS-specific
  *
  * Every code in a platform band refines one common code, named in its
@@ -138,7 +138,8 @@ extern "C" {
 /* Windows-specific (-64..-79). Not returned on macOS. */
 #define HKDFGUARD_ERR_WIN_GROUP_INVALID (-64)   /* refines HKDFGUARD_ERR_POLICY_INVALID; Windows only */
 
-/* Linux-specific (-80..-95): none defined yet. Not returned on macOS. */
+/* Linux-specific (-80..-95). Not returned on macOS. */
+#define HKDFGUARD_ERR_LINUX_GROUP_INVALID (-80) /* refines HKDFGUARD_ERR_POLICY_INVALID; Linux only */
 
 /* macOS-specific (-96..-111). Each refines HKDFGUARD_ERR_PROVIDER_ERROR. */
 #define HKDFGUARD_ERR_MAC_ACCESS_CONTROL_CREATION_FAILED (-96) /* failed to set up the access policy for a new KEK, before any Secure Enclave key was requested */
@@ -196,8 +197,10 @@ extern "C" {
 // libraries, this one shares the function names and signatures, status
 // codes, flags, and call semantics. Two functions here are macOS-only, with
 // no Linux or Windows counterpart, so a cross-platform caller must not rely
-// on them: hkdfguard_keychain_mode and hkdfguard_machine_policy. Not shared
-// either: the payload layout, which is per-platform (Linux's carries a
+// on them: hkdfguard_keychain_mode and hkdfguard_machine_policy. Two
+// Linux functions have no macOS counterpart and are not declared here:
+// hkdfguard_security_model and hkdfguard_key_file_principal_trusted. Not
+// shared either: the payload layout, which is per-platform (Linux's carries a
 // version byte, a provider tag and a key id, 132..276 bytes). The
 // construction is the same on all three -- ECDH against a hashed
 // per-payload point, HKDF-SHA512, AES-256-GCM -- so on every platform only
@@ -258,6 +261,14 @@ extern "C" {
 //       approves every program that interpreter runs as the same user.
 //       Prefer data-protection mode, or a service shipped as its own signed
 //       executable (see the README's "What the legacy-mode ACL checks").
+//       The ACL also does not control who creates the item: any process
+//       running as the same user can plant a KEK item of its own under a
+//       service name before hkdfguard_create_kek runs, and the library
+//       then uses it. Legacy mode trusts every process running as that
+//       user. Record the fingerprint at provisioning, and compare it with
+//       the first 32 bytes of every payload hkdfguard_wrap_dek returns
+//       before storing it (see the README's "A KEK item can be planted
+//       ahead of time").
 //
 // The two keychains are disjoint, so the process that provisions a
 // service's KEK and every process that unwraps under it MUST run in the
