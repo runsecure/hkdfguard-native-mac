@@ -85,7 +85,7 @@ extern "C" {
  *    -16 ..  -31   KEK
  *    -32 ..  -63   key file (hkdfguard_open_file); -40..-63 reserved
  *    -64 ..  -79   Windows-specific
- *    -80 ..  -95   Linux-specific (none defined yet)
+ *    -80 ..  -95   Linux-specific
  *    -96 .. -111   macOS-specific
  *
  * Every code in a platform band refines one common code, named in its
@@ -138,7 +138,8 @@ extern "C" {
 /* Windows-specific (-64..-79). Not returned on macOS. */
 #define HKDFGUARD_ERR_WIN_GROUP_INVALID (-64)   /* refines HKDFGUARD_ERR_POLICY_INVALID; Windows only */
 
-/* Linux-specific (-80..-95): none defined yet. Not returned on macOS. */
+/* Linux-specific (-80..-95). Not returned on macOS. */
+#define HKDFGUARD_ERR_LINUX_GROUP_INVALID (-80) /* refines HKDFGUARD_ERR_POLICY_INVALID; Linux only */
 
 /* macOS-specific (-96..-111). Each refines HKDFGUARD_ERR_PROVIDER_ERROR. */
 #define HKDFGUARD_ERR_MAC_ACCESS_CONTROL_CREATION_FAILED (-96) /* failed to set up the access policy for a new KEK, before any Secure Enclave key was requested */
@@ -196,8 +197,10 @@ extern "C" {
 // libraries, this one shares the function names and signatures, status
 // codes, flags, and call semantics. Two functions here are macOS-only, with
 // no Linux or Windows counterpart, so a cross-platform caller must not rely
-// on them: hkdfguard_keychain_mode and hkdfguard_machine_policy. Not shared
-// either: the payload layout, which is per-platform (Linux's carries a
+// on them: hkdfguard_keychain_mode and hkdfguard_machine_policy. Two
+// Linux functions have no macOS counterpart and are not declared here:
+// hkdfguard_security_model and hkdfguard_key_file_principal_trusted. Not
+// shared either: the payload layout, which is per-platform (Linux's carries a
 // version byte, a provider tag and a key id, 132..276 bytes). The
 // construction is the same on all three -- ECDH against a hashed
 // per-payload point, HKDF-SHA512, AES-256-GCM -- so on every platform only

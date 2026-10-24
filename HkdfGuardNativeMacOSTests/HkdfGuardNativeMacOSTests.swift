@@ -1368,6 +1368,8 @@ struct HkdfGuardCrossPlatformABITests {
 
     /// The functions only this platform exports, as its header documents.
     static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_machine_policy"]
+    /// The Linux functions this platform doesn't export, as its header documents.
+    static let linuxOnlyFunctions: Set<String> = ["hkdfguard_security_model", "hkdfguard_key_file_principal_trusted"]
 
     static func read(_ url: URL) throws -> String {
         try String(contentsOf: url, encoding: .utf8)
@@ -1457,7 +1459,7 @@ struct HkdfGuardCrossPlatformABITests {
         #expect(linux.count >= 8, "parsed too few functions from the Linux header: \(linux.sorted())")
 
         let missing = linux.subtracting(mac)
-        #expect(missing.isEmpty, "declared on Linux but not macOS: \(missing.sorted())")
+        #expect(missing == Self.linuxOnlyFunctions, "Linux-only functions are \(missing.sorted()); the headers document \(Self.linuxOnlyFunctions.sorted())")
         let extra = mac.subtracting(linux)
         #expect(extra == Self.macOnlyFunctions, "macOS-only functions are \(extra.sorted()); the headers document \(Self.macOnlyFunctions.sorted())")
     }
