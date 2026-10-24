@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:hkdfguard-native-mac}/hkdfguard-cli",
+            "name": "Debug hkdfguard (hkdfguard-cli)",
+            "target": "hkdfguard",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug hkdfguard (hkdfguard-cli)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:hkdfguard-native-mac}/hkdfguard-cli",
+            "name": "Release hkdfguard (hkdfguard-cli)",
+            "target": "hkdfguard",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release hkdfguard (hkdfguard-cli)"
+        }
+    ]
+}

@@ -518,6 +518,42 @@ Either way the user account remains the boundary (see
 user can also read its files and, unless the process runs with the
 hardened runtime, attach a debugger to it.
 
+### A KEK item can be planted ahead of time
+
+The ACL protects an item **after** it exists, but it does not control who
+creates it. In legacy mode, any process running as the same user can create
+the service's KEK item in the login keychain before HkdfGuard does. It can
+store a Secure Enclave key of its own there, under its own ACL. `provision`
+then finds an item already present. It reports "already provisioned"
+and prints that key's fingerprint, and every DEK wrapped afterwards is
+sealed to a key the other process controls. **Legacy mode trusts every
+process running as that user**, not just the ones the ACL lists.
+
+Data-protection mode narrows this to apps signed by the same Team that list
+the same access group. A stock interpreter or a dropped-in script running as
+the user can't write there. **Prefer data-protection mode** (the bundled
+`hkdfguard.app` CLI and Team-signed consumers) for production KEKs.
+
+In either mode, the fingerprint is how a planted or swapped item is
+caught:
+
+- On `provision`, "already provisioned" for a service you have never
+  provisioned means someone else created the item. Don't use it.
+  Retire it, then provision again.
+- `wrap --fingerprint <recorded value>` refuses to write a payload sealed
+  to any other KEK. Make it the normal way to wrap, and especially the
+  **first** wrap, which has nothing else to compare with; `wrap` warns when
+  neither check applies.
+- `wrap --force` over an existing wrapped key, without `--fingerprint`, is
+  pinned to the KEK that file was wrapped under. It refuses a different
+  one and leaves the old file intact.
+
+The C ABI does none of this for you. `hkdfguard_wrap_dek` wraps under
+whatever item the service name resolves to. A consumer that wraps should
+compare the first 32 bytes of the payload with its recorded fingerprint
+before storing it (see `wrap --fingerprint` below). A library-side check
+driven by an existing key file is not implemented yet.
+
 ## Access policy and headless use
 
 This section describes **user-scoped** KEKs: every KEK with no policy, and
@@ -654,7 +690,13 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
   made from Terminal, `sudo` included, would be unusable by the service's
   daemons. `provision` and `wrap` hand that step to a short-lived system job
   running the same `hkdfguard` executable. The DEK goes to it through a FIFO
-  in a root-only folder, so it never touches disk. The job runs only if the
+  in a root-only folder, so it never touches disk. That folder is made in
+  `/Library/Application Support/HkdfGuard/v1/jobs`, and the job runs only if
+  it and every folder above it are owned and writable by root alone, so no
+  other account can swap the job's definition, its DEK channel or its answer.
+  If the CLI dies before sending the DEK, the job gives up after 30 seconds
+  and removes its folder; a folder left by a crashed run is removed on the
+  next one. The job runs only if the
   `hkdfguard` executable and the library it loaded are root's and writable
   only by root, which the installed package's are; a build run from a
   source tree is refused.
@@ -847,14 +889,23 @@ hkdfguard retire --service-name|-sn <name> \
   only at unwrap (`-16`), after the DEK had already been sealed to the wrong
   key. The check is made on the returned payload, not through a separate
   fingerprint call, so there is no window between "which KEK?" and "wrap
-  under it". Use it in every scripted pipeline. ABI consumers get the same
-  guarantee by comparing the first 32 bytes of the payload
+  under it". It is the normal way to wrap: use it in every scripted
+  pipeline, and always on a service's first wrap, which nothing else can
+  check (see [A KEK item can be planted ahead of time](#a-kek-item-can-be-planted-ahead-of-time)).
+  When a wrap has neither `--fingerprint` nor an existing key file to pin
+  to, `wrap` prints a warning on stderr; it still exits `0`. ABI consumers
+  get the same guarantee by comparing the first 32 bytes of the payload
   `hkdfguard_wrap_dek` returns against their recorded fingerprint before
   storing it.
 - **`--force`** securely overwrites an existing `<path>` (eight alternating
   zero/random passes, each flushed with `F_FULLFSYNC`) before replacing it.
   It refuses a file over 64 KiB, as the Linux tool does: a wrapped key is
-  125 bytes, so anything far bigger at the key path isn't one. A `--fingerprint` mismatch is detected before the overwrite
+  125 bytes, so anything far bigger at the key path isn't one. When the
+  existing file is a wrapped key and `--fingerprint` is not given, the KEK
+  that file was wrapped under is the pin. A wrap under a different KEK is
+  refused, with both fingerprints named. To move a service to a deliberately
+  replaced KEK (re-provisioned after `retire`), name the new KEK with
+  `--fingerprint`. Either mismatch is detected before the overwrite
   starts, so the existing file is left intact. It only ever
   touches a **regular file with a single link**: a symlink at `<path>` is
   refused rather than followed (`O_NOFOLLOW` + `fstat`), and so is a file
@@ -1743,7 +1794,8 @@ Three Swift Testing suites:
   subprocess: `provision`/`wrap`/`status`/`retire` semantics, DEK sources
   and their bounds (whitespace, oversized, non-ASCII, missing file),
   rejected arguments, `wrap --fingerprint` (match, mismatch leaves an
-  existing file untouched, malformed), `retire` by fingerprint and
+  existing file untouched, malformed, the unpinned-wrap warning), `wrap
+  --force` pinned to the replaced key file's KEK, `retire` by fingerprint and
   `--corrupt`, `--force` symlink/hard-link/FIFO refusal, the 64 KiB size cap
   and a full overwrite at that cap, file permissions, exit codes, and —
   hosted — the bundled CLI's data-protection provision/wrap/retire with
