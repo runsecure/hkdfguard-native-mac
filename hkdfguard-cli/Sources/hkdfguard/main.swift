@@ -15,8 +15,11 @@
 //              ONLY command that deletes keys, and deliberately implemented
 //              here rather than in the library: the dylib's C ABI offers no
 //              delete, so no consumer that loads it gets a one-call wipe.
-//              Everything wrapped under a retired KEK is permanently
-//              unrecoverable -- retire only after migrating to a new service.
+//              Everything wrapped under a retired KEK stops unwrapping --
+//              retire only after migrating to a new service. Not a
+//              crypto-shred: a backup or APFS snapshot taken before the
+//              retire still holds the KEK, and restoring it on this Mac
+//              revives every payload under it.
 //   status     reports the keychain mode, whether a service's KEK exists, and
 //              its fingerprint. Read-only: never creates or deletes a key.
 //
@@ -356,8 +359,10 @@ func printUsage() {
                       Prints the fingerprint of the KEK the payload was wrapped under.
           retire      delete the KEK for <name>, only if its fingerprint matches <hex>
                       (64 hex characters, as printed by provision). The only command
-                      that deletes keys. Everything wrapped under that KEK becomes
-                      permanently unrecoverable: migrate to a new service name first.
+                      that deletes keys. Everything wrapped under that KEK stops
+                      unwrapping: migrate to a new service name first. A backup or
+                      APFS snapshot taken before the retire still holds the KEK;
+                      restoring it on this Mac revives every payload under it.
                       With --corrupt instead, deletes the item only if the library
                       reports it as corrupt (-19) and the Secure Enclave is proven
                       usable in this session, so a healthy KEK that merely could not
@@ -1972,7 +1977,7 @@ func runRetire(_ args: RetireArgs) throws {
         try retireKEK(service: service, expectedFingerprint: fingerprint)
         auditKekRetired(service: service, fingerprint: fingerprint, scope: keychainModeName())
         print("retired KEK for service \"\(service)\" (fingerprint \(hexString(fingerprint)), keychain: \(keychainModeName()))")
-        print("every payload wrapped under it is now permanently unrecoverable")
+        print("no payload wrapped under it unwraps now -- unless the keychain is restored from a backup or APFS snapshot taken before this retire")
     case .corrupt:
         try retireCorruptKEK(service: service)
         print("retired corrupt KEK item for service \"\(service)\" (keychain: \(keychainModeName())); service \"\(service)\" can now be provisioned again")
@@ -2181,7 +2186,7 @@ func runRetireMachine(service: String, confirmation: RetireConfirmation, policy:
         try deleteMachineKeyFile(policy: policy, service: service)
         auditKekRetired(service: service, fingerprint: expected, scope: "machine")
         print("retired machine KEK for service \"\(service)\" (fingerprint \(hexString(expected)))")
-        print("every payload wrapped under it is now permanently unrecoverable")
+        print("no payload wrapped under it unwraps now -- unless the KEK file is restored from an APFS snapshot or a backup taken before this retire")
     case .corrupt:
         let (status, _) = kekExistsStatus(service: service)
         guard status == HKDFGuardStatus.kekCorrupted.rawValue else {

@@ -1413,7 +1413,23 @@ private func openMachineKeyFolderCreatingIt(service: String) -> Int32? {
         close(fd)
         return nil
     }
+    // On every provision, not just the first, so a folder made by an older
+    // build is excluded too. Not fatal: the KEK is no less usable for it.
+    if !excludeFromBackup(url.path) {
+        logMachineRefusal(service, "\(url.path) could not be excluded from Time Machine; a backup of it would let a retired KEK be restored")
+    }
     return fd
+}
+
+/// Excludes the folder at `path` from Time Machine, so a retired machine
+/// KEK can't come back from a backup. A sticky exclusion: it stays with the
+/// folder if it moves. Backup tools that ignore it, and local APFS
+/// snapshots, still keep copies; deleting the KEK file can't reach those.
+func excludeFromBackup(_ path: String) -> Bool {
+    var url = URL(fileURLWithPath: path, isDirectory: true)
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    return (try? url.setResourceValues(values)) != nil
 }
 
 private enum MachineKeyWrite {

@@ -319,7 +319,8 @@ extern "C" {
 // A service listed in MachineServices has a machine KEK: a Secure Enclave
 // key created by root in the system context (a LaunchDaemon -- the CLI's
 // `provision` does this), kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-// kept in /Library/Application Support/HkdfGuard/keks/<service>.kek, owned
+// kept in /Library/Application Support/HkdfGuard/keks/<service>.kek (the
+// folder excluded from Time Machine; local snapshots still hold it), owned
 // root:<RunnerGroup>, mode 0640 (0600 with no RunnerGroup). Its consumers
 // call the same functions as always, and:
 //

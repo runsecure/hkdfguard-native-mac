@@ -597,11 +597,20 @@ has already unwrapped every DEK they could reach. Recover in this order:
 2. Generate **new DEKs**, re-encrypt the data, and `wrap` them under the new
    service.
 3. Only then `retire` the old service's KEK. Anything still wrapped under it
-   becomes permanently unrecoverable.
+   stops unwrapping.
 
-A legacy-mode KEK item can come back if a backup of the login keychain
-taken before retirement is restored onto the same Mac; account for backups
-if the goal is a true crypto-shred.
+`retire` is not a crypto-shred. It deletes the KEK's keychain item or key
+file, which holds the Secure Enclave key in the only form it is stored in.
+A copy taken before the retire still holds it: a Time Machine or other
+backup of the login keychain or of `/Library/Application Support`, or a
+local APFS snapshot. Restored onto the same Mac, that copy unwraps every
+payload under the KEK again. (On another Mac it is useless: only this Mac's
+Secure Enclave can use it.) The machine KEK folder is excluded from Time
+Machine, but local snapshots and backup tools that ignore Time Machine's
+exclusions still keep it. If a retire must hold, delete the local snapshots
+taken before it (`tmutil listlocalsnapshots /`, then
+`sudo tmutil deletelocalsnapshots <date>`) and any backups that hold the
+KEK.
 
 ## Production mode: machine-scoped KEKs
 
@@ -703,8 +712,9 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
 - **`wrap` gives the key file to the `RunnerGroup`** (`0640`) unless
   `--group` says otherwise, so the daemons can read it.
 - **`retire` deletes the KEK file** after confirming the fingerprint, and
-  writes audit event 1004. Every payload wrapped under it becomes
-  unrecoverable.
+  writes audit event 1004. Every payload wrapped under it stops unwrapping,
+  unless the file comes back from a snapshot or backup (see "If a KEK is
+  compromised").
 
 ### What the runtime can and can't do
 
@@ -722,7 +732,9 @@ service:
   `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). It holds the
   public key and the Secure Enclave key blob, which is usable only by this
   Mac's Secure Enclave, in the system context, after the first unlock since
-  boot (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). A file that
+  boot (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). `provision`
+  excludes the `keks` folder from Time Machine; local APFS snapshots still
+  hold it. A file that
   isn't root's, that anyone else can write, that others can read, or that
   this library didn't write is `-19` (`KEK_INVALID`).
 - **Root is trusted.** Root can read the file and install a LaunchDaemon, so
