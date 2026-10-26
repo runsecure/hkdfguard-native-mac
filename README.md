@@ -165,9 +165,10 @@ Declared in
 [`hkdfguard.h`](HkdfGuardNativeMacOS/hkdfguard.h)
 (plain C; `extern "C"`-guarded; nullability-annotated). All pointers are
 required — a NULL is reported, never dereferenced — except `out` in a size
-probe (`out = NULL`, `*out_len = 0`), as on Linux. `hkdfguard_keychain_mode`
-and `hkdfguard_kek_fingerprint` are macOS-only; everything else is the C ABI
-shared with Linux and Windows.
+probe (`out = NULL`, `*out_len = 0`), as on Linux. `hkdfguard_keychain_mode`,
+`hkdfguard_kek_fingerprint` and `hkdfguard_machine_policy` (the KEK policy in
+effect, as JSON; the CLI uses it to enforce the admin roles) are macOS-only;
+everything else is the C ABI shared with Linux and Windows.
 
 ```c
 int hkdfguard_keychain_mode(int* out_mode);          // macOS-only: 0 legacy, 1 data-protection
@@ -182,6 +183,7 @@ int hkdfguard_generate_and_wrap_dek(const char* service, uint8_t* out, int* out_
 int hkdfguard_open_file(const char* path, uint8_t* out, int* out_len); // reads a 125-byte payload file
 int hkdfguard_harden_process(void);                           // opt-in; see below
 int hkdfguard_harden_process_with_flags(unsigned int flags);
+int hkdfguard_machine_policy(uint8_t* out, int* out_len); // macOS-only: the policy in effect, as JSON
 ```
 
 `*out_len` is the buffer capacity on entry and, on return, either the bytes
@@ -324,7 +326,7 @@ reach `out` only on success; on any failure the whole declared capacity of
   directory components resolve as usual, so `/etc/...` works. A FIFO,
   socket, directory, or device is refused without blocking. Every check is
   made on the opened descriptor (`fstat`), so it describes the file that is
-  actually read. At most 147 bytes are read, and a file larger than a
+  actually read. At most 126 bytes are read, and a file larger than a
   payload is rejected from its size before any read.
 - **Ownership.** The file must be owned by the process's effective user
   **or by root**, and writable by no one but its owner, or it is
@@ -437,6 +439,7 @@ here are defined there but never returned on macOS.
 | `-17` | `ERR_KEK_NOT_FOUND` | `kekNotFound` | no KEK for this service in this process's keychain mode; call `hkdfguard_create_kek` |
 | `-18` | `ERR_KEK_ACCESS_DENIED` | `keychainAccessDenied` | locked keychain / no UI session / ACL denial / declined prompt / missing entitlement / Secure Enclave won't load keys in this session (keybag locked, e.g. SSH after `security unlock-keychain`). **A key likely exists**; don't create or delete anything |
 | `-19` | `ERR_KEK_INVALID` | `kekCorrupted` | an item exists but can't be reconstructed into a key, and a throwaway probe key shows the enclave works in this session; never auto-replaced |
+| `-20` | `ERR_PROCESS_HARDENING_FAILED` | `processHardeningFailed` | `hkdfguard_harden_process` couldn't disable core dumps or debugger attachment, or (with `HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE`) the process can still be debugged by its own user |
 | `-32` | `ERR_FILE_NOT_FOUND` | `fileNotFound` | no file at the path, or a path component is not a directory (`hkdfguard_open_file` only, as are `-33` to `-39`) |
 | `-33` | `ERR_FILE_ACCESS_DENIED` | `fileAccessDenied` | this process may not read the file or a directory on its path |
 | `-34` | `ERR_FILE_IO` | `fileIO` | a directory, FIFO, socket, or device; or `open`/`fstat`/`read` failed |
@@ -551,8 +554,7 @@ caught:
 The C ABI does none of this for you. `hkdfguard_wrap_dek` wraps under
 whatever item the service name resolves to. A consumer that wraps should
 compare the first 32 bytes of the payload with its recorded fingerprint
-before storing it (see `wrap --fingerprint` below). A library-side check
-driven by an existing key file is not implemented yet.
+before storing it (see `wrap --fingerprint` below). 
 
 ## Access policy and headless use
 
@@ -718,8 +720,8 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
 
 ### What the runtime can and can't do
 
-The application calls the same functions as always. For a machine-scoped
-service:
+The application calls the same functions as for a user-scoped KEK. For a
+machine-scoped service:
 
 - **Only LaunchDaemons can unwrap.** A process in a login session
   (Terminal, `sudo` from it, a GUI app, SSH) gets `-18`
@@ -773,7 +775,7 @@ hkdfguard status --service-name|-sn <name>
 hkdfguard wrap --key-file-path|-kf <path> \
                              --service-name|-sn <name> \
                              ( --dek-stdin | --dek-file <path> ) \
-                             [--fingerprint|-fp <64 hex chars>] [--force|-f]
+                             [--group|-g <name>] [--fingerprint|-fp <64 hex chars>] [--force|-f]
 
 hkdfguard retire --service-name|-sn <name> \
                                ( --fingerprint|-fp <64 hex chars> | --corrupt )
@@ -1006,7 +1008,7 @@ xcodebuild -project HkdfGuardNativeMacOS.xcodeproj \
   -target HkdfGuardNativeMacOSDylib -configuration Release build
 
 # CLI (links against build/Release by default; override with HKDFGUARD_DYLIB_DIR):
-swift build -c release --package-path hkdfguard
+swift build -c release --package-path hkdfguard-cli
 
 # Tests (real Secure Enclave required — see Tests):
 xcodebuild test -scheme HkdfGuardNativeMacOSTests
@@ -1731,9 +1733,9 @@ int status = hkdfguard_create_kek("com.example.ingest");
 `libhkdfguard.dylib` here by adding the platform's `lib` prefix and
 extension, so the same `DllImport` works wherever the library follows the
 standard naming -- including Linux, where the same name resolves to
-`libhkdfguard.so`. (Both libraries dropped an earlier `_v1` suffix from the
-name; the ABI's major version is carried by the install folder
-`HkdfGuard/v1/` here and by the `libhkdfguard.so.1` SONAME on Linux.)
+`libhkdfguard.so`. (The name carries no version; the ABI's major version is
+carried by the install folder `HkdfGuard/v1/` here and by the
+`libhkdfguard.so.1` SONAME on Linux.)
 
 ## Signing and entitlements
 
@@ -1777,12 +1779,12 @@ name; the ABI's major version is carried by the install folder
   others load the winner's key.
 - The Secure Enclave / `securityd` IPC layer has limited real concurrency.
   A handful of simultaneous enclave operations from one process is fine;
-  dozens cause severe contention (observed while building the test suite,
-  which runs serialized for that reason).
+  dozens cause severe contention (the test suite runs serialized for that
+  reason).
 
 ## Tests
 
-Three Swift Testing suites:
+Nine Swift Testing suites. The three largest:
 
 - **`HkdfGuardNativeMacOSWrapUnwrapTests`** (`.serialized`) exercises
   every C entry point in-process: provisioning, idempotence and the first-use race,
@@ -1812,6 +1814,13 @@ Three Swift Testing suites:
   and a full overwrite at that cap, file permissions, exit codes, and —
   hosted — the bundled CLI's data-protection provision/wrap/retire with
   this host unwrapping.
+
+Smaller suites cover the audit records (`HkdfGuardAuditTests`), process
+hardening (`HkdfGuardHardenProcessTests`), the setup gate
+(`HkdfGuardSetupGateTests`), the salt-to-point hash
+(`HkdfGuardPayloadPointTests`), the production policy
+(`HkdfGuardMachineScopeTests`), and the shared C ABI against the Linux
+header (`HkdfGuardCrossPlatformABITests`).
 
 The wrap/unwrap suite needs a real Secure Enclave and is skipped as a whole on
 CI/VM runners; `HkdfGuardOpenFileTests` runs everywhere; in the CLI suite only the tests that reach the enclave are
@@ -1859,26 +1868,25 @@ ships. `build-dist.sh` fails if a shipped bundle carries the test group, and
 groups are disjoint: a fixture provisioned for tests is invisible to
 production builds, and the reverse.
 
-Last full pass: **84 tests, both suites, no failures**, on real Secure
-Enclave hardware, in each of three runs:
+On real Secure Enclave hardware, each way of running skips some tests by
+design:
 
-- unhosted (legacy mode): nine skipped by design — the four
-  data-protection-only tests and the five interactive legacy tests;
-- hosted (data-protection mode, test group): including
+- unhosted (legacy mode): the four data-protection-only tests and the five
+  interactive legacy tests;
+- hosted (data-protection mode, test group): the five interactive legacy
+  tests (legacy-only by construction) and the one test that only makes
+  sense in an unentitled host. This run includes
   `dataProtectionModeStoresItemsOnlyInTheDataProtectionKeychain`,
   `bundledCliProvisionsAndWrapsInDataProtectionModeAndEntitledHostUnwraps`
   (the end-to-end cross-process round trip), `bundledCliRetiresDataProtectionKek`,
-  and `bundledCliRetiresCorruptDataProtectionItem`; six skipped — the five
-  interactive legacy tests (legacy-only by construction) and the one test
-  that only makes sense in an unentitled host;
+  and `bundledCliRetiresCorruptDataProtectionItem`;
 - unhosted with the interactive opt-in: only the four data-protection
-  tests skipped; all five legacy cross-process tests ran (including `cliRetireCorruptDeletesOnlyACorruptItem`, which plants a
-  corrupt item from another process). The first of them waited on the
-  keychain prompt; once approved, the rest completed in seconds.
+  tests. All five legacy cross-process tests run (including `cliRetireCorruptDeletesOnlyACorruptItem`, which plants a
+  corrupt item from another process). The first of them waits on the
+  keychain prompt; once approved, the rest complete in seconds.
 
 Every test that provisions a key is paired with a `defer` that deletes it,
-so a failing assertion still leaves the keychain clean; this was confirmed
-by inspecting the login keychain after the runs.
+so a failing assertion still leaves the keychain clean.
 
 The CLI suite runs an incremental build of the dylib and the CLI once per
 test run, so it always tests the current source rather than whatever
