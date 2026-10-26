@@ -34,10 +34,10 @@ Wrapping is the same construction as the Linux and Windows libraries:
 **ECDH against a hashed per-payload point, HKDF-SHA512, AES-256-GCM**, with
 CryptoKit doing every primitive:
 
-1. A fresh random 32-byte **salt** is hashed to a P-256 point `H`:
-   the first `SHA-256("HkdfGuard-P256-payload-ECDH-point-v1:" ‖ salt ‖ counter)`
-   that is a valid x-coordinate, taken with even Y (the Linux library's
-   hash, byte for byte).
+1. A fresh random 32-byte **salt** is hashed to a P-256 point `H` with
+   RFC 9380 hash-to-curve, suite `P256_XMD:SHA-256_SSWU_RO_`, under the DST
+   `"HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_"`
+   (the Linux library's hash, byte for byte).
 2. The **Secure Enclave** computes `Z = ECDH(KEK_priv, H)`.
 3. **HKDF-SHA512** turns `Z` into the 32-byte AES key, with the salt as
    HKDF's salt and an `info` of `"hkdfguard-wrap-v1:"` ‖ the service name's
