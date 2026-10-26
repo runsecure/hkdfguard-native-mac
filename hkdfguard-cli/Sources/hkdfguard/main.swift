@@ -83,7 +83,7 @@
 //   --dek-file <path>  base64 DEK read from a file. It must be a regular
 //                      file (not a symlink, FIFO, or device), owned by root
 //                      or by this process's user, granting no access to
-//                      group or others (mode 0400/0600), and not reached
+//                      group or others (e.g. mode 0400 or 0600), and not reached
 //                      through a symlinked folder -- the Linux tool's rule
 //                      (see openDekFile, openRealFolder).
 //
@@ -339,8 +339,23 @@ enum Command {
 
 let dekSourceFlags = "--dek-stdin | --dek-file <path>"
 
+// Writes `text` to standard error with write(2). FileHandle.standardError
+// raises an Objective-C exception, which Swift can't catch, when descriptor
+// 2 is closed; here a message that can't be delivered is dropped instead.
+func writeStderr(_ text: String) {
+    Array(text.utf8).withUnsafeBufferPointer { buffer in
+        var offset = 0
+        while offset < buffer.count {
+            let n = write(STDERR_FILENO, buffer.baseAddress! + offset, buffer.count - offset)
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return }
+            offset += n
+        }
+    }
+}
+
 func printUsage() {
-    FileHandle.standardError.write(
+    writeStderr(
         """
         Usage:
           \(programName) provision --service-name|-sn <name>
@@ -382,7 +397,7 @@ func printUsage() {
           --key-file-path|-kf <path>  where to write the wrapped payload
           --dek-stdin         read the base64 DEK from standard input
           --dek-file <path>   read the base64 DEK from a file (a regular file, not a
-                      symlink, owned by you or root, mode 0400 or 0600)
+                      symlink, owned by you or root, no group or other access)
           --group|-g <name>   also let this group read the file (mode 0640): a dedicated
                       group for the service that unwraps it, which you belong to;
                       broad groups (staff, everyone, admin, wheel, ...) are refused
@@ -395,7 +410,7 @@ func printUsage() {
         The DEK is never accepted as a command-line argument (it would be visible
         to other processes via ps and recorded in shell history).
 
-        """.data(using: .utf8)!
+        """
     )
 }
 
@@ -1228,7 +1243,7 @@ func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
 // and ownership/permission checks made against the *opened descriptor*
 // rather than the path, so nothing can be swapped between the check and the
 // read. The file must be a regular file owned by root or this process's
-// effective user, granting no access to group or others (0400/0600).
+// effective user, granting no access to group or others (e.g. 0400/0600).
 func openDekFile(_ spelledPath: String) throws -> Int32 {
     // No symbolic link in the folders above it either (see openRealFolder);
     // O_NOFOLLOW below covers the file itself, opened within the checked
@@ -1372,7 +1387,7 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     scratch.initializeMemory(as: UInt8.self, repeating: 0)
     let locked = mlock(scratch.baseAddress!, byteCount) == 0
     if !locked {
-        FileHandle.standardError.write("warning: could not lock the DEK's buffer into memory (mlock: \(String(cString: strerror(errno)))); it could be written to swap\n".data(using: .utf8)!)
+        writeStderr("warning: could not lock the DEK's buffer into memory (mlock: \(String(cString: strerror(errno)))); it could be written to swap\n")
     }
     defer {
         _ = memset_s(scratch.baseAddress!, byteCount, 0, byteCount)
@@ -2115,7 +2130,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
         if !machine {
             let mode = keychainModeName()
             let planters = mode == "legacy" ? "any process running as this user" : "any app in the same keychain access group"
-            FileHandle.standardError.write(Data("warning: this wrap was not pinned to a KEK -- no --fingerprint, and no existing key file to compare with. In \(mode) keychain mode \(planters) could have created the service's KEK item before provision did; pass --fingerprint <value printed by provision> on the first wrap\n".utf8))
+            writeStderr("warning: this wrap was not pinned to a KEK -- no --fingerprint, and no existing key file to compare with. In \(mode) keychain mode \(planters) could have created the service's KEK item before provision did; pass --fingerprint <value printed by provision> on the first wrap\n")
         }
     }
 }
@@ -2209,10 +2224,14 @@ func runOrExit(_ body: () throws -> Void) -> Never {
         try body()
         exit(0)
     } catch {
-        FileHandle.standardError.write("error: \(error)\n".data(using: .utf8)!)
+        writeStderr("error: \(error)\n")
         exit(1)
     }
 }
+
+// A write past RLIMIT_FSIZE fails with EFBIG instead of killing the process,
+// so writeWrappedKeyFile still removes the partial file it created.
+signal(SIGXFSZ, SIG_IGN)
 
 // Before anything is read: this process holds a plaintext DEK, so it must
 // not be dumpable or debuggable by other processes of the same user. Refuse
@@ -2225,7 +2244,7 @@ let hardenStatus = hkdfguard_harden_process()
 let hardenHint = ""
 #endif
 guard hardenStatus == HKDFGuardStatus.success.rawValue else {
-    FileHandle.standardError.write("error: \(describeStatus(hardenStatus))\(hardenHint); refusing to handle key material\n".data(using: .utf8)!)
+    writeStderr("error: \(describeStatus(hardenStatus))\(hardenHint); refusing to handle key material\n")
     exit(1)
 }
 
@@ -2247,7 +2266,7 @@ do {
     }
 } catch {
     // An argument-parsing failure: print the error and usage, then exit 2.
-    FileHandle.standardError.write("error: \(error)\n".data(using: .utf8)!)
+    writeStderr("error: \(error)\n")
     printUsage()
     exit(2)
 }

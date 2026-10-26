@@ -853,8 +853,8 @@ hkdfguard retire --service-name|-sn <name> \
   - *`--dek-file` rules (same as the Linux tool).* The file must be a
     regular file -- a symbolic link is refused, never followed, and a FIFO
     or device is refused without blocking -- owned by root or by the user
-    running the CLI, and grant no access to group or others (mode `0400` or
-    `0600`). Every check is made on the opened descriptor, so it describes
+    running the CLI, and grant no access to group or others (for example
+    mode `0400` or `0600`; the owner's bits aren't checked). Every check is made on the opened descriptor, so it describes
     the file that is read. A file carrying an access control list is
     refused too, whatever its mode bits: an ACL can grant read to anyone.
   - *No symbolic link above a path (same as the Linux tool).* Neither

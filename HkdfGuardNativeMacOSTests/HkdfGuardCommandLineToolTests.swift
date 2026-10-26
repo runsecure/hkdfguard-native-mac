@@ -1352,6 +1352,46 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!FileManager.default.fileExists(atPath: "/out.key"), "nothing may be created at the filesystem root")
     }
 
+    @Test func cliExitsNormallyWithTheStandardDescriptorsClosed() throws {
+        // A daemon or job runner can start the CLI with descriptors 0-2
+        // closed. Every message then has nowhere to go, but the exit code
+        // must still be the ordinary one: FileHandle.standardError would
+        // raise an uncatchable exception and abort (terminationStatus 6).
+        try Self.toolsBuilt.get()
+        for (arguments, expected) in [("--help", Int32(0)), ("status -sn 'bad!name'", 1), ("bogus", 2)] {
+            let result = try Self.run(
+                URL(fileURLWithPath: "/bin/sh"),
+                ["-c", "exec \"$0\" \(arguments) <&- >&- 2>&-", Self.cliExecutablePath]
+            )
+            #expect(result.exitCode == expected, "\(arguments): exit \(result.exitCode)")
+        }
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliLeavesNoPartialKeyFileWhenTheFileSizeLimitIsHit() throws {
+        // With RLIMIT_FSIZE below a payload, the default SIGXFSZ would kill
+        // the CLI mid-write and leave a truncated key file that blocks the
+        // retry with EEXIST. The CLI ignores the signal, so the write fails
+        // with EFBIG and the partial file is removed.
+        let service = "com.hkdfguard.tests.cli.fsize.limit"
+        defer { Self.deleteKEK(service: service) }
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        try Self.provision(service: service)
+
+        let result = try Self.run(
+            URL(fileURLWithPath: "/bin/sh"),
+            ["-c", "ulimit -f 0 && exec \"$0\" wrap -kf \"$1\" -sn \"$2\" --dek-stdin", Self.cliExecutablePath, keyFilePath, service],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(result.exitCode == 1, "exit \(result.exitCode): \(result.stderr)")
+        #expect(result.stderr.contains("File too large"), "stderr: \(result.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath), "a partial key file was left behind")
+
+        let retry = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"], stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(retry.exitCode == 0, "retry after the failed write: \(retry.stderr)")
+    }
+
     @Test func cliDekFileRefusesGroupOrOtherAccess() throws {
         for mode in [0o640, 0o604, 0o620, 0o602, 0o610, 0o644, 0o666] {
             let dekFilePath = Self.makeTempFilePath()
