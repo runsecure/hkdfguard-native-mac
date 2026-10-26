@@ -854,9 +854,13 @@ hkdfguard retire --service-name|-sn <name> \
     regular file -- a symbolic link is refused, never followed, and a FIFO
     or device is refused without blocking -- owned by root or by the user
     running the CLI, and grant no access to group or others (for example
-    mode `0400` or `0600`; the owner's bits aren't checked). Every check is made on the opened descriptor, so it describes
-    the file that is read. A file carrying an access control list is
-    refused too, whatever its mode bits: an ACL can grant read to anyone.
+    mode `0400` or `0600`; the owner's bits aren't checked). This is
+    stricter than what `hkdfguard_open_file` asks of a key file, which may
+    be group- or world-readable: the DEK file holds the plaintext key, the
+    key file only ciphertext. Every check is made on the opened descriptor,
+    so it describes the file that is read. A file carrying an access
+    control list is refused too, whatever its mode bits: an ACL can grant
+    read to anyone.
   - *No symbolic link above a path (same as the Linux tool).* Neither
     `--key-file-path` nor `--dek-file` may be reached through a symlinked
     folder: whoever could plant one where the operator writes could redirect

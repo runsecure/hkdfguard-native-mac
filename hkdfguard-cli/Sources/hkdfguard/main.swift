@@ -261,7 +261,7 @@ enum HKDFGuardStatus: Int32 {
         case .fileTooLong: return "the key file is longer than a wrapped DEK"
         case .fileUnprotectedKey: return "the key file appears to hold an UNWRAPPED DEK -- treat it as exposed"
         case .fileMalformed: return "the key file is not a well-formed wrapped DEK"
-        case .fileInsecure: return "the key file is owned by another user, writable by group or others, or hard-linked"
+        case .fileInsecure: return "the key file is a symbolic link, owned by another user, or writable by group or others"
         case .accessControlCreationFailed: return "failed to set up access control for a new key"
         case .keyGenerationFailed: return "the Secure Enclave refused to generate a new key"
         case .keychainWriteFailed: return "failed to persist the newly generated key to the keychain"
