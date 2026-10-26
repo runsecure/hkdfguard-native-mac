@@ -15,8 +15,11 @@
 //              ONLY command that deletes keys, and deliberately implemented
 //              here rather than in the library: the dylib's C ABI offers no
 //              delete, so no consumer that loads it gets a one-call wipe.
-//              Everything wrapped under a retired KEK is permanently
-//              unrecoverable -- retire only after migrating to a new service.
+//              Everything wrapped under a retired KEK stops unwrapping --
+//              retire only after migrating to a new service. Not a
+//              crypto-shred: a backup or APFS snapshot taken before the
+//              retire still holds the KEK, and restoring it on this Mac
+//              revives every payload under it.
 //   status     reports the keychain mode, whether a service's KEK exists, and
 //              its fingerprint. Read-only: never creates or deletes a key.
 //
@@ -80,7 +83,7 @@
 //   --dek-file <path>  base64 DEK read from a file. It must be a regular
 //                      file (not a symlink, FIFO, or device), owned by root
 //                      or by this process's user, granting no access to
-//                      group or others (mode 0400/0600), and not reached
+//                      group or others (e.g. mode 0400 or 0600), and not reached
 //                      through a symlinked folder -- the Linux tool's rule
 //                      (see openDekFile, openRealFolder).
 //
@@ -138,9 +141,9 @@ func hkdfguard_wrap_dek(
     _ outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32
 
-// The library's wrap calls never create a KEK. These two are used only by
-// the `provision` command (see `provisionKEK` below): ask whether one
-// exists, and create it only if the answer is a definite "no".
+// The library's wrap calls never create a KEK. `provision` is the only
+// command that calls hkdfguard_create_kek (see `provisionKEK` below);
+// hkdfguard_kek_exists also answers `retire` and `status`.
 @_silgen_name("hkdfguard_kek_exists")
 func hkdfguard_kek_exists(_ service: UnsafePointer<CChar>?, _ outExists: UnsafeMutablePointer<Int32>?) -> Int32
 
@@ -156,10 +159,6 @@ func hkdfguard_kek_fingerprint(
     _ outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32
 
-// Which keychain this process's KEK items live in (0 legacy, 1
-// data-protection) -- decided by the library from this executable's own
-// code-signing entitlements. Printed by both commands because a service's
-// provisioner and its consumers must agree on it; see the header.
 // Opt-in process hardening: core dumps off, debugger attachment denied. The
 // tool calls it before reading anything, as the Linux tool does.
 //
@@ -180,6 +179,11 @@ func hkdfguard_harden_process_with_flags(_ flags: UInt32) -> Int32
 
 let hardenRequireProtectedSignature: UInt32 = 0x1 // HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE
 
+// Which keychain this process's KEK items live in (0 legacy, 1
+// data-protection) -- decided by the library from this executable's own
+// code-signing entitlements. Printed by every command that reports a
+// user-scoped KEK, because a service's provisioner and its consumers must
+// agree on it.
 @_silgen_name("hkdfguard_keychain_mode")
 func hkdfguard_keychain_mode(_ outMode: UnsafeMutablePointer<Int32>?) -> Int32
 
@@ -257,7 +261,7 @@ enum HKDFGuardStatus: Int32 {
         case .fileTooLong: return "the key file is longer than a wrapped DEK"
         case .fileUnprotectedKey: return "the key file appears to hold an UNWRAPPED DEK -- treat it as exposed"
         case .fileMalformed: return "the key file is not a well-formed wrapped DEK"
-        case .fileInsecure: return "the key file is owned by another user, writable by group or others, or hard-linked"
+        case .fileInsecure: return "the key file is a symbolic link, owned by another user, or writable by group or others"
         case .accessControlCreationFailed: return "failed to set up access control for a new key"
         case .keyGenerationFailed: return "the Secure Enclave refused to generate a new key"
         case .keychainWriteFailed: return "failed to persist the newly generated key to the keychain"
@@ -335,8 +339,23 @@ enum Command {
 
 let dekSourceFlags = "--dek-stdin | --dek-file <path>"
 
+// Writes `text` to standard error with write(2). FileHandle.standardError
+// raises an Objective-C exception, which Swift can't catch, when descriptor
+// 2 is closed; here a message that can't be delivered is dropped instead.
+func writeStderr(_ text: String) {
+    Array(text.utf8).withUnsafeBufferPointer { buffer in
+        var offset = 0
+        while offset < buffer.count {
+            let n = write(STDERR_FILENO, buffer.baseAddress! + offset, buffer.count - offset)
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return }
+            offset += n
+        }
+    }
+}
+
 func printUsage() {
-    FileHandle.standardError.write(
+    writeStderr(
         """
         Usage:
           \(programName) provision --service-name|-sn <name>
@@ -356,8 +375,10 @@ func printUsage() {
                       Prints the fingerprint of the KEK the payload was wrapped under.
           retire      delete the KEK for <name>, only if its fingerprint matches <hex>
                       (64 hex characters, as printed by provision). The only command
-                      that deletes keys. Everything wrapped under that KEK becomes
-                      permanently unrecoverable: migrate to a new service name first.
+                      that deletes keys. Everything wrapped under that KEK stops
+                      unwrapping: migrate to a new service name first. A backup or
+                      APFS snapshot taken before the retire still holds the KEK;
+                      restoring it on this Mac revives every payload under it.
                       With --corrupt instead, deletes the item only if the library
                       reports it as corrupt (-19) and the Secure Enclave is proven
                       usable in this session, so a healthy KEK that merely could not
@@ -376,7 +397,7 @@ func printUsage() {
           --key-file-path|-kf <path>  where to write the wrapped payload
           --dek-stdin         read the base64 DEK from standard input
           --dek-file <path>   read the base64 DEK from a file (a regular file, not a
-                      symlink, owned by you or root, mode 0400 or 0600)
+                      symlink, owned by you or root, no group or other access)
           --group|-g <name>   also let this group read the file (mode 0640): a dedicated
                       group for the service that unwraps it, which you belong to;
                       broad groups (staff, everyone, admin, wheel, ...) are refused
@@ -389,7 +410,7 @@ func printUsage() {
         The DEK is never accepted as a command-line argument (it would be visible
         to other processes via ps and recorded in shell history).
 
-        """.data(using: .utf8)!
+        """
     )
 }
 
@@ -626,8 +647,9 @@ func parseWrap(_ arguments: [String]) throws -> Command {
             throw CLIError("\(arg) is not supported: a DEK on the command line is visible via ps and recorded in shell history; use \(dekSourceFlags)")
         default:
             if !arg.hasPrefix("-") {
-                // The key file path used to be positional; say so rather
-                // than leaving the caller to guess what went wrong.
+                // A bare argument is most likely a key file path given
+                // positionally; say how to pass it rather than leaving the
+                // caller to guess what went wrong.
                 throw CLIError("wrap: unexpected argument \"\(arg)\" -- the key file path is given with --key-file-path|-kf <path>")
             }
             throw CLIError("unrecognized argument for `wrap`: \(arg)")
@@ -691,23 +713,13 @@ func validateServiceCharset(_ service: String) throws {
 
 // MARK: - KEK provisioning (the `provision` command only)
 
-// Creates the KEK for `service` if none exists; returns true if one was
-// created, false if one already existed. hkdfguard_kek_exists first,
-// hkdfguard_create_kek only on a definite "no key yet". Anything other than
-// a clean yes/no from the exists check -- keychainAccessDenied,
-// keychainReadFailed, kekCorrupted, enclaveUnavailable -- stops here with
-// that specific reason, rather than falling through to a create attempt
-// whose failure would be reported against the wrong step.
-//
-// This is the only place in the tool that calls either function: `wrap`
-// never checks for or creates a KEK.
 // `provision`: the only place the setup calls are made. Always calls
 // hkdfguard_create_kek, whether or not the KEK exists, as the Linux and
 // Windows tools do: for an existing KEK that call loads the keychain item
 // and rebuilds the Secure Enclave key from it, so an item that exists but
 // can't be used (kekCorrupted, -19; an access denial, -18) fails here at
-// deployment rather than at the first wrap. kek_exists is still asked
-// first, only to report the outcome precisely -- "provisioned" versus
+// deployment rather than at the first wrap. kek_exists is asked first,
+// only to report the outcome precisely -- "provisioned" versus
 // "already provisioned". Neither call changes an existing KEK. Returns
 // whether the KEK was newly created.
 func provisionKEK(service: String) throws -> Bool {
@@ -1037,9 +1049,9 @@ func callWithWrappedBuffer(
     return Array(wrapped.prefix(Int(wrappedLen)))
 }
 
-// Wraps a caller-supplied DEK. Takes `dek` as `Data` rather than `[UInt8]`
-// so the caller's already-tightly-scoped, zero-on-exit buffer (see `run`
-// below) is the only copy of the plaintext DEK that ever exists --
+// Wraps a caller-supplied DEK. Takes `dek` as a raw buffer pointer rather
+// than `[UInt8]` so the caller's tightly scoped, zero-on-exit buffer (see
+// withSuppliedDek) is the only copy of the plaintext DEK that ever exists --
 // converting to `[UInt8]` first would leave a second, unzeroed copy sitting
 // in memory for the rest of the process's life.
 func wrapDek(service: String, dek: UnsafeRawBufferPointer) throws -> [UInt8] {
@@ -1231,7 +1243,7 @@ func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
 // and ownership/permission checks made against the *opened descriptor*
 // rather than the path, so nothing can be swapped between the check and the
 // read. The file must be a regular file owned by root or this process's
-// effective user, granting no access to group or others (0400/0600).
+// effective user, granting no access to group or others (e.g. 0400/0600).
 func openDekFile(_ spelledPath: String) throws -> Int32 {
     // No symbolic link in the folders above it either (see openRealFolder);
     // O_NOFOLLOW below covers the file itself, opened within the checked
@@ -1277,9 +1289,6 @@ func openDekFile(_ spelledPath: String) throws -> Int32 {
     return fd
 }
 
-
-// The Linux and Windows tools' messages, word for word.
-//
 // Deliberately fixed: it names no character, offset or bit pattern, so a
 // mistyped DEK never puts part of itself into a log.
 let invalidBase64DekMessage = "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)"
@@ -1301,10 +1310,9 @@ let utf16DekMessage = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-
 // alphabet, a length that is a multiple of 4, `=` only as the last one or
 // two characters, and zero in the bits the padding leaves unused) into
 // `out`, and returns how many bytes it decodes to -- or nil if `text` is
-// not that. The rules of the Linux tool's decoder (base64ct) and the
-// Windows tool's.
+// not that.
 //
-// Constant time with respect to the text, as both of theirs are: the only
+// Constant time with respect to the text. The only
 // branches are on its length, which is public; every character is
 // classified and accumulated with mask arithmetic, so how long this takes
 // says nothing about which character, if any, was wrong. Bytes are written
@@ -1379,7 +1387,7 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     scratch.initializeMemory(as: UInt8.self, repeating: 0)
     let locked = mlock(scratch.baseAddress!, byteCount) == 0
     if !locked {
-        FileHandle.standardError.write("warning: could not lock the DEK's buffer into memory (mlock: \(String(cString: strerror(errno)))); it could be written to swap\n".data(using: .utf8)!)
+        writeStderr("warning: could not lock the DEK's buffer into memory (mlock: \(String(cString: strerror(errno)))); it could be written to swap\n")
     }
     defer {
         _ = memset_s(scratch.baseAddress!, byteCount, 0, byteCount)
@@ -1433,11 +1441,11 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
 
     // Exactly one trailing newline (optionally CRLF) is tolerated, so a file
     // written by `printf '%s\n'` or an editor still works -- nothing else,
-    // as in the Linux tool: leading or other trailing whitespace is part of
+    // : leading or other trailing whitespace is part of
     // the input and fails to decode.
     // A leading UTF-8 byte-order mark, which some Windows tools (PowerShell,
     // .NET) prepend, is skipped; a UTF-16 one is refused as such, since the
-    // fix is on the sending side -- the Linux and Windows tools' rules.
+    // fix is on the sending side.
     let bytes = UnsafeRawBufferPointer(rebasing: input[0..<total])
     var start = 0
     if total >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
@@ -1466,8 +1474,8 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
         throw CLIError("\(flag): the DEK must decode to exactly \(dekLen) bytes, got \(decodedLength)")
     }
     // The base64 text has served its only purpose: zero it now, before the
-    // wrap, rather than when this function returns -- as the Linux tool
-    // does. Only the decoded DEK stays, for `body`.
+    // wrap, rather than when this function returns.
+    // Only the decoded DEK stays, for `body`.
     if let inputBase = input.baseAddress {
         _ = memset_s(inputBase, input.count, 0, input.count)
     }
@@ -1528,8 +1536,7 @@ func lookupGroup(_ spec: String) throws -> (gid: gid_t, name: String)? {
 
 // Resolves --group to the gid the key file is given, refusing a group that
 // doesn't exist or is over-broad. Done before the DEK is read or the Secure
-// Enclave is used, so a bad --group costs nothing. The Linux tool's
-// resolve_key_file_group.
+// Enclave is used, so a bad --group costs nothing.
 func resolveKeyFileGroup(_ spec: String) throws -> (gid: gid_t, name: String) {
     guard let found = try lookupGroup(spec) else {
         throw CLIError("--group \"\(spec)\" does not name a group on this host")
@@ -1581,47 +1588,9 @@ func writeAll(fd: Int32, bytes: UnsafeBufferPointer<UInt8>, context: String) thr
     }
 }
 
-// Before a --force overwrite is allowed to destroy an existing wrapped-key
-// file, this overwrites its *current* contents in place --
-// secureOverwritePassCount (8) alternating all-zero/random passes, each
-// flushed to the storage device (F_FULLFSYNC) before the next pass starts so they're
-// genuinely sequential rather than coalesced by the page cache -- and only
-// then deletes it. Only ever called when --force was passed; without
-// --force, an existing file is never touched at all (writeWrappedKeyFile's
-// plain O_EXCL create fails outright instead).
-//
-// If the file doesn't exist, this is a no-op. If it exists but can't be
-// opened for writing (EACCES/EPERM -- this tool doesn't own it), the
-// overwrite passes are skipped entirely and this falls back to a plain
-// `unlink`, per explicit product direction: destroying the old bytes first
-// is worth attempting, but not worth failing the whole command over when
-// this process isn't even allowed to write to the file it's about to
-// replace. That fallback still refuses anything that isn't a regular file.
-//
-// Only a regular file is ever written to or removed. The open uses
-// O_NOFOLLOW, so a symbolic link at `path` fails with ELOOP and is refused
-// outright rather than followed -- without it, a link planted at
-// <key-file-path> (trivial in a shared or world-writable directory) would
-// redirect the eight destructive passes onto whatever file it points at,
-// after which `unlink` would remove only the link. O_NONBLOCK keeps an
-// open on a reader-less FIFO from blocking forever, and the fstat check
-// after open rejects a FIFO, device node, or directory before a single
-// byte is written (a device node opened for writing by a privileged
-// invocation would otherwise be overwritten). It also rejects a regular
-// file with more than one hard link: a hard link planted at <key-file-path>
-// is indistinguishable from the original file to O_NOFOLLOW and S_IFREG,
-// so without this check the passes would destroy the shared contents of
-// whatever file it was linked to.
-//
-// Caveat this can't fully solve, worth knowing rather than assuming away:
-// on copy-on-write/log-structured filesystems (e.g. APFS) and on SSDs
-// generally (wear leveling), writing new bytes to a file's logical offsets
-// does not guarantee those bytes land on the same physical storage cells
-// the old bytes occupied -- the old bytes can persist in already-copied-
-// away or already-remapped blocks until the medium itself reclaims them.
-// This is a best-effort measure against casual recovery (e.g. `strings` on
-// the raw device, a filesystem-level undelete), not a cryptographic
-// guarantee against a determined attacker with access to the raw flash.
+// Refuses anything --force must not overwrite or remove: a symbolic link,
+// a non-regular file, a file with other hard links, or one far larger than
+// a wrapped key.
 func requireRegularFile(_ st: stat, path: String) throws {
     switch st.st_mode & S_IFMT {
     case S_IFREG:
@@ -1701,7 +1670,7 @@ func existingKeyFileFingerprint(_ folder: CheckedFolder) -> [UInt8]? {
 
 // Removes `folder.leaf` -- but only while that name still refers to the
 // file open as `fd` (same device and inode): a file someone put at the name
-// in the meantime is left alone. The Linux tool's remove_created_file.
+// in the meantime is left alone.
 func unlinkIfStillSame(_ folder: CheckedFolder, fd: Int32) -> Bool {
     var opened = stat()
     var named = stat()
@@ -1712,7 +1681,47 @@ func unlinkIfStillSame(_ folder: CheckedFolder, fd: Int32) -> Bool {
     return unlinkat(folder.fd, folder.leaf, 0) == 0
 }
 
-
+// Before a --force overwrite is allowed to destroy an existing wrapped-key
+// file, this overwrites its *current* contents in place --
+// secureOverwritePassCount (8) alternating all-zero/random passes, each
+// flushed to the storage device (F_FULLFSYNC) before the next pass starts so they're
+// genuinely sequential rather than coalesced by the page cache -- and only
+// then deletes it. Only ever called when --force was passed; without
+// --force, an existing file is never touched at all (writeWrappedKeyFile's
+// plain O_EXCL create fails outright instead).
+//
+// If the file doesn't exist, this is a no-op. If it exists but can't be
+// opened for writing (EACCES/EPERM -- this tool doesn't own it), the
+// overwrite passes are skipped entirely and this falls back to a plain
+// `unlink`: destroying the old bytes first
+// is worth attempting, but not worth failing the whole command over when
+// this process isn't even allowed to write to the file it's about to
+// replace. That fallback still refuses anything that isn't a regular file.
+//
+// Only a regular file is ever written to or removed. The open uses
+// O_NOFOLLOW, so a symbolic link at `path` fails with ELOOP and is refused
+// outright rather than followed -- without it, a link planted at
+// <key-file-path> (trivial in a shared or world-writable directory) would
+// redirect the eight destructive passes onto whatever file it points at,
+// after which `unlink` would remove only the link. O_NONBLOCK keeps an
+// open on a reader-less FIFO from blocking forever, and the fstat check
+// after open rejects a FIFO, device node, or directory before a single
+// byte is written (a device node opened for writing by a privileged
+// invocation would otherwise be overwritten). It also rejects a regular
+// file with more than one hard link: a hard link planted at <key-file-path>
+// is indistinguishable from the original file to O_NOFOLLOW and S_IFREG,
+// so without this check the passes would destroy the shared contents of
+// whatever file it was linked to.
+//
+// Caveat this can't fully solve, worth knowing rather than assuming away:
+// on copy-on-write/log-structured filesystems (e.g. APFS) and on SSDs
+// generally (wear leveling), writing new bytes to a file's logical offsets
+// does not guarantee those bytes land on the same physical storage cells
+// the old bytes occupied -- the old bytes can persist in already-copied-
+// away or already-remapped blocks until the medium itself reclaims them.
+// This is a best-effort measure against casual recovery (e.g. `strings` on
+// the raw device, a filesystem-level undelete), not a cryptographic
+// guarantee against a determined attacker with access to the raw flash.
 func secureOverwriteAndRemoveIfExists(_ folder: CheckedFolder, display path: String) throws {
     let fd = openat(folder.fd, folder.leaf, O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     guard fd >= 0 else {
@@ -1760,9 +1769,8 @@ func secureOverwriteAndRemoveIfExists(_ folder: CheckedFolder, display path: Str
     if fileSize > 0 {
         // One fixed-size chunk, reused for every write of every pass: memory
         // use is bounded by secureOverwriteChunkSize however large the file
-        // is. The previous implementation allocated the whole file, so a
-        // --force pointed at a multi-gigabyte file by mistake meant gigabytes
-        // of RAM on top of the eight full-size writes.
+        // is, so a --force pointed at a multi-gigabyte file by mistake
+        // doesn't also cost gigabytes of RAM.
         let chunkCapacity = min(fileSize, secureOverwriteChunkSize)
         var chunk = [UInt8](repeating: 0, count: chunkCapacity)
         // Scrub the chunk (random bytes from the last random pass, or zeros)
@@ -1843,6 +1851,23 @@ func flushFolder(_ folder: CheckedFolder) throws {
 }
 
 
+// Removes the file's access control list, if it has one, and confirms it is
+// gone. acl_set_fd with an empty ACL clears the extended ACL on APFS/HFS+;
+// the re-read is the guarantee, whatever the call did.
+func stripACL(fd: Int32, path: String) throws {
+    if let existing = acl_get_fd(fd) {
+        acl_free(UnsafeMutableRawPointer(existing))
+        if let empty = acl_init(0) {
+            defer { acl_free(UnsafeMutableRawPointer(empty)) }
+            _ = acl_set_fd(fd, empty)
+        }
+        if let still = acl_get_fd(fd) {
+            acl_free(UnsafeMutableRawPointer(still))
+            throw CLIError("\(path) inherited an access control list from its folder that could not be removed; the file's permissions would not be what was asked for -- use a folder without an inheritable ACL (ls -lde shows it; chmod -N removes it)")
+        }
+    }
+}
+
 // Writes `bytes` to a new file at `path` with `keyFilePermissions`, durably,
 // or leaves no file behind.
 //
@@ -1863,26 +1888,9 @@ func flushFolder(_ folder: CheckedFolder) throws {
 //
 // With `group`, the file is given that group on the open descriptor
 // (fchown) before its mode widens to 0640 and before a byte is written, so
-// the payload never sits in it under any other group -- as the Linux tool
-// does. A caller who isn't root can only give a group they belong to: the
+// the payload never sits in it under any other group.
+// A caller who isn't root can only give a group they belong to: the
 // kernel's rule, reported plainly, and the empty file removed.
-// Removes the file's access control list, if it has one, and confirms it is
-// gone. acl_set_fd with an empty ACL clears the extended ACL on APFS/HFS+;
-// the re-read is the guarantee, whatever the call did.
-func stripACL(fd: Int32, path: String) throws {
-    if let existing = acl_get_fd(fd) {
-        acl_free(UnsafeMutableRawPointer(existing))
-        if let empty = acl_init(0) {
-            defer { acl_free(UnsafeMutableRawPointer(empty)) }
-            _ = acl_set_fd(fd, empty)
-        }
-        if let still = acl_get_fd(fd) {
-            acl_free(UnsafeMutableRawPointer(still))
-            throw CLIError("\(path) inherited an access control list from its folder that could not be removed; the file's permissions would not be what was asked for -- use a folder without an inheritable ACL (ls -lde shows it; chmod -N removes it)")
-        }
-    }
-}
-
 func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
     if force {
         try secureOverwriteAndRemoveIfExists(folder, display: path)
@@ -1972,7 +1980,7 @@ func runRetire(_ args: RetireArgs) throws {
         try retireKEK(service: service, expectedFingerprint: fingerprint)
         auditKekRetired(service: service, fingerprint: fingerprint, scope: keychainModeName())
         print("retired KEK for service \"\(service)\" (fingerprint \(hexString(fingerprint)), keychain: \(keychainModeName()))")
-        print("every payload wrapped under it is now permanently unrecoverable")
+        print("no payload wrapped under it unwraps now -- unless the keychain is restored from a backup or APFS snapshot taken before this retire")
     case .corrupt:
         try retireCorruptKEK(service: service)
         print("retired corrupt KEK item for service \"\(service)\" (keychain: \(keychainModeName())); service \"\(service)\" can now be provisioned again")
@@ -2062,9 +2070,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // (for a machine-scoped service, its RunnerGroup if it has one).
     let group = try (args.groupName ?? (machine ? policy.runnerGroup(args.serviceName) : nil)).map(resolveKeyFileGroup)
 
-    // `wrap` never checks for or creates a KEK -- hkdfguard_kek_exists and
-    // hkdfguard_create_kek belong to the `provision` command alone. With no
-    // KEK for this service hkdfguard_wrap_dek fails with kekNotFound before
+    // `wrap` never checks for or creates a KEK. With no KEK for this service hkdfguard_wrap_dek fails with kekNotFound before
     // touching anything, which callWithWrappedBuffer reports as "run
     // provision first".
     // The DEK exists in plaintext only inside this closure: withSuppliedDek
@@ -2124,7 +2130,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
         if !machine {
             let mode = keychainModeName()
             let planters = mode == "legacy" ? "any process running as this user" : "any app in the same keychain access group"
-            FileHandle.standardError.write(Data("warning: this wrap was not pinned to a KEK -- no --fingerprint, and no existing key file to compare with. In \(mode) keychain mode \(planters) could have created the service's KEK item before provision did; pass --fingerprint <value printed by provision> on the first wrap\n".utf8))
+            writeStderr("warning: this wrap was not pinned to a KEK -- no --fingerprint, and no existing key file to compare with. In \(mode) keychain mode \(planters) could have created the service's KEK item before provision did; pass --fingerprint <value printed by provision> on the first wrap\n")
         }
     }
 }
@@ -2181,7 +2187,7 @@ func runRetireMachine(service: String, confirmation: RetireConfirmation, policy:
         try deleteMachineKeyFile(policy: policy, service: service)
         auditKekRetired(service: service, fingerprint: expected, scope: "machine")
         print("retired machine KEK for service \"\(service)\" (fingerprint \(hexString(expected)))")
-        print("every payload wrapped under it is now permanently unrecoverable")
+        print("no payload wrapped under it unwraps now -- unless the KEK file is restored from an APFS snapshot or a backup taken before this retire")
     case .corrupt:
         let (status, _) = kekExistsStatus(service: service)
         guard status == HKDFGuardStatus.kekCorrupted.rawValue else {
@@ -2212,21 +2218,24 @@ func wrapDekInSystemContext(service: String, dek: UnsafeRawBufferPointer) throws
 // MARK: - Entry point
 
 // Runs a command body; a runtime failure prints the error and exits 1 --
-// distinct from an argument-parsing failure (exit 2) below, matching the
-// Linux tool's own exit-code convention.
+// distinct from an argument-parsing failure (exit 2) below.
 func runOrExit(_ body: () throws -> Void) -> Never {
     do {
         try body()
         exit(0)
     } catch {
-        FileHandle.standardError.write("error: \(error)\n".data(using: .utf8)!)
+        writeStderr("error: \(error)\n")
         exit(1)
     }
 }
 
+// A write past RLIMIT_FSIZE fails with EFBIG instead of killing the process,
+// so writeWrappedKeyFile still removes the partial file it created.
+signal(SIGXFSZ, SIG_IGN)
+
 // Before anything is read: this process holds a plaintext DEK, so it must
 // not be dumpable or debuggable by other processes of the same user. Refuse
-// to run rather than handle a DEK unprotected -- the Linux tool's rule.
+// to run rather than handle a DEK unprotected.
 #if HKDFGUARD_STRICT_HARDENING
 let hardenStatus = hkdfguard_harden_process_with_flags(hardenRequireProtectedSignature)
 let hardenHint = " -- this distribution build must be signed with the Hardened Runtime and without get-task-allow"
@@ -2235,7 +2244,7 @@ let hardenStatus = hkdfguard_harden_process()
 let hardenHint = ""
 #endif
 guard hardenStatus == HKDFGuardStatus.success.rawValue else {
-    FileHandle.standardError.write("error: \(describeStatus(hardenStatus))\(hardenHint); refusing to handle key material\n".data(using: .utf8)!)
+    writeStderr("error: \(describeStatus(hardenStatus))\(hardenHint); refusing to handle key material\n")
     exit(1)
 }
 
@@ -2257,7 +2266,7 @@ do {
     }
 } catch {
     // An argument-parsing failure: print the error and usage, then exit 2.
-    FileHandle.standardError.write("error: \(error)\n".data(using: .utf8)!)
+    writeStderr("error: \(error)\n")
     printUsage()
     exit(2)
 }

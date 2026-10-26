@@ -5,7 +5,8 @@
 #
 #   - provision: refused without root, refused for an admin outside
 #     SecurityAdminGroup, then a machine KEK created by the one-off system
-#     job, owned root:<RunnerGroup> 0640; a second run verifies it
+#     job, owned root:<RunnerGroup> 0640, its folder excluded from Time
+#     Machine; a second run verifies it
 #   - wrap: refused for an admin outside DeploymentAdminGroup, then done in
 #     the system job, --fingerprint confirmed, the key file given to the
 #     runner group by default
@@ -178,6 +179,7 @@ expect "provision creates the machine KEK" "machine KEK provisioned" "$OUT"
 FP=$(sed -n 's/^fingerprint: \([0-9a-f]\{64\}\) .*/\1/p' <<<"$OUT")
 [ ${#FP} -eq 64 ] && pass "provision printed a fingerprint" || fail "provision printed no fingerprint: $OUT"
 expect "the KEK file is root:$GROUP 0640" "root:$GROUP 640" "$(stat -f '%Su:%Sg %Lp' "$KEKS/$SERVICE.kek" 2>&1)"
+expect "the KEK folder is excluded from Time Machine" "\\[Excluded\\]" "$(tmutil isexcluded "$KEKS" 2>&1)"
 OUT=$("$CLI" provision -sn $SERVICE 2>&1)
 expect "a second provision verifies, not replaces" "already provisioned.*verified" "$OUT"
 expect "with the same fingerprint" "fingerprint: $FP" "$OUT"

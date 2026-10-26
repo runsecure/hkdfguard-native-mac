@@ -19,16 +19,15 @@ import CryptoKit
 /// recovered by *application code* (the library, called directly here the
 /// same way a consuming app would) via `hkdfguard_unwrap_dek`.
 ///
-/// That last point is confirmed to work correctly (byte-for-byte, proven
-/// below) but is NOT free of ceremony: the CLI tool and this test host are
+/// That last point works correctly (byte-for-byte, proven below) but is
+/// NOT free of ceremony: the CLI tool and this test host are
 /// two differently-signed binaries, and the Secure Enclave key the CLI
 /// creates is persisted as an ordinary keychain item with no shared
 /// `kSecAttrAccessGroup` (see the comment in
 /// HkdfGuardNativeMacOS.entitlements on why not). Its default ACL
 /// therefore trusts exactly the creating binary's code signature, or
 /// falls back to an interactive macOS keychain-access prompt for anyone
-/// else — confirmed directly in the system log (`log show`) while
-/// developing this suite:
+/// else, as the system log (`log show`) shows:
 ///
 ///   securityd: displaying keychain prompt for .../xctest(59175);
 ///   ACL: ThresholdAclSubject(1 of 2)
@@ -37,12 +36,10 @@ import CryptoKit
 ///
 /// The first time this test host (as a new, not-yet-approved requesting
 /// identity) reads a keychain item the CLI created, that prompt appears
-/// and blocks until a human clicks it — observed taking over half an hour
-/// in an unattended run. Once approved, that identity seems to be trusted
-/// going forward: three more CLI→app round trips in the same run
-/// afterward completed in single-digit seconds each, not the same long
-/// wait. See `interactiveKeychainAccessEnabled` below for how the affected
-/// tests are gated because of this.
+/// and blocks until a human clicks it, indefinitely in an unattended run.
+/// Once approved, that identity stays trusted: later CLI→app round trips
+/// complete in seconds. See `interactiveKeychainAccessEnabled` below for
+/// how the affected tests are gated because of this.
 ///
 /// This is not just a test-environment quirk: it's the same prompt a real
 /// differently-signed consuming application would hit in production
@@ -50,9 +47,9 @@ import CryptoKit
 /// group entitlement between them.
 ///
 /// Separately: the *first* CLI subprocess launch after a freshly built
-/// binary was also observed to take several seconds longer than later
-/// launches — Gatekeeper's first-launch check, most likely — independent
-/// of the keychain-prompt issue above. `toolsBuilt`
+/// binary takes several seconds longer than later launches —
+/// Gatekeeper's first-launch check, most likely — independent of the
+/// keychain-prompt issue above. `toolsBuilt`
 /// below deliberately builds the tool once, up front, outside of any
 /// individual test's timing, so that one-time cost doesn't land on
 /// whichever test happens to run first.
@@ -77,7 +74,7 @@ struct HkdfGuardCommandLineToolTests {
     /// prefixed `TEST_RUNNER_` to the test process, prefix stripped:
     /// `TEST_RUNNER_HKDFGUARD_RUN_INTERACTIVE_KEYCHAIN_TESTS=1 xcodebuild test ...`.
     /// A bare `HKDFGUARD_RUN_INTERACTIVE_KEYCHAIN_TESTS=1 xcodebuild test`
-    /// is silently dropped and the tests stay skipped (observed directly). They're excluded
+    /// is silently dropped and the tests stay skipped. They're excluded
     /// from the default run — rather than left enabled and just slow —
     /// because the *first* time they run against a keychain/machine that
     /// hasn't already approved this test host's identity, macOS shows a
@@ -172,12 +169,10 @@ struct HkdfGuardCommandLineToolTests {
     /// parent blocks in `waitUntilExit` waiting for the child. The CLI
     /// itself writes a line or two, but this same helper also launches
     /// `xcodebuild` and `swift build` (via `buildDylib`/
-    /// `buildCLI`), whose logs are far larger than 64KB — observed
-    /// directly: on a clean checkout the nested Release-dylib build
-    /// finished its work in under a minute and then sat for 20 minutes
-    /// blocked in `write` on a full 65536-byte pipe, with this test host
-    /// parked in `waitUntilExit`. That is what a "hanging" CLI test looked
-    /// like from the outside.
+    /// `buildCLI`), whose logs are far larger than 64KB: read late, the
+    /// nested Release-dylib build would block in `write` on a full pipe
+    /// with this test host parked in `waitUntilExit`, and the CLI tests
+    /// would appear to hang.
     ///
     /// `stdin`, when given, is written to the child's standard input and
     /// then closed; otherwise the child's stdin is /dev/null, so no child
@@ -197,15 +192,12 @@ struct HkdfGuardCommandLineToolTests {
         // the test bundle can find HkdfGuardNativeMacOS.framework;
         // dyld's DYLD_LIBRARY_PATH override resolves @rpath/<leaf-name>
         // against *any* matching filename found there first, ahead of a
-        // launched executable's own embedded rpath. Confirmed directly: a
-        // stale, same-named dylib left behind in that DerivedData directory
-        // from an earlier build caused the CLI subprocess launched below to
-        // silently load that wrong, outdated dylib instead of the current
-        // one at build/Release — producing a pre-fingerprint 124-byte
-        // wrapped payload instead of the current length, and in other runs, behavior odd
-        // enough to hang. Stripping DYLD_* here removes that whole class of
-        // environment leakage regardless of what DerivedData happens to
-        // contain.
+        // launched executable's own embedded rpath. A stale, same-named
+        // dylib in that DerivedData directory would be silently loaded by
+        // the CLI subprocess launched below instead of the current one at
+        // build/Release, so the test would exercise the wrong library.
+        // Stripping DYLD_* here removes that whole class of environment
+        // leakage regardless of what DerivedData happens to contain.
         var environment = ProcessInfo.processInfo.environment
         for key in environment.keys where key.hasPrefix("DYLD_") {
             environment.removeValue(forKey: key)
@@ -243,8 +235,8 @@ struct HkdfGuardCommandLineToolTests {
 
     /// Builds the Release dylib and the CLI once per test run. Always
     /// invoked, not skipped when binaries already exist: both builds are
-    /// incremental, and skipping them let the suite silently test a stale
-    /// CLI that no longer matched its source.
+    /// incremental, and skipping them would let the suite silently test a
+    /// stale CLI that doesn't match its source.
     private static let toolsBuilt: Result<Void, Error> = Result {
         try buildDylib()
         try buildCLI()
@@ -315,8 +307,7 @@ struct HkdfGuardCommandLineToolTests {
     /// every KEK this suite needs to clean up was created by the separate,
     /// differently-signed `hkdfguard` process, and a plain
     /// `SecItemDelete` from *this* process (the test host) against such an
-    /// item fails outright — confirmed directly while developing this
-    /// suite, returning errSecInvalidOwnerEdit (-25244, "Invalid attempt
+    /// item fails outright, returning errSecInvalidOwnerEdit (-25244, "Invalid attempt
     /// to change the owner of this item"), silently, no interactive prompt
     /// at all (unlike the *read* path — see the suite's doc comment).
     /// `/usr/bin/security`, an Apple-signed platform binary, has broader
@@ -375,7 +366,6 @@ struct HkdfGuardCommandLineToolTests {
         return (status, Array(out.prefix(Int(max(outLen, 0)))))
     }
 
-    /// A temp file path under the system temp directory, not yet created.
     /// Writes `contents` to `path` as a `--dek-file` the CLI accepts: a
     /// regular file owned by this user, mode 0600 (the Linux tool's rule).
     private static func writeDekFile(_ contents: Data, to path: String, mode: Int = 0o600) throws {
@@ -383,6 +373,7 @@ struct HkdfGuardCommandLineToolTests {
         try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: path)
     }
 
+    /// A temp file path under the system temp directory, not yet created.
     private static func makeTempFilePath() -> String {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("hkdfguard-cli-test-\(UUID().uuidString).bin")
@@ -475,7 +466,7 @@ struct HkdfGuardCommandLineToolTests {
     }
 
     @Test func cliDekInputFileIsReportedAsUnprotectedByOpenFile() throws {
-        // The mistake hkdfguard_open_file's -26 exists for: an application
+        // The mistake hkdfguard_open_file's -37 exists for: an application
         // pointed at the plaintext DEK file given to `wrap --dek-file`
         // (base64 plus a newline) instead of the wrapped key file `wrap`
         // wrote. Needs no enclave: the plaintext file is never wrapped here.
@@ -563,8 +554,8 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.stderr.contains("not valid base64"), "stderr: \(result.stderr)")
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
         // A rejected invocation must have no persistent side effects: the
-        // CLI used to provision the KEK before validating --dek, leaving a
-        // Secure Enclave key and keychain item behind for every typo.
+        // DEK is validated before any KEK is provisioned, so a typo leaves
+        // no Secure Enclave key or keychain item behind.
         #expect(!Self.kekItemExists(service: service), "a rejected --dek must not provision a KEK")
     }
 
@@ -1050,8 +1041,8 @@ struct HkdfGuardCommandLineToolTests {
     }
 
     @Test func cliRejectsNonAsciiDekInputAsInvalidBase64() throws {
-        // No longer decoded as UTF-8 text first: bytes the base64 decoder
-        // cannot accept are reported as invalid base64.
+        // Not decoded as UTF-8 text first: bytes the base64 decoder cannot
+        // accept are reported as invalid base64.
         let keyFilePath = Self.makeTempFilePath()
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
         let result = try Self.runCLI(
@@ -1361,6 +1352,46 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!FileManager.default.fileExists(atPath: "/out.key"), "nothing may be created at the filesystem root")
     }
 
+    @Test func cliExitsNormallyWithTheStandardDescriptorsClosed() throws {
+        // A daemon or job runner can start the CLI with descriptors 0-2
+        // closed. Every message then has nowhere to go, but the exit code
+        // must still be the ordinary one: FileHandle.standardError would
+        // raise an uncatchable exception and abort (terminationStatus 6).
+        try Self.toolsBuilt.get()
+        for (arguments, expected) in [("--help", Int32(0)), ("status -sn 'bad!name'", 1), ("bogus", 2)] {
+            let result = try Self.run(
+                URL(fileURLWithPath: "/bin/sh"),
+                ["-c", "exec \"$0\" \(arguments) <&- >&- 2>&-", Self.cliExecutablePath]
+            )
+            #expect(result.exitCode == expected, "\(arguments): exit \(result.exitCode)")
+        }
+    }
+
+    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    func cliLeavesNoPartialKeyFileWhenTheFileSizeLimitIsHit() throws {
+        // With RLIMIT_FSIZE below a payload, the default SIGXFSZ would kill
+        // the CLI mid-write and leave a truncated key file that blocks the
+        // retry with EEXIST. The CLI ignores the signal, so the write fails
+        // with EFBIG and the partial file is removed.
+        let service = "com.hkdfguard.tests.cli.fsize.limit"
+        defer { Self.deleteKEK(service: service) }
+        let keyFilePath = Self.makeTempFilePath()
+        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+        try Self.provision(service: service)
+
+        let result = try Self.run(
+            URL(fileURLWithPath: "/bin/sh"),
+            ["-c", "ulimit -f 0 && exec \"$0\" wrap -kf \"$1\" -sn \"$2\" --dek-stdin", Self.cliExecutablePath, keyFilePath, service],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(result.exitCode == 1, "exit \(result.exitCode): \(result.stderr)")
+        #expect(result.stderr.contains("File too large"), "stderr: \(result.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: keyFilePath), "a partial key file was left behind")
+
+        let retry = try Self.runCLI(["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"], stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(retry.exitCode == 0, "retry after the failed write: \(retry.stderr)")
+    }
+
     @Test func cliDekFileRefusesGroupOrOtherAccess() throws {
         for mode in [0o640, 0o604, 0o620, 0o602, 0o610, 0o644, 0o666] {
             let dekFilePath = Self.makeTempFilePath()
@@ -1376,8 +1407,8 @@ struct HkdfGuardCommandLineToolTests {
     @Test func cliDekFileAllowsRootOwnershipButStillChecksPermissions() throws {
         // /etc/hosts is root-owned and 0644. Root ownership is allowed, so it
         // must fail on its permissions, not its owner. (A file owned by some
-        // other non-root user can't be made without root, so that branch --
-        // untested on Linux too -- is checked by review only.)
+        // other non-root user can't be made without root, so that branch is
+        // not tested here, as on Linux.)
         let result = try Self.wrapWithDekFile("/etc/hosts")
         #expect(result.exitCode == 1)
         #expect(result.stderr.contains("permissions are too broad"), "stderr: \(result.stderr)")
@@ -1423,7 +1454,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
-    // MARK: - provision / wrap split
+    // MARK: - provision / wrap
 
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
     func cliProvisionCreatesKekAndIsIdempotent() throws {
@@ -1446,7 +1477,7 @@ struct HkdfGuardCommandLineToolTests {
 
     @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
     func cliWrapRefusesWithoutProvision() throws {
-        // The point of the split: `wrap` must never create a KEK. Against a
+        // `wrap` must never create a KEK. Against a
         // never-provisioned service it fails, names the fix, and leaves
         // neither a keychain item nor an output file behind -- for every
         // DEK source.
@@ -1512,8 +1543,8 @@ struct HkdfGuardCommandLineToolTests {
     }
 
     @Test func cliRejectsPositionalKeyFilePath() throws {
-        // The key file path used to be positional; a caller on the old
-        // syntax must get told exactly what changed.
+        // The key file path is not positional: a bare path is a usage
+        // error that names --key-file-path, and nothing is written.
         let keyFilePath = Self.makeTempFilePath()
         let result = try Self.runCLI(["wrap", keyFilePath, "--service-name", "com.hkdfguard.tests.cli.positional.path", "--dek-stdin"])
         #expect(result.exitCode == 2)
@@ -1939,8 +1970,8 @@ struct HkdfGuardCommandLineToolTests {
     /// Plants a legacy-keychain item under `service` whose data is not a
     /// Secure Enclave key, so the library reports it as kekCorrupted (-19).
     /// The item is created by `security`, not by the CLI, so the CLI reading
-    /// it is a cross-process legacy access: even with `-A`, it was observed
-    /// to raise an interactive keychain prompt. Tests using this are gated
+    /// it is a cross-process legacy access: even with `-A`, it can raise an
+    /// interactive keychain prompt. Tests using this are gated
     /// on the interactive opt-in for that reason.
     private static func plantCorruptLegacyItem(service: String) throws {
         let result = try run(

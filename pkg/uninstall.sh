@@ -7,7 +7,8 @@
 #
 # Usage: sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
 #
-# KEKs are NOT touched: they live in each user's keychain, not here. Retire
+# KEKs are NOT touched: user-scoped ones live in each user's keychain, and
+# machine-scoped ones in $root_dir/keks, outside v1/. Retire
 # any that should go *before* uninstalling, while the CLI still exists:
 #   hkdfguard retire --service-name <name> --fingerprint <hex>
 set -eu
