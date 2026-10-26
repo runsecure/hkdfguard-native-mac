@@ -512,6 +512,6 @@ private let auditLog = Logger(subsystem: "com.hkdfguard", category: "audit")
 /// other record; retiring is this tool's alone.
 func auditKekRetired(service: String, fingerprint: [UInt8], scope: String) {
     let actor = sessionUser()?.name ?? "root"
-    let line = "event=1004 op=retire result=OK service=\"\(service)\" provider=SECURE_ENCLAVE keychain=\(scope) kek_fingerprint=\(hexString(fingerprint)) actor=\"\(actor)\" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) msg=\"KEK retired: every DEK wrapped under it can no longer be unwrapped\""
+    let line = "event=1004 op=retire result=OK service=\"\(service)\" provider=SECURE_ENCLAVE keychain=\(scope) kek_fingerprint=\(hexString(fingerprint)) actor=\"\(actor)\" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) msg=\"KEK retired: no DEK wrapped under it unwraps unless the KEK is restored from a backup or snapshot\""
     auditLog.error("\(line, privacy: .public)")
 }

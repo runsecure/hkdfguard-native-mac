@@ -73,8 +73,8 @@ HEADER="$ROOT/HkdfGuardNativeMacOS/hkdfguard.h"
 SIGN_IDENTITY="${HKDFGUARD_SIGN_IDENTITY:-Apple Development}"
 
 # --options runtime: hardened runtime. For the CLI this disables the DYLD_*
-# environment variables (DYLD_LIBRARY_PATH was demonstrated to silently
-# redirect which dylib the CLI loads) and turns on library validation, so
+# environment variables (DYLD_LIBRARY_PATH can silently redirect which
+# dylib the CLI loads) and turns on library validation, so
 # it will only load dylibs signed by the same Team ID or by Apple -- which
 # is why the dylib next to it is signed with the same identity, here, by
 # this script, rather than relying on whatever the Xcode target's own
@@ -213,14 +213,12 @@ assert_arch() {
     [ "$actual" = "$expected" ] || fail "$file is built for '$actual', expected '$expected'"
 }
 
-# Asserts a signature verifies strictly and carries the hardened-runtime
-# flag and a secure timestamp.
-#
-# Tool output is captured into a variable before grepping, here and in
-# every check below: piping a tool straight into `grep -q` lets grep exit
-# on its first match, the tool then dies of SIGPIPE writing the rest of its
-# output, and `set -o pipefail` reports that as a failed pipeline -- a
-# false failure (or, for a negated check, a false pass).
+# Tool output is captured into a variable before grepping, in every check
+# below: piping a tool straight into `grep -q` lets grep exit on its first
+# match, the tool then dies of SIGPIPE writing the rest of its output, and
+# `set -o pipefail` reports that as a failed pipeline -- a false failure
+# (or, for a negated check, a false pass).
+
 # The binary's LC_RPATH list must be exactly the one given: nothing may be
 # searched for the dylib before (or besides) the directory the binary is in.
 assert_only_rpath() {
@@ -246,6 +244,8 @@ assert_entitlements() {
         || fail "$file: entitlements are [$(tr '\n' ' ' <<<"$actual")], expected [$(tr '\n' ' ' <<<"$expected")]"
 }
 
+# Asserts a signature verifies strictly and carries the hardened-runtime
+# flag and a secure timestamp.
 assert_signed() {
     local file="$1" info
     codesign --verify --strict --verbose=1 "$file" \
@@ -298,8 +298,8 @@ TICKET_LOOKUP_URL="https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket
 # Asserts the ticket service publishes a notarization ticket for `file` --
 # what every *other* Mac will find when it first runs it. Checked against
 # the service directly rather than through this Mac's `spctl`: syspolicyd
-# caches lookups by cdhash, and a negative answer it cached once has been
-# seen to outlast a published ticket by many minutes. The build is
+# caches lookups by cdhash, and a cached negative answer can outlast a
+# published ticket by many minutes. The build is
 # reproducible, so the same cdhash recurs across builds of unchanged code.
 # Retries cover the short delay between "Accepted" and publication.
 assert_ticket_published() {

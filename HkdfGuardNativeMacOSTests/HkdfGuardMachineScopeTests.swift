@@ -138,6 +138,14 @@ struct HkdfGuardMachineScopeTests {
         #expect(reason.contains("root"), "\(reason)")
     }
 
+    @Test func theKeyFolderIsExcludedFromBackup() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.keks.\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(excludeFromBackup(dir.path))
+        #expect(try URL(fileURLWithPath: dir.path).resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+    }
+
     // MARK: - System context
 
     @Test func aTestRunnerInALoginSessionIsNotTheSystemContext() {
