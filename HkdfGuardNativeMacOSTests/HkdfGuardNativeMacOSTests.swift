@@ -30,26 +30,23 @@ import os
 ///   -100 = keychainReadFailed
 ///   (the shared HkdfGuard status table; see hkdfguard.h).
 ///
-/// Important behavior change worth calling out here, not just in the
-/// individual tests below: `hkdfguard_wrap_dek`/`hkdfguard_unwrap_dek`/
-/// `hkdfguard_generate_and_wrap_dek` no longer create a KEK on first use —
-/// that's the entire point of splitting `hkdfguard_kek_exists`/
-/// `hkdfguard_create_kek` out as their own calls (see
-/// HkdfGuardNativeMacOS.swift's `createKEK`/`kekExists`). Every
-/// test below that expects a wrap/unwrap/generate-and-wrap to actually
-/// *succeed* therefore calls `Self.createKEK(service:)` first and asserts
-/// it returns success, exactly as real calling code now must.
+/// `hkdfguard_wrap_dek`/`hkdfguard_unwrap_dek`/
+/// `hkdfguard_generate_and_wrap_dek` never create a KEK; only
+/// `hkdfguard_create_kek` does (see HkdfGuardNativeMacOS.swift's
+/// `createKEK`/`kekExists`). Every test below that expects a
+/// wrap/unwrap/generate-and-wrap to *succeed* therefore calls
+/// `Self.createKEK(service:)` first and asserts it returns success, exactly
+/// as real calling code must.
 ///
 /// This suite runs serialized (`.serialized` below), not in parallel:
-/// Swift Testing's default per-test parallelism was observed to hang the
-/// whole run — many tests simultaneously calling into the real Secure
-/// Enclave Processor (visible in a stack sample as multiple threads
-/// piled up inside `TKSEPClientTokenSession`/`TKSEPKey`) apparently
-/// exceeds whatever concurrency the SEP/securityd IPC layer actually
+/// Swift Testing's default per-test parallelism hangs the whole run —
+/// many tests simultaneously calling into the real Secure Enclave
+/// Processor (threads pile up inside `TKSEPClientTokenSession`/`TKSEPKey`)
+/// exceed whatever concurrency the SEP/securityd IPC layer actually
 /// supports, well short of a hardware or App Sandbox limit we're
 /// deliberately imposing. Each test still uses its own distinct service
 /// identifier (rather than one shared default) so failures stay isolated
-/// and easy to attribute to a specific test even though everything now
+/// and easy to attribute to a specific test even though everything
 /// runs one at a time. Every test that actually provisions a Secure
 /// Enclave key registers a `defer` to delete that key's keychain item
 /// immediately after declaring the service string it'll use — `defer`
@@ -105,11 +102,6 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         return blob
     }
 
-    /// Deletes the keychain item backing a service's Secure Enclave key,
-    /// if one was created. There's no separate "delete this SE key" API —
-    /// the SE key becomes unreferenced (and its `dataRepresentation` can
-    /// never be reconstructed again) once the keychain item that stores
-    /// that representation is gone, which is the actual cleanup unit here.
     /// The attributes identifying `service`'s KEK item *in the keychain this
     /// process's mode uses* — mirroring the library's own
     /// `keychainItemAttributes`. Hosted in the entitled HkdfGuardNativeMacOSTestHost
@@ -133,6 +125,11 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         return query
     }
 
+    /// Deletes the keychain item backing a service's Secure Enclave key,
+    /// if one was created. There's no separate "delete this SE key" API —
+    /// the SE key becomes unreferenced (and its `dataRepresentation` can
+    /// never be reconstructed again) once the keychain item that stores
+    /// that representation is gone, which is the actual cleanup unit here.
     private static func deleteKEK(service: String) {
         SecItemDelete(keychainQuery(service: service) as CFDictionary)
     }
@@ -255,35 +252,27 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     }
 
     @Test func concurrentFirstUseOfCreateKekConvergesOnOneKEK() {
-        // Regression test: createKEK() used to report a failure
-        // non-deterministically when multiple callers raced to create the
-        // very first keychain item for a service at the same time
-        // (SecItemAdd's unique index on service+account lets only one
-        // caller's create win; the rest must fall back to loading the
-        // winner's key rather than treating that as failure). This race
-        // used to be exercised through hkdfguard_wrap_dek itself, back
-        // when wrap implicitly created a missing KEK — now that creation
-        // is its own call, this exercises hkdfguard_create_kek directly,
-        // which is where that logic actually lives today. Using a
-        // never-before-seen service identifier here forces every task
-        // through that first-use race on every run.
+        // Several callers racing to create the very first keychain item
+        // for a service must all succeed. SecItemAdd's unique index on
+        // service+account lets only one caller's create win; the rest must
+        // fall back to loading the winner's key rather than treating that
+        // as failure. Using a never-before-seen service identifier here
+        // forces every task through that first-use race on every run.
         //
-        // This deliberately uses DispatchQueue.concurrentPerform (real OS
-        // threads from GCD's pool) rather than Swift's async/withTaskGroup:
+        // This deliberately uses GCD (real OS threads from its global
+        // pool) rather than Swift's async/withTaskGroup:
         // hkdfguard_create_kek makes synchronous, blocking
         // Security-framework calls, and Swift Concurrency's cooperative
         // thread pool has a limited number of threads that assume tasks
         // suspend via `await` rather than block outright. Spawning several
         // blocking calls via withTaskGroup here — on top of Swift
-        // Testing's own default per-test parallelism — was enough to
-        // exhaust that pool and deadlock the entire test run, observed
-        // directly (every thread parked in the Testing runner's
-        // scheduler, no forward progress). GCD's pool is designed for
-        // exactly this kind of blocking work.
+        // Testing's own default per-test parallelism — is enough to
+        // exhaust that pool and deadlock the entire test run (every thread
+        // parked in the Testing runner's scheduler, no forward progress).
+        // GCD's pool is designed for exactly this kind of blocking work.
         //
         // Service names must stay within the letters/digits/'.' charset —
-        // unlike the old version of this test, this can't suffix a raw
-        // UUID (its dashes would be rejected), so it strips them instead.
+        // a raw UUID's dashes would be rejected, so they are stripped.
         let service = "com.hkdfguard.tests.kek.create.concurrent.\(UUID().uuidString.filter { $0 != "-" })"
         defer { Self.deleteKEK(service: service) }
 
@@ -292,14 +281,13 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         let statuses = OSAllocatedUnfairLock<[Int32]>(initialState: [])
 
         // 3 concurrent creators is enough to exercise the unique-index
-        // race (needs >=2); observed directly that pushing much more
-        // simultaneous load at the real Secure Enclave/securityd IPC
-        // layer causes severe contention on this hardware, so this stays
-        // deliberately modest rather than maximizing concurrency.
+        // race (needs >=2); much more simultaneous load at the real Secure
+        // Enclave/securityd IPC layer causes severe contention, so this
+        // stays deliberately modest rather than maximizing concurrency.
         //
         // The creators run on GCD's global pool and this thread waits with
         // a deadline rather than joining them: the SEP/securityd IPC has
-        // been seen to stall outright under concurrent first use, and a
+        // been known to stall outright under concurrent first use, and a
         // thread blocked inside it cannot be cancelled -- `.timeLimit`
         // alone would record the failure but leave the whole run hung. On
         // a stall this records an issue and returns; the stuck threads are
@@ -592,10 +580,9 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     // MARK: - wrap/unwrap require an already-created KEK
 
     @Test func wrapFailsWithKekNotFoundWhenNoKekWasCreated() {
-        // The core behavior change this split is all about: wrap no
-        // longer creates a KEK on first use. A well-formed, never-created
-        // service must fail with kekNotFound, not succeed by silently
-        // provisioning one.
+        // Wrap never creates a KEK. A well-formed, never-created service
+        // must fail with kekNotFound, not succeed by silently provisioning
+        // one.
         let service = "com.hkdfguard.tests.wrap.without.create"
         // No defer/cleanup needed: hkdfguard_wrap_dek must not create
         // anything here — that's exactly what's under test.
@@ -1143,9 +1130,9 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     }
 
     @Test func aPayloadForgedWithOnlyThePublicKeyIsRefused() throws {
-        // The reason for the hashed point (finding #1): with HPKE base mode
-        // anyone holding the public key could compute e * KEK_pub and seal
-        // a DEK of their choosing. Here the attacker does exactly that, in
+        // The reason for the hashed point: with an ECIES-style e * KEK_pub
+        // secret, anyone holding the public key could seal a DEK of their
+        // choosing. Here the attacker does exactly that, in
         // the real format, with the real fingerprint and service -- and is
         // refused, because ECDH(KEK_priv, H(salt)) is not something the
         // public key lets them compute.
@@ -1351,8 +1338,7 @@ struct HkdfGuardHardenProcessTests {
 /// Drift guard: the shared C ABI must not drift between this library and
 /// hkdfguard-native-linux, the source of record. Checks the two headers
 /// against each other, and the Swift status enums -- hand-maintained copies
-/// of the table, which is how the codes drifted before -- against the
-/// header. Pure text checks: no keychain or Secure Enclave. Skipped when the
+/// of the table -- against the header. Pure text checks: no keychain or Secure Enclave. Skipped when the
 /// Linux repository isn't checked out next to this one.
 @Suite
 struct HkdfGuardCrossPlatformABITests {

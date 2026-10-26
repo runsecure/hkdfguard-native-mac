@@ -1413,8 +1413,8 @@ private func openMachineKeyFolderCreatingIt(service: String) -> Int32? {
         close(fd)
         return nil
     }
-    // On every provision, not just the first, so a folder made by an older
-    // build is excluded too. Not fatal: the KEK is no less usable for it.
+    // On every provision, not just the first, so an existing folder is
+    // excluded too. Not fatal: the KEK is no less usable for it.
     if !excludeFromBackup(url.path) {
         logMachineRefusal(service, "\(url.path) could not be excluded from Time Machine; a backup of it would let a retired KEK be restored")
     }
@@ -1711,10 +1711,9 @@ private func wrapDekCore(
 //   mistakes (INVALID_ARGUMENT, BUFFER_TOO_SMALL, INVALID_SERVICE_NAME) and
 //   KEK_NOT_FOUND aren't audited either, as on Linux and Windows.
 // - Differences from Linux. 1001 (KEK created off the policy's first choice)
-//   and 2004 (POLICY_INVALID) never occur: there is one provider, the Secure
-//   Enclave, and no policy file. For the same reason the unwrap-success
-//   record (1003) is always written -- Linux's `[audit] unwrap_success`
-//   switch has nowhere to live here. The macOS-only refinements of
+//   never occurs: there is one provider, the Secure Enclave. The
+//   unwrap-success record (1003) is always written: the macOS policy has no
+//   counterpart of Linux's `[audit] unwrap_success` switch. The macOS-only refinements of
 //   PROVIDER_ERROR (-96..-100) are audited as 2005, like PROVIDER_ERROR.
 //
 // Any process can write to the unified log, so these records are an audit
@@ -1892,7 +1891,8 @@ func auditPlaintextKeyFile(path: [UInt8]) {
 /// caller looping on them -- Linux's threshold.
 let auditSetupCallsWarnAt = 10
 
-/// Counts setup calls (hkdfguard_create_kek / hkdfguard_kek_exists) and
+/// Counts setup calls (hkdfguard_create_kek / hkdfguard_kek_exists /
+/// hkdfguard_kek_fingerprint) and
 /// reports, once per counter, when they pass `auditSetupCallsWarnAt`.
 struct SetupCallCounter {
     private(set) var calls = 0
@@ -1931,8 +1931,8 @@ func auditSetupCallsExceeded(floorMs: Int64) {
 
 /// The least wall-clock time each setup call (`hkdfguard_create_kek`,
 /// `hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`) takes, whatever its outcome -- the Linux and
-/// Windows default. Fixed on macOS: there is no policy file or
-/// administrator setting to tune it (Linux reads
+/// Windows default. Fixed on macOS: the policy has no setting to tune it
+/// (Linux reads
 /// `startup_behavior.setup_min_delay_ms`, Windows
 /// `HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs`).
 ///

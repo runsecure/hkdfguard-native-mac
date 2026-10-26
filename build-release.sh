@@ -73,8 +73,8 @@ echo
 ./build-dist.sh
 ./build-pkg.sh
 
-# The package build-pkg.sh just wrote: the newest signed (not -UNSIGNED) one,
-# never an old-style "-macos-v1-" package left in dist/ by an earlier build.
+# The package build-pkg.sh just wrote: the newest signed (not -UNSIGNED) one.
+# Any "-macos-v1-" package in dist/ is skipped.
 PKG="$(ls -t dist/hkdfguard-native-macos-*-osx-arm64.pkg 2>/dev/null | grep -v -e '-UNSIGNED' -e '-macos-v1-' | head -n 1 || true)"
 [ -n "$PKG" ] || fail "build-pkg.sh finished but no package was found in dist/"
 
