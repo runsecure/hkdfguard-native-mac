@@ -1274,9 +1274,6 @@ func openDekFile(_ spelledPath: String) throws -> Int32 {
     return fd
 }
 
-
-// The Linux and Windows tools' messages, word for word.
-//
 // Deliberately fixed: it names no character, offset or bit pattern, so a
 // mistyped DEK never puts part of itself into a log.
 let invalidBase64DekMessage = "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)"
@@ -1298,10 +1295,9 @@ let utf16DekMessage = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-
 // alphabet, a length that is a multiple of 4, `=` only as the last one or
 // two characters, and zero in the bits the padding leaves unused) into
 // `out`, and returns how many bytes it decodes to -- or nil if `text` is
-// not that. The rules of the Linux tool's decoder (base64ct) and the
-// Windows tool's.
+// not that.
 //
-// Constant time with respect to the text, as both of theirs are: the only
+// Constant time with respect to the text. The only
 // branches are on its length, which is public; every character is
 // classified and accumulated with mask arithmetic, so how long this takes
 // says nothing about which character, if any, was wrong. Bytes are written
@@ -1430,11 +1426,11 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
 
     // Exactly one trailing newline (optionally CRLF) is tolerated, so a file
     // written by `printf '%s\n'` or an editor still works -- nothing else,
-    // as in the Linux tool: leading or other trailing whitespace is part of
+    // : leading or other trailing whitespace is part of
     // the input and fails to decode.
     // A leading UTF-8 byte-order mark, which some Windows tools (PowerShell,
     // .NET) prepend, is skipped; a UTF-16 one is refused as such, since the
-    // fix is on the sending side -- the Linux and Windows tools' rules.
+    // fix is on the sending side.
     let bytes = UnsafeRawBufferPointer(rebasing: input[0..<total])
     var start = 0
     if total >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
@@ -1463,8 +1459,8 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
         throw CLIError("\(flag): the DEK must decode to exactly \(dekLen) bytes, got \(decodedLength)")
     }
     // The base64 text has served its only purpose: zero it now, before the
-    // wrap, rather than when this function returns -- as the Linux tool
-    // does. Only the decoded DEK stays, for `body`.
+    // wrap, rather than when this function returns.
+    // Only the decoded DEK stays, for `body`.
     if let inputBase = input.baseAddress {
         _ = memset_s(inputBase, input.count, 0, input.count)
     }
@@ -1525,8 +1521,7 @@ func lookupGroup(_ spec: String) throws -> (gid: gid_t, name: String)? {
 
 // Resolves --group to the gid the key file is given, refusing a group that
 // doesn't exist or is over-broad. Done before the DEK is read or the Secure
-// Enclave is used, so a bad --group costs nothing. The Linux tool's
-// resolve_key_file_group.
+// Enclave is used, so a bad --group costs nothing.
 func resolveKeyFileGroup(_ spec: String) throws -> (gid: gid_t, name: String) {
     guard let found = try lookupGroup(spec) else {
         throw CLIError("--group \"\(spec)\" does not name a group on this host")
@@ -1660,7 +1655,7 @@ func existingKeyFileFingerprint(_ folder: CheckedFolder) -> [UInt8]? {
 
 // Removes `folder.leaf` -- but only while that name still refers to the
 // file open as `fd` (same device and inode): a file someone put at the name
-// in the meantime is left alone. The Linux tool's remove_created_file.
+// in the meantime is left alone.
 func unlinkIfStillSame(_ folder: CheckedFolder, fd: Int32) -> Bool {
     var opened = stat()
     var named = stat()
@@ -1878,8 +1873,8 @@ func stripACL(fd: Int32, path: String) throws {
 //
 // With `group`, the file is given that group on the open descriptor
 // (fchown) before its mode widens to 0640 and before a byte is written, so
-// the payload never sits in it under any other group -- as the Linux tool
-// does. A caller who isn't root can only give a group they belong to: the
+// the payload never sits in it under any other group.
+// A caller who isn't root can only give a group they belong to: the
 // kernel's rule, reported plainly, and the empty file removed.
 func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
     if force {
@@ -2208,8 +2203,7 @@ func wrapDekInSystemContext(service: String, dek: UnsafeRawBufferPointer) throws
 // MARK: - Entry point
 
 // Runs a command body; a runtime failure prints the error and exits 1 --
-// distinct from an argument-parsing failure (exit 2) below, matching the
-// Linux tool's own exit-code convention.
+// distinct from an argument-parsing failure (exit 2) below.
 func runOrExit(_ body: () throws -> Void) -> Never {
     do {
         try body()
@@ -2222,7 +2216,7 @@ func runOrExit(_ body: () throws -> Void) -> Never {
 
 // Before anything is read: this process holds a plaintext DEK, so it must
 // not be dumpable or debuggable by other processes of the same user. Refuse
-// to run rather than handle a DEK unprotected -- the Linux tool's rule.
+// to run rather than handle a DEK unprotected.
 #if HKDFGUARD_STRICT_HARDENING
 let hardenStatus = hkdfguard_harden_process_with_flags(hardenRequireProtectedSignature)
 let hardenHint = " -- this distribution build must be signed with the Hardened Runtime and without get-task-allow"

@@ -55,7 +55,7 @@ private let hkdfguardHeaderLength = hkdfguardCiphertextOffset
 private let hkdfguardCiphertextLength = hkdfguardDekLength + hkdfguardGCMTagLength
 
 /// HKDF `info` prefix and the salt-to-point hash's domain, byte for byte
-/// the Linux library's (HKDF_INFO_PREFIX, PAYLOAD_POINT_DOMAIN). Payloads
+/// (HKDF_INFO_PREFIX, PAYLOAD_POINT_DOMAIN). Payloads
 /// are host-only, so nothing requires the labels to match; matching keeps
 /// the three implementations reviewable as one design.
 private let hkdfguardHKDFInfoPrefix = Data("hkdfguard-wrap-v1:".utf8)
@@ -65,7 +65,7 @@ private let hkdfguardPayloadPointDomain = Data("HkdfGuard-P256-payload-ECDH-poin
 /// || service || header. The length prefix keeps the concatenation
 /// unambiguous, so no two distinct (service, header) pairs give the same
 /// `info`; the header binds the fingerprint, suite, salt and nonce into the
-/// key itself. Linux's `derive_wrapping_key`.
+/// key itself.
 func wrappingKeyInfo(service: String, header: Data) -> Data { // internal: the forgery tests rebuild payloads with it
     let serviceBytes = Data(service.utf8) // validated ASCII, at most 128 bytes
     var info = hkdfguardHKDFInfoPrefix
@@ -78,7 +78,7 @@ func wrappingKeyInfo(service: String, header: Data) -> Data { // internal: the f
 
 /// Hashes `salt` to a P-256 point: the first `X = SHA-256(domain || salt ||
 /// counter)` that is a valid x-coordinate, with the even-Y point (compressed
-/// 0x02 || X). Linux's `payload_ecdh_point`, byte for byte.
+/// 0x02 || X).
 ///
 /// Why: the wrapping key comes from `ECDH(KEK_priv, H)`. Nobody knows the
 /// discrete log of a hash output, so computing it takes the KEK's private
@@ -468,8 +468,7 @@ private func secureZero(_ bytes: inout Data) {
 }
 
 /// Copies the first `count` bytes of `bytes` to `out`, or reports that it
-/// couldn't. Never traps: Swift can't catch a runtime trap the way the
-/// Linux build catches a panic at every export (and Windows an exception),
+/// couldn't. Never traps: Swift can't catch a runtime trap,
 /// so a trap here would end the host process instead of returning a status.
 /// The library therefore has no force-unwrap, `try!`, `fatalError` or
 /// `precondition` on any path an export can reach (the
@@ -531,8 +530,7 @@ private let hkdfguardMaxServiceLength = 128
 /// bytes rather than `Character` properties on purpose: `Character.isLetter`
 /// / `isNumber` are Unicode-aware and would accept `é`, CJK, Arabic-Indic
 /// digits, `½`, and so on, while `String.count` counts grapheme clusters
-/// rather than bytes. The C header, the CLI, and this project's Linux
-/// tool all promise (and enforce) ASCII bytes, so this must too.
+/// rather than bytes. The C header, the CLI, all promise (and enforce) ASCII bytes, so this must too.
 private func isValidServiceByte(_ byte: UInt8) -> Bool {
     (0x30...0x39).contains(byte)      // '0'-'9'
         || (0x41...0x5A).contains(byte) // 'A'-'Z'
@@ -540,8 +538,7 @@ private func isValidServiceByte(_ byte: UInt8) -> Bool {
         || byte == 0x2E                 // '.'
 }
 
-/// The shared HkdfGuard service-name rule (hkdfguard-native-linux's
-/// `cstr_to_service` is the source of record): 1-128 bytes, ASCII letters,
+/// The shared HkdfGuard service-name rule : 1-128 bytes, ASCII letters,
 /// digits, and '.' only, not starting with '.', and with no two consecutive
 /// dots. So a name can never be ".", "..", or a hidden dot-name, and never
 /// has an empty label between dots -- the same names are valid on every
@@ -574,8 +571,8 @@ private func validServiceName(service: String) -> Bool {
 /// the keychain query/store calls use, and the HKDF `info` is built from. Returns `nil` when the name is invalid — the
 /// caller maps that to `invalidServiceIdentifier`.
 ///
-/// The terminator is looked for in at most 129 bytes (`strnlen`), as on
-/// Linux, rather than with `String(cString:)`, which reads until it finds a
+/// The terminator is looked for in at most 129 bytes (`strnlen`)
+/// rather than with `String(cString:)`, which reads until it finds a
 /// NUL however far away: an unterminated or over-long string is rejected
 /// without reading past the longest name that could be valid.
 private func normalizedService(from servicePtr: UnsafePointer<CChar>) -> String? {
@@ -919,7 +916,7 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
 
 /// Computes the "fingerprint" embedded at the front of every wrapped
 /// payload: a SHA-256 hash of the KEK's public key, uncompressed X9.63
-/// (0x04 || x || y) -- the encoding Linux and Windows hash.
+/// (0x04 || x || y).
 /// Not a secret value — the public key it hashes isn't secret either —
 /// so the explicit equality check against it in `hkdfguard_unwrap_dek`
 /// exists purely to fail fast, cheaply, on "this payload wasn't wrapped
@@ -1082,7 +1079,7 @@ private func readAll(fd: Int32, limit: Int) -> Data? {
 /// The policy at `path`, read as a file rather than through CFPreferences
 /// so that every setting in it is seen and validated. nil when there is
 /// no such file. It, and every folder above it, must be root's and
-/// writable by root alone -- as Linux requires of its policy.
+/// writable by root alone.
 func loadPolicyFile(atPath path: String) -> PolicyLoad? {
     let url = URL(fileURLWithPath: path)
     let folderFd = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
@@ -1605,7 +1602,7 @@ func machinePolicyJSON() -> Data? {
 //                  [nonce, 12 random bytes]
 //                  [AES-256-GCM ciphertext || 16-byte tag, 48 bytes]
 //
-// The Linux and Windows construction: the Secure Enclave computes
+// the Secure Enclave computes
 // Z = ECDH(KEK_priv, H(salt)), where H hashes the salt to a P-256 point
 // (`payloadECDHPoint`); HKDF-SHA512 turns Z into the AES-256 key
 // (`deriveWrappingKey`); AES-256-GCM seals the DEK. Wrapping needs the
@@ -1613,7 +1610,7 @@ func machinePolicyJSON() -> Data? {
 // anyone who has seen the public key -- can create a payload.
 //
 // The header (fingerprint || suite id || salt || nonce: every byte before
-// the ciphertext) is bound twice, as on Linux: into the key, through HKDF's
+// the ciphertext) is bound twice: into the key, through HKDF's
 // `info` with the service name, and into the tag, as the AEAD's additional
 // authenticated data. Neither the fingerprint nor the suite byte can be
 // rewritten, and a payload sealed for one service cannot be opened under
@@ -1689,8 +1686,7 @@ private func wrapDekCore(
 // MARK: - Audit trail
 
 // One system-log record per security-relevant event, written whatever the
-// host does about logging -- the macOS counterpart of the Linux build's
-// syslog records (src/audit.rs) and the Windows build's Event Log events:
+// host does about logging :
 // the same event IDs, meanings, fields and sentences, so one set of alerts
 // reads all three.
 //
@@ -1765,7 +1761,6 @@ private let auditLog = Logger(subsystem: "com.hkdfguard", category: "audit")
 /// and so free, in normal use.
 let auditCapture = OSAllocatedUnfairLock<[String]?>(initialState: nil)
 
-/// The provider, as Linux's `provider=` field names its own.
 private let auditProvider = "SECURE_ENCLAVE"
 
 private let auditExecutable: String = {
@@ -1775,7 +1770,7 @@ private let auditExecutable: String = {
     return auditQuote(buffer[0..<min(Int(length), buffer.count)].map { UInt8(bitPattern: $0) })
 }()
 
-/// A double-quoted field value, exactly as Linux quotes one: printable ASCII
+/// A double-quoted field value: printable ASCII
 /// other than `"` and `\` is kept; everything else -- quotes, backslashes,
 /// control characters (so no value can forge a second record) and any
 /// non-ASCII byte -- is written as \xNN.
@@ -1842,7 +1837,7 @@ func auditDekOperation(_ op: AuditOp, service: String, payload: UnsafeBufferPoin
 }
 
 /// `op` failed with `code`, for `service`. Only the failures worth an
-/// administrator's attention are written -- Linux's and Windows' list.
+/// administrator's attention are written
 func auditOperationFailed(_ op: AuditOp, service: String, code: Int32) {
     guard let status = HKDFGuardStatus(rawValue: code) else { return }
     let event: AuditEvent
@@ -1888,7 +1883,7 @@ func auditPlaintextKeyFile(path: [UInt8]) {
 }
 
 /// More than this many setup calls in one process is the signature of a
-/// caller looping on them -- Linux's threshold.
+/// caller looping on them.
 let auditSetupCallsWarnAt = 10
 
 /// Counts setup calls (hkdfguard_create_kek / hkdfguard_kek_exists /
@@ -1930,11 +1925,7 @@ func auditSetupCallsExceeded(floorMs: Int64) {
 // MARK: - Setup gate
 
 /// The least wall-clock time each setup call (`hkdfguard_create_kek`,
-/// `hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`) takes, whatever its outcome -- the Linux and
-/// Windows default. Fixed on macOS: the policy has no setting to tune it
-/// (Linux reads
-/// `startup_behavior.setup_min_delay_ms`, Windows
-/// `HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs`).
+/// `hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`) takes, whatever its outcome
 ///
 /// Setup calls are meant to run once per application startup. Holding
 /// each to a floor, serialized across threads, caps how fast a caller --
@@ -1967,8 +1958,7 @@ private let setupGate = NSLock()
 /// entry -- whatever `body` returned, and however quickly. Argument
 /// validation happens before callers reach this, so a NULL pointer or an
 /// invalid service name still fails immediately; only calls that would
-/// reach the keychain pay the floor. The counterpart of Linux's
-/// `gated_setup` and Windows' `GatedSetup`.
+/// reach the keychain pay the floor.
 /// `floor` is a parameter only so the tests of the gate itself can pass
 /// their own without racing other suites over the override.
 func gatedSetup<T>(floor: Duration? = nil, _ body: () -> T) -> T {
@@ -2096,8 +2086,7 @@ public func hkdfguard_harden_process() -> Int32 {
     hkdfguard_harden_process_with_flags(flags: 0)
 }
 
-/// Opt-in hardening of the calling process against memory disclosure, in
-/// the same steps as on Linux where macOS has them:
+/// Opt-in hardening of the calling process against memory disclosure:
 ///
 /// 1. `RLIMIT_CORE` = 0, soft and hard, so it can't be raised again.
 /// 2. `ptrace(PT_DENY_ATTACH)`: later ptrace attaches fail. Refused (-20)
@@ -2333,7 +2322,7 @@ private func writtenPayload(_ status: Int32, _ outPtr: UnsafeMutablePointer<UInt
 }
 
 /// The argument checks shared by `hkdfguard_wrap_dek` and
-/// `hkdfguard_generate_and_wrap_dek`, in Linux's `wrap_impl` order, then the
+/// `hkdfguard_generate_and_wrap_dek`, then the
 /// wrap itself. Everything here is answered before any keychain lookup or
 /// Secure Enclave operation:
 ///
@@ -2401,7 +2390,7 @@ private func generateAndWrapCore(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    // As on Linux: the DEK is generated first, then every argument is
+    // the DEK is generated first, then every argument is
     // checked exactly as hkdfguard_wrap_dek checks it.
     guard var dek = generateRandomDek() else {
         return HKDFGuardStatus.encryptionFailed.rawValue
@@ -2469,7 +2458,7 @@ private func unwrapDekCore(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    // Argument checks in Linux's unwrap_impl order, all before any keychain
+    // Argument checks, all before any keychain
     // lookup or Secure Enclave operation.
     guard let outLen, let wrappedPtr else {
         return HKDFGuardStatus.invalidInputLength.rawValue
@@ -2607,27 +2596,25 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
 /// effective user, and not writable by group or others unless sticky
 /// (`/tmp`-style: the kernel then lets only an entry's owner, or the
 /// folder's, rename or remove it, and the file's own owner has just been
-/// checked). Write bits are ignored on a read-only volume. Linux's
-/// `check_dir_chain_for_existing_file`, with the same rules.
+/// checked). Write bits are ignored on a read-only volume.
 ///
 /// The folder is the one the path names the file in, opened by
 /// `readWrappedFile` before the file, which is then opened *within* it
 /// (`openat`): so the file read is that folder's entry, whatever other
 /// names (hard links) it has elsewhere, and the folder checked is where it
-/// was found -- Linux's "folder the path names it in". (Working back from
+/// was found. (Working back from
 /// the open file instead, with F_GETPATH, fails for a hard-linked file:
-/// macOS reports whichever of its names was looked up last.) As on Linux,
-/// folders that symlinks inside the path live in are not walked: someone
+/// macOS reports whichever of its names was looked up last.)
+/// Folders that symlinks inside the path live in are not walked: someone
 /// able to retarget one could at most send the path to a different file
 /// that itself passes every check here.
 ///
-/// A folder writable by the `admin` group (`/Applications`, say) fails,
-/// as a group-writable folder does on Linux: every administrator could
-/// replace the key there without root.
+/// A folder writable by the `admin` group (`/Applications`, say) fails.
+/// Every administrator could replace the key there without root.
 ///
 /// `rootOnly` (the policy file's and machine keys' folders): every folder
 /// must be root's, not this user's, and no group or other write bit is
-/// excused by the sticky bit either -- as Linux judges its policy folder.
+/// excused by the sticky bit either.
 func keyFileFoldersAreTrusted(folderFd: Int32, rootOnly: Bool = false) -> Bool {
     // Walked by descriptor, from the key file's own folder up through
     // openat(fd, "..") until a folder is its own parent (/): no path string
@@ -2829,8 +2816,8 @@ private func readWrappedFile(
     // bytes here, and the owner is either this user or root (an admin- or
     // MDM-deployed file; root can alter anything anyway).
     //
-    // A file with more than one hard link is accepted, as on Linux and
-    // Windows. Another name for the file only matters if someone could use
+    // A file with more than one hard link is accepted.
+    // Another name for the file only matters if someone could use
     // it to put an older payload where the service looks -- and that takes
     // creating an entry in the key's own folder: the folder the file was
     // just opened within, which `keyFileFoldersAreTrusted` below limits to
@@ -2882,15 +2869,14 @@ private func readWrappedFile(
     return (status, status == .success ? count : 0)
 }
 
-/// Longest text form of a DEK recognised, surrounding whitespace included --
-/// the Linux and Windows limit. Every length up to it is below a payload's,
+/// Longest text form of a DEK recognised, surrounding whitespace included.
+/// Every length up to it is below a payload's,
 /// so no payload can be mistaken for a plaintext key.
 private let hkdfguardMaxPlaintextTextLength = 96
 
 // Branch-free byte classification for `looksLikePlaintextDek`. Every helper
 // returns 0 or 1 and is straight-line arithmetic on UInt32 (`&-`, `&+`:
 // wrapping, never trapping), with no data-dependent branch or table lookup.
-// The Linux build's `ct` module, step for step.
 
 /// 1 if a == b, else 0 (inputs below 2^31).
 @inline(__always) private func ctEq(_ a: UInt32, _ b: UInt32) -> UInt32 {
@@ -2908,7 +2894,7 @@ private let hkdfguardMaxPlaintextTextLength = 96
     b ^ ((a ^ b) & (0 &- cond))
 }
 
-/// What Rust's trim_ascii removes: space, tab, LF, form feed, CR.
+/// What trim_ascii removes: space, tab, LF, form feed, CR.
 @inline(__always) private func ctIsWhitespace(_ c: UInt32) -> UInt32 {
     ctEq(c, 0x20) | ctEq(c, 0x09) | ctEq(c, 0x0A) | ctEq(c, 0x0C) | ctEq(c, 0x0D)
 }
@@ -2938,7 +2924,7 @@ private let hkdfguardMaxPlaintextTextLength = 96
 /// 43 characters, or 44 ending in `=`, all in one alphabet, whose last
 /// character's 2 unused bits are zero.
 ///
-/// Constant-time in the contents, as on Linux and Windows: the only
+/// Constant-time in the contents: the only
 /// branches are on the length, which the file's size already gives away.
 /// Every byte is visited twice (once to find the text between the
 /// surrounding whitespace, once to test it against all three alphabets at
@@ -3031,7 +3017,7 @@ private func openFileCore(
     outPtr: UnsafeMutablePointer<UInt8>?,
     outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32 {
-    // Argument checks in Linux's open_file_impl order, before the file is
+    // Argument checks, before the file is
     // opened. As on Linux (and as wrap and unwrap do), `*out_len` is written
     // only on success (125) and on buffer-too-small (the size to retry
     // with); every other failure leaves it as the caller set it.
@@ -3088,7 +3074,7 @@ private func openFileCore(
     // Structural checks only -- authenticity is the AEAD's job at unwrap.
     // A SHA-256 fingerprint of all zeros does not occur in practice (checked
     // first), and the suite byte must be one this build implements. Either
-    // failure is `fileMalformed`, as Linux and Windows report every format
+    // failure is `fileMalformed`, report every format
     // problem in a key file; unwrap, given the same bytes, still names an
     // unknown suite specifically (-12). The salt, nonce and ciphertext are
     // random-looking by design; nothing more can be checked without the KEK.
