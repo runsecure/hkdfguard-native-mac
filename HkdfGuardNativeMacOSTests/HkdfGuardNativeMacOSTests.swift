@@ -1690,10 +1690,11 @@ struct HkdfGuardSetupGateTests {
     }
 }
 
-/// The salt-to-point hash on its own, without the Secure Enclave. The
-/// vectors were computed independently (Python, Euler's criterion on
-/// x^3 - 3x + b mod p) and are pinned in the Linux library's tests too, so
-/// both libraries hash a salt to the same point.
+/// The salt-to-point hash on its own, without the Secure Enclave: RFC 9380
+/// `P256_XMD:SHA-256_SSWU_RO_`, checked against the RFC's own vectors, then
+/// under HkdfGuard's DST against values the Linux library pins too
+/// (`payload_ecdh_point_known_vectors` and the `known_answer` module in
+/// src/crypto.rs), so both libraries hash a salt to the same point.
 @Suite
 struct HkdfGuardPayloadPointTests {
     private static func hex(_ s: String) -> Data {
@@ -1707,15 +1708,80 @@ struct HkdfGuardPayloadPointTests {
         return out
     }
 
+    @Test func matchesRFC9380AppendixJ11() throws {
+        let dst = Data("QUUX-V01-CS02-with-P256_XMD:SHA-256_SSWU_RO_".utf8)
+        for (msg, x, y) in [
+            ("", "2c15230b26dbc6fc9a37051158c95b79656e17a1a920b11394ca91c44247d3e4",
+             "8a7a74985cc5c776cdfe4b1f19884970453912e9d31528c060be9ab5c43e8415"),
+            ("abc", "0bb8b87485551aa43ed54f009230450b492fead5f1cc91658775dac4a3388a0f",
+             "5c41b3d0731a27a7b14bc0bf0ccded2d8751f83493404c84a88e71ffd424212e"),
+            ("abcdef0123456789", "65038ac8f2b1def042a5df0b33b1f4eca6bff7cb0f9c6c1526811864e544ed80",
+             "cad44d40a656e7aff4002a8de287abc8ae0482b5ae825822bb870d6df9b56ca3"),
+        ] {
+            let point = try #require(hashToCurveP256(message: Data(msg.utf8), dst: dst))
+            #expect(point.x963Representation == Data([0x04]) + Self.hex(x) + Self.hex(y), "msg \"\(msg)\"")
+        }
+    }
+
+    @Test func matchesRFC9380HashToFieldIntermediates() {
+        // msg "" of Appendix J.1.1: u0 and u1, to localize a failure above.
+        let dst = Data("QUUX-V01-CS02-with-P256_XMD:SHA-256_SSWU_RO_".utf8)
+        let uniform = [UInt8](expandMessageXMD(message: Data(), dst: dst, length: 96))
+        #expect(P256Field.reduce(uniform[0..<48]).bigEndianBytes
+            == [UInt8](Self.hex("ad5342c66a6dd0ff080df1da0ea1c04b96e0330dd89406465eeba11582515009")))
+        #expect(P256Field.reduce(uniform[48..<96]).bigEndianBytes
+            == [UInt8](Self.hex("8c0f1d43204bd6f6ea70ae8013070a1518b43873bcd850aafa0a9e220e2eea5a")))
+    }
+
     @Test func matchesTheLinuxLibrarysVectors() throws {
         for (salt, compressed) in [
-            (Data(0..<32), "02074508261589a2c703bcb88966769c27f980a528de99cd3dc92d93d3de8fa2a6"), // first candidate
-            (Data(repeating: 0x00, count: 32), "02c68960c82e7e3d5395da61ee0f2024fb5e9ec0e45e2f104e33c65cca87c93620"), // second
-            (Data(repeating: 0xFF, count: 32), "02d31f6c8437eae360104be32527bbd36356c573c3047bc685ebbbde53148c13cb"), // second
+            (Data(0..<32), "03877847fb8a2cfbcf800b4191284aaba0934fd52e7e1971d30fa14b296544229e"),
+            (Data(repeating: 0x00, count: 32), "02a2b51e2ca3a067bd58078749da73319c73c7e25985053d8cc6f046a3346f38f5"),
+            (Data(repeating: 0xFF, count: 32), "036fecbe49be33b5a13f69f948456292aa1f60c5bb3e3d0d702736765af0f160c0"),
+            (Data(repeating: 0x11, count: 32), "02b23092bba6aaf88b48a76e47eff090537c0f22de2d07f8ea53d688533a71fd78"),
         ] {
             let point = try #require(payloadECDHPoint(salt: salt))
             #expect(point.compressedRepresentation == Self.hex(compressed), "salt \(salt.map { String(format: "%02x", $0) }.joined())")
         }
+    }
+
+    @Test func matchesTheLinuxLibrarysKnownAnswer() throws {
+        // The Linux library's `known_answer` inputs, end to end outside the
+        // Secure Enclave (which cannot import a chosen scalar): a software
+        // KEK's ECDH against the salt's point, then the HKDF and AES-GCM
+        // calls `deriveWrappingKey` and `wrapDekCore` make. The header is a
+        // stand-in string, as on Linux, not a real payload header.
+        let kek = try P256.KeyAgreement.PrivateKey(rawRepresentation: Data(repeating: 0x2A, count: 32))
+        let salt = Data(repeating: 0x11, count: 32)
+        let service = "com.hkdfguard.kat"
+        let header = Data("hkdfguard known-answer header".utf8)
+
+        let shared = try kek.sharedSecretFromKeyAgreement(with: try #require(payloadECDHPoint(salt: salt)))
+        #expect(shared.withUnsafeBytes { Data($0) }
+            == Self.hex("c25dfa74f08cf0cfc90c09b137e1ce621163a914e04d734e5d811ee9d8012707"))
+
+        let key = shared.hkdfDerivedSymmetricKey(
+            using: SHA512.self, salt: salt,
+            sharedInfo: wrappingKeyInfo(service: service, header: header), outputByteCount: 32)
+        #expect(key.withUnsafeBytes { Data($0) }
+            == Self.hex("513e5531a4a065f8cc55444d0642a87599525282156d338292860e7be62cfb31"))
+
+        let sealed = try AES.GCM.seal(
+            Data(repeating: 0x5A, count: 32), using: key,
+            nonce: AES.GCM.Nonce(data: Data(repeating: 0x22, count: 12)), authenticating: header)
+        #expect(sealed.ciphertext + sealed.tag == Self.hex(
+            "c2d840acab45552dfabe45d3d2d3556d4134bd2ae71e2163e39a4a27ef53593f6591b2dc77414d94e6a0a78f236efb6d"))
+    }
+
+    @Test func pointAdditionRefusesInfinityAndDoubles() {
+        // Not reachable from a salt in practice; the addition itself must
+        // refuse P + (-P) rather than return garbage for ECDH.
+        let g = (x: P256Field.Element(bigEndian: Self.hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")),
+                 y: P256Field.Element(bigEndian: Self.hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")))
+        #expect(P256Field.addPoints(g, (g.x, P256Field.neg(g.y))) == nil)
+        let doubled = P256Field.addPoints(g, g) // 2G, from SEC 2 / NIST test data
+        #expect(doubled?.x.bigEndianBytes
+            == [UInt8](Self.hex("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978")))
     }
 
     @Test func isDeterministicAndDiffersPerSalt() throws {
