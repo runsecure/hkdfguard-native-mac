@@ -1653,13 +1653,18 @@ struct HkdfGuardSetupGateTests {
         let floor = Duration.milliseconds(100)
         let clock = ContinuousClock()
         var bodyStarted = clock.now
+        var bodyEnded = clock.now
         gatedSetup(floor: floor) {
             bodyStarted = clock.now // once inside the gate: no queueing counted
             Thread.sleep(forTimeInterval: 0.3)
+            bodyEnded = clock.now
         }
-        let elapsed = clock.now - bodyStarted
-        #expect(elapsed >= .milliseconds(300))
-        #expect(elapsed < .milliseconds(300) + floor, "the floor is a minimum, not added on top; took \(elapsed)")
+        let returned = clock.now
+        #expect(returned - bodyStarted >= .milliseconds(300))
+        // Only what the gate adds after the body counts: a loaded CI runner
+        // can oversleep the body's own 300 ms by more than the floor.
+        let added = returned - bodyEnded
+        #expect(added < floor, "the floor is a minimum, not added on top; the gate added \(added)")
     }
 
     @Test func aZeroFloorDoesNotWait() {
