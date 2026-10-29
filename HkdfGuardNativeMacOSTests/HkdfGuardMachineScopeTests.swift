@@ -82,6 +82,60 @@ struct HkdfGuardMachineScopeTests {
         }
     }
 
+    @Test func theSuiteSettingsDefaultToMLKEMAndOptInToP256() {
+        func suites(_ values: [String: Any]) -> SuitePolicy? {
+            guard case .loaded(let policy) = parseMachinePolicy(values, source: "p") else {
+                return nil
+            }
+            return policy.suites
+        }
+        #expect(suites([:]) == SuitePolicy(provisionSuite: .mlkem1024StoredCiphertext, requirePostQuantum: false))
+        #expect(suites(["KekSuite": "ML-KEM-1024"])?.provisionSuite == .mlkem1024StoredCiphertext)
+        #expect(suites(["KekSuite": "P-256"])?.provisionSuite == .p256HashedPoint)
+        #expect(suites(["RequirePostQuantum": true])?.requirePostQuantum == true)
+        #expect(suites(["RequirePostQuantum": false, "KekSuite": "P-256"])?.provisionSuite == .p256HashedPoint)
+        // Only the suite settings: every service stays user-scoped.
+        let onlySuites = PolicyLoad.loaded(MachinePolicy(source: "p", securityAdminGroup: nil, deploymentAdminGroup: nil,
+                                                         machineServices: [:], suites: SuitePolicy(provisionSuite: .p256HashedPoint)))
+        #expect(Self.with(onlySuites) { kekScope(service: "svc") } == .user)
+        #expect(Self.with(onlySuites) { currentSuitePolicy()?.provisionSuite } == .p256HashedPoint)
+        #expect(Self.with(.none) { currentSuitePolicy() } == SuitePolicy(), "no policy: the defaults")
+        #expect(Self.with(.invalid("bad")) { currentSuitePolicy() } == nil, "an invalid policy fails closed")
+
+        let cases: [([String: Any], String)] = [
+            (["KekSuite": "ML-KEM-768"], "KekSuite must be"),
+            (["KekSuite": "p-256"], "KekSuite must be"),
+            (["KekSuite": 2], "KekSuite must be"),
+            (["RequirePostQuantum": "yes"], "must be a boolean"),
+            (["RequirePostQuantum": 1], "must be a boolean"),
+            (["KekSuite": "P-256", "RequirePostQuantum": true], "contradicts RequirePostQuantum"),
+        ]
+        for (values, expected) in cases {
+            guard case .invalid(let reason) = parseMachinePolicy(values, source: "p") else {
+                Issue.record("accepted \(values)")
+                continue
+            }
+            #expect(reason.contains(expected), "\(values): \(reason)")
+        }
+    }
+
+    @Test func thePolicyJSONReportsTheSuiteSettings() throws {
+        func json(_ load: PolicyLoad) throws -> [String: Any] {
+            let data = try #require(Self.with(load) { machinePolicyJSON() })
+            return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+        let development = try json(.none)
+        #expect(development["kekSuite"] as? String == "ML-KEM-1024")
+        #expect(development["requirePostQuantum"] as? Bool == false)
+        let strict = try json(.loaded(MachinePolicy(source: "p", securityAdminGroup: nil, deploymentAdminGroup: nil,
+                                                    machineServices: [:], suites: SuitePolicy(requirePostQuantum: true))))
+        #expect(strict["kekSuite"] as? String == "ML-KEM-1024")
+        #expect(strict["requirePostQuantum"] as? Bool == true)
+        let classical = try json(.loaded(MachinePolicy(source: "p", securityAdminGroup: nil, deploymentAdminGroup: nil,
+                                                       machineServices: [:], suites: SuitePolicy(provisionSuite: .p256HashedPoint))))
+        #expect(classical["kekSuite"] as? String == "P-256")
+    }
+
     // MARK: - The policy file
 
     @Test func aMissingPolicyFileIsDevelopmentMode() {
@@ -108,7 +162,8 @@ struct HkdfGuardMachineScopeTests {
 
     @Test func theKeyFileFormatRoundTripsAndRejectsAnythingElse() throws {
         let publicKey = P256.KeyAgreement.PrivateKey().publicKey.x963Representation
-        let file = MachineKeyFile(publicKey: publicKey, blob: Data((0..<200).map { UInt8($0 & 0xFF) }))
+        let file = MachineKeyFile.v1(publicKey: publicKey, blob: Data((0..<200).map { UInt8($0 & 0xFF) }))
+        #expect(file.fingerprint == Data(SHA256.hash(data: publicKey)))
         let encoded = try #require(encodeMachineKeyFile(file))
         #expect(decodeMachineKeyFile(encoded) == file)
 
@@ -123,8 +178,44 @@ struct HkdfGuardMachineScopeTests {
         #expect(decodeMachineKeyFile(corrupt(71)) == nil, "blob length")
         #expect(decodeMachineKeyFile(encoded.dropLast()) == nil, "truncated")
         #expect(decodeMachineKeyFile(encoded + Data([0])) == nil, "trailing bytes")
-        #expect(encodeMachineKeyFile(MachineKeyFile(publicKey: publicKey.dropLast(), blob: file.blob)) == nil)
-        #expect(encodeMachineKeyFile(MachineKeyFile(publicKey: publicKey, blob: Data())) == nil)
+        #expect(encodeMachineKeyFile(.v1(publicKey: publicKey.dropLast(), blob: file.blob)) == nil)
+        #expect(encodeMachineKeyFile(.v1(publicKey: publicKey, blob: Data())) == nil)
+    }
+
+    @Test func formatTwoRoundTripsForBothSuitesAndRejectsAnythingElse() throws {
+        let fingerprint = Data((0..<32).map { UInt8($0 + 1) })
+        let blob = Data((0..<1833).map { UInt8($0 & 0xFF) })
+        let ciphertext = Data((0..<1568).map { UInt8(($0 * 7) & 0xFF) })
+        for stored in [StoredKEK.p256(blob: blob), .mlkem1024(blob: blob, encapsulated: ciphertext)] {
+            let file = MachineKeyFile.v2(stored, fingerprint: fingerprint)
+            #expect(file.publicKey == nil)
+            #expect(file.stored == stored)
+            let encoded = try #require(encodeMachineKeyFile(file))
+            #expect(encoded[4] == 2)
+            #expect(decodeMachineKeyFile(encoded) == file)
+            #expect(decodeMachineKeyFile(encoded.dropLast()) == nil, "truncated")
+            #expect(decodeMachineKeyFile(encoded + Data([0])) == nil, "trailing bytes")
+        }
+
+        let encoded = try #require(encodeMachineKeyFile(.v2(.mlkem1024(blob: blob, encapsulated: ciphertext), fingerprint: fingerprint)))
+        func set(_ index: Int, _ value: UInt8) -> Data {
+            var bytes = [UInt8](encoded)
+            bytes[index] = value
+            return Data(bytes)
+        }
+        #expect(decodeMachineKeyFile(set(4, 3)) == nil, "format version")
+        #expect(decodeMachineKeyFile(set(5, 0x03)) == nil, "unknown suite")
+        #expect(decodeMachineKeyFile(set(5, 0x01)) == nil, "P-256 with a ciphertext")
+        #expect(decodeMachineKeyFile(set(38, 0xFF)) == nil, "blob length")
+        var zeroFingerprint = [UInt8](encoded)
+        zeroFingerprint.replaceSubrange(6..<38, with: [UInt8](repeating: 0, count: 32))
+        #expect(decodeMachineKeyFile(Data(zeroFingerprint)) == nil, "an all-zero fingerprint")
+
+        // The encoder refuses what the decoder would.
+        #expect(encodeMachineKeyFile(.v2(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast()), fingerprint: fingerprint)) == nil)
+        #expect(encodeMachineKeyFile(.v2(.p256(blob: Data()), fingerprint: fingerprint)) == nil)
+        #expect(encodeMachineKeyFile(.v2(.p256(blob: blob), fingerprint: fingerprint.dropLast())) == nil)
+        #expect(encodeMachineKeyFile(.v2(.p256(blob: Data(count: 9000)), fingerprint: fingerprint)) == nil, "over the size limit")
     }
 
     @Test func refusesAKeyFolderNotOwnedByRoot() throws {

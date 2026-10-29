@@ -10,6 +10,35 @@ import Security
 import os
 @testable import HkdfGuardNativeMacOS
 
+/// Before macOS 26, runs each test under a policy whose KekSuite is P-256,
+/// as such a Mac must be configured; from macOS 26 on, does nothing. A test
+/// that sets its own policy (`underSuitePolicy`) still gets that one. The
+/// policy is a task-local: a test that calls in from GCD or its own
+/// threads must re-apply it there.
+struct ProvisionsP256BeforeMacOS26: SuiteTrait, TestTrait, TestScoping {
+    var isRecursive: Bool { true }
+
+    func scopeProvider(for test: Test, testCase: Test.Case?) -> Self? {
+        guard testCase != nil else { return nil }
+        if #available(macOS 26.0, *) { return nil }
+        return self
+    }
+
+    // `@concurrent`: Testing's requirement, which this target's
+    // nonisolated(nonsending) default would otherwise not match.
+    @concurrent func provideScope(
+        for test: Test, testCase: Test.Case?, performing function: @concurrent @Sendable () async throws -> Void
+    ) async throws {
+        try await MachineScopeTestOverrides.$policy.withValue(.loaded(MachinePolicy(
+            source: "test", securityAdminGroup: nil, deploymentAdminGroup: nil, machineServices: [:],
+            suites: SuitePolicy(provisionSuite: .p256HashedPoint))), operation: function)
+    }
+}
+
+extension Trait where Self == ProvisionsP256BeforeMacOS26 {
+    static var provisionsP256BeforeMacOS26: Self { Self() }
+}
+
 /// Exercises the public C-ABI entry points exposed by
 /// `hkdfguard.h` — `hkdfguard_kek_exists`,
 /// `hkdfguard_create_kek`, `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`, and
@@ -62,12 +91,19 @@ import os
 /// naturally with (e.g. `wrapped.length`, not `wrapped-length`), and
 /// nowhere relies on `UUID().uuidString` verbatim (its dashes would fail
 /// validation too).
+///
+/// Before macOS 26 the enclave can't make the default suite's ML-KEM KEK,
+/// so provisioning under the default policy fails by design (no fallback).
+/// There each test runs under a KekSuite P-256 policy instead -- what such
+/// a Mac has to be configured with -- so the suite still covers wrap and
+/// unwrap end to end. See `ProvisionsP256BeforeMacOS26`.
 @Suite(
     .serialized,
     .enabled(
         if: SecureEnclave.isAvailable,
         "requires a real Secure Enclave — not available on CI/VM runners (e.g. GitHub-hosted macOS runners, where Apple's Virtualization framework doesn't pass the Secure Enclave through to the guest); run this suite on real Mac hardware before committing/requesting a build"
-    )
+    ),
+    .provisionsP256BeforeMacOS26
 )
 struct HkdfGuardNativeMacOSWrapUnwrapTests {
 
@@ -147,6 +183,36 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         service.withCString { serviceCStr in
             hkdfguard_create_kek(servicePtr: serviceCStr)
         }
+    }
+
+    /// `createKEK` under a policy whose KekSuite is P-256: for the tests
+    /// that rebuild suite 0x01 payloads from the KEK's P-256 key.
+    private static func createClassicalKEK(service: String) -> Int32 {
+        underSuitePolicy(SuitePolicy(provisionSuite: .p256HashedPoint)) { createKEK(service: service) }
+    }
+
+    /// Runs `body` under a policy with these suite settings and no machine
+    /// services -- for this test's calls only (task-local).
+    private static func underSuitePolicy<T>(_ suites: SuitePolicy, _ body: () throws -> T) rethrows -> T {
+        try MachineScopeTestOverrides.$policy.withValue(.loaded(MachinePolicy(
+            source: "test", securityAdminGroup: nil, deploymentAdminGroup: nil, machineServices: [:],
+            suites: suites)), operation: body)
+    }
+
+    private static func kekSuite(service: String) -> (status: Int32, suite: Int32) {
+        var suite: Int32 = -1
+        let status = service.withCString { hkdfguard_kek_suite(servicePtr: $0, outSuite: &suite) }
+        return (status, suite)
+    }
+
+    /// The service's keychain item data, as stored.
+    private static func storedItem(service: String) throws -> Data {
+        var query = keychainQuery(service: service)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        try #require(SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess)
+        return try #require(result as? Data)
     }
 
     private static func wrap(
@@ -293,10 +359,17 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // a stall this records an issue and returns; the stuck threads are
         // abandoned (they hold no test state) and don't block the run.
         // A normal run completes in well under a second.
+        //
+        // GCD threads don't inherit task-locals, so each creator re-applies
+        // this test's policy (P-256 before macOS 26; see
+        // `ProvisionsP256BeforeMacOS26`).
+        let policy = MachineScopeTestOverrides.policy
         let creators = DispatchGroup()
         for _ in 0..<3 {
             DispatchQueue.global(qos: .userInitiated).async(group: creators) {
-                let status = Self.createKEK(service: service)
+                let status = MachineScopeTestOverrides.$policy.withValue(policy) {
+                    Self.createKEK(service: service)
+                }
                 statuses.withLock { $0.append(status) }
             }
         }
@@ -575,6 +648,201 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
             Issue.record("a fresh enclave key reconstructs"); return
         }
         #expect(!probed, "the probe runs only after a blob fails to load")
+    }
+
+    // MARK: - A stored ML-KEM KEK
+
+    /// Stores an ML-KEM-1024 KEK for `service` in the keychain item format
+    /// provisioning will use, and returns its public key.
+    @available(macOS 26.0, *)
+    private static func plantMLKEMKEK(service: String) throws -> Data {
+        let access = try #require(SecAccessControlCreateWithFlags(
+            nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], nil))
+        let (kem, blob) = try #require(newMLKEM1024KEK(accessControl: access))
+        var attributes = keychainQuery(service: service)
+        let item = try #require(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: kem.encapsulated)))
+        attributes[kSecValueData as String] = item
+        try #require(SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess)
+        return kem.publicKey
+    }
+
+    @available(macOS 26.0, *)
+    @Test func aStoredMLKEMKEKWrapsAndUnwrapsInSuite2() throws {
+        let service = "com.hkdfguard.tests.mlkem.stored"
+        defer { Self.deleteKEK(service: service) }
+        let publicKey = try Self.plantMLKEMKEK(service: service)
+
+        #expect(Self.kekExists(service: service) == (0, true))
+        #expect(Self.createKEK(service: service) == 0, "an existing ML-KEM KEK is verified, never replaced")
+        let dek = Self.randomDEK()
+        let wrapped = Self.wrap(dek, service: service)
+        #expect(wrapped.status == 0)
+        #expect(wrapped.wrapped.count == Self.wrappedLength)
+        #expect(Data(wrapped.wrapped.prefix(32)) == Data(SHA256.hash(data: publicKey)))
+        #expect(wrapped.wrapped[32] == 0x02)
+        let unwrapped = Self.unwrap(wrapped.wrapped, service: service)
+        #expect(unwrapped.status == 0)
+        #expect(unwrapped.plaintext == dek)
+
+        // The suite byte rewritten to P-256's: the fingerprint is this KEK's,
+        // so the byte was altered.
+        var rewritten = wrapped.wrapped
+        rewritten[32] = 0x01
+        #expect(Self.unwrap(rewritten, service: service).status == -11)
+    }
+
+    @available(macOS 26.0, *)
+    @Test func anMLKEMItemWhoseBlobTheEnclaveRejectsIsCorrupt() throws {
+        let service = "com.hkdfguard.tests.mlkem.corrupt.blob"
+        defer { Self.deleteKEK(service: service) }
+        let item = try #require(encodeKeychainKEK(.mlkem1024(
+            blob: Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) }),
+            encapsulated: Data(repeating: 0x5A, count: 1568))))
+        var attributes = Self.keychainQuery(service: service)
+        attributes[kSecValueData as String] = item
+        #expect(SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess)
+
+        #expect(Self.kekExists(service: service) == (-19, false))
+        #expect(Self.createKEK(service: service) == -19, "never replaced")
+        #expect(Self.wrap(Self.randomDEK(), service: service).status == -19)
+        #expect(Self.kekExists(service: service).status == -19)
+    }
+
+    // MARK: - Provisioning picks the policy's suite
+
+    @available(macOS 26.0, *)
+    @Test func provisioningCreatesAnMLKEMKEKByDefault() throws {
+        let service = "com.hkdfguard.tests.provision.default.suite"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.kekSuite(service: service) == (-17, 0), "no KEK yet")
+        #expect(Self.createKEK(service: service) == 0)
+        #expect(try Self.storedItem(service: service).starts(with: Data("HKGQ".utf8)), "stored as an ML-KEM item")
+        #expect(Self.kekSuite(service: service) == (0, 2))
+        #expect(Self.createKEK(service: service) == 0, "a second provision verifies it")
+
+        let dek = Self.randomDEK()
+        let wrapped = Self.wrap(dek, service: service)
+        #expect(wrapped.status == 0)
+        #expect(wrapped.wrapped[32] == 0x02)
+        #expect(Self.unwrap(wrapped.wrapped, service: service).plaintext == dek)
+    }
+
+    @Test func kekSuiteOptsInToP256AndReportsIt() throws {
+        let service = "com.hkdfguard.tests.provision.classical.suite"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createClassicalKEK(service: service) == 0)
+        #expect(try !Self.storedItem(service: service).starts(with: Data("HKGQ".utf8)), "a bare P-256 blob, as always")
+        #expect(Self.kekSuite(service: service) == (0, 1))
+        // Once it exists, the default policy uses it as it is: provisioning
+        // never replaces a KEK of the other suite.
+        #expect(Self.createKEK(service: service) == 0)
+        let wrapped = Self.wrap(Self.randomDEK(), service: service)
+        #expect(wrapped.status == 0)
+        #expect(wrapped.wrapped[32] == 0x01)
+
+        var suite: Int32 = 7
+        #expect(service.withCString { hkdfguard_kek_suite(servicePtr: $0, outSuite: nil) } == -1)
+        #expect(hkdfguard_kek_suite(servicePtr: nil, outSuite: &suite) == -8)
+        #expect(suite == 0, "zeroed on failure")
+    }
+
+    @Test func requirePostQuantumRefusesAP256KEKButStillLetsItBeFound() throws {
+        let service = "com.hkdfguard.tests.provision.require.pq"
+        defer { Self.deleteKEK(service: service) }
+        #expect(Self.createClassicalKEK(service: service) == 0)
+        let dek = Self.randomDEK()
+        let wrapped = Self.wrap(dek, service: service)
+        #expect(wrapped.status == 0)
+
+        Self.underSuitePolicy(SuitePolicy(requirePostQuantum: true)) {
+            #expect(Self.createKEK(service: service) == -18, "provision refuses it, and doesn't replace it")
+            #expect(Self.wrap(Self.randomDEK(), service: service).status == -18)
+            #expect(Self.unwrap(wrapped.wrapped, service: service).status == -12)
+            #expect(Self.generateAndWrap(service: service).status == -18)
+            // So it can be found and retired:
+            #expect(Self.kekExists(service: service) == (0, true))
+            #expect(Self.kekSuite(service: service) == (0, 1))
+        }
+        #expect(Self.unwrap(wrapped.wrapped, service: service).plaintext == dek, "without the setting it opens again")
+    }
+
+    @available(macOS 26.0, *)
+    @Test func requirePostQuantumAcceptsAnMLKEMKEK() throws {
+        let service = "com.hkdfguard.tests.provision.require.pq.mlkem"
+        defer { Self.deleteKEK(service: service) }
+        Self.underSuitePolicy(SuitePolicy(requirePostQuantum: true)) {
+            #expect(Self.createKEK(service: service) == 0)
+            #expect(Self.kekSuite(service: service) == (0, 2))
+            let dek = Self.randomDEK()
+            let wrapped = Self.wrap(dek, service: service)
+            #expect(wrapped.status == 0)
+            #expect(Self.unwrap(wrapped.wrapped, service: service).plaintext == dek)
+            // A suite 0x01 payload is refused before the keychain is asked.
+            var classical = wrapped.wrapped
+            classical[32] = 0x01
+            #expect(Self.unwrap(classical, service: service).status == -12)
+        }
+        #expect(try Self.storedItem(service: service).starts(with: Data("HKGQ".utf8)))
+    }
+
+    // MARK: - A Mac whose Secure Enclave has no ML-KEM (before macOS 26)
+
+    /// Runs `body` as a macOS before 26 would: no ML-KEM keys created or
+    /// loaded. For this test's calls only (task-local).
+    private static func withoutMLKEM<T>(_ body: () throws -> T) rethrows -> T {
+        try MachineScopeTestOverrides.$withoutMLKEM.withValue(true, operation: body)
+    }
+
+    @Test func withoutMLKEMProvisioningFailsRatherThanFallingBackToP256() {
+        let service = "com.hkdfguard.tests.without.mlkem.provision"
+        defer { Self.deleteKEK(service: service) }
+        Self.withoutMLKEM {
+            // The default policy, even where the suite runs under P-256.
+            #expect(Self.underSuitePolicy(SuitePolicy()) { Self.createKEK(service: service) } == -3)
+            #expect(Self.underSuitePolicy(SuitePolicy(requirePostQuantum: true)) {
+                Self.createKEK(service: service)
+            } == -3)
+        }
+        let result = Self.kekExists(service: service)
+        #expect(result.status == 0)
+        #expect(result.exists == false, "no P-256 KEK was created in its place")
+    }
+
+    @Test func withoutMLKEMKekSuiteP256StillProvisions() {
+        let service = "com.hkdfguard.tests.without.mlkem.classical"
+        defer { Self.deleteKEK(service: service) }
+        Self.withoutMLKEM {
+            #expect(Self.createClassicalKEK(service: service) == 0)
+            #expect(Self.kekSuite(service: service) == (0, 1))
+            let dek = Self.randomDEK()
+            let wrapped = Self.wrap(dek, service: service)
+            #expect(wrapped.status == 0)
+            #expect(wrapped.wrapped[32] == 0x01)
+            #expect(Self.unwrap(wrapped.wrapped, service: service).plaintext == dek)
+        }
+    }
+
+    /// An ML-KEM KEK this Mac can't load is refused (-18), never reported
+    /// corrupt (-19), which would invite deleting it.
+    @available(macOS 26.0, *)
+    @Test func withoutMLKEMAStoredMLKEMKEKIsRefusedNeverCorrupt() throws {
+        let service = "com.hkdfguard.tests.without.mlkem.stored"
+        defer { Self.deleteKEK(service: service) }
+        _ = try Self.plantMLKEMKEK(service: service)
+        let dek = Self.randomDEK()
+        let wrapped = Self.wrap(dek, service: service)
+        #expect(wrapped.status == 0)
+        let item = try Self.storedItem(service: service)
+
+        Self.withoutMLKEM {
+            #expect(Self.kekExists(service: service).status == -18)
+            #expect(Self.createKEK(service: service) == -18, "never replaced")
+            #expect(Self.wrap(Self.randomDEK(), service: service).status == -18)
+            #expect(Self.unwrap(wrapped.wrapped, service: service).status == -18)
+            #expect(Self.kekSuite(service: service).status == -18)
+        }
+        #expect(try Self.storedItem(service: service) == item, "the item is left as it was")
+        #expect(Self.unwrap(wrapped.wrapped, service: service).plaintext == dek)
     }
 
     // MARK: - wrap/unwrap require an already-created KEK
@@ -1138,7 +1406,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // public key lets them compute.
         let service = "com.hkdfguard.tests.forgery.public.key"
         defer { Self.deleteKEK(service: service) }
-        #expect(Self.createKEK(service: service) == 0)
+        #expect(Self.createClassicalKEK(service: service) == 0)
         let kek = try Self.enclaveKEK(service: service)
         let dek = Self.randomDEK()
         let salt = Data((0..<32).map { _ in UInt8.random(in: .min ... .max) })
@@ -1174,7 +1442,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // HKDF's info, so the key differs and the tag fails.
         let service = "com.hkdfguard.tests.binding.service.a"
         defer { Self.deleteKEK(service: service) }
-        #expect(Self.createKEK(service: service) == 0)
+        #expect(Self.createClassicalKEK(service: service) == 0)
         let kek = try Self.enclaveKEK(service: service)
         let salt = Data((0..<32).map { _ in UInt8.random(in: .min ... .max) })
         let point = try #require(payloadECDHPoint(salt: salt))
@@ -1189,7 +1457,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // the answer is -12, not -17: the suite is checked first.
         let service = "com.hkdfguard.tests.unsupported.suite"
         var blob = [UInt8](repeating: 0x5A, count: Self.wrappedLength)
-        blob[32] = 0x02
+        blob[32] = 0x03 // 0x01 and 0x02 are implemented
         #expect(Self.unwrap(blob, service: service).status == -12)
         #expect(Self.kekExists(service: service).exists == false, "nothing may have been created")
     }
@@ -1353,7 +1621,7 @@ struct HkdfGuardCrossPlatformABITests {
     static let linuxMissing = Comment(rawValue: "hkdfguard-native-linux is not checked out next to this repository")
 
     /// The functions only this platform exports, as its header documents.
-    static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_machine_policy"]
+    static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_machine_policy", "hkdfguard_kek_suite"]
     /// The Linux functions this platform doesn't export, as its header documents.
     static let linuxOnlyFunctions: Set<String> = ["hkdfguard_security_model", "hkdfguard_key_file_principal_trusted"]
 
@@ -1802,5 +2070,189 @@ struct HkdfGuardPayloadPointTests {
         let key = P256.KeyAgreement.PrivateKey().publicKey
         #expect(kekFingerprint(key) == Data(SHA256.hash(data: key.x963Representation)))
         #expect(key.x963Representation.count == 65 && key.x963Representation.first == 0x04)
+    }
+}
+
+/// Suite 0x02: an ML-KEM-1024 KEK, through `sealDek`/`openPayload` -- the
+/// payload crypto wrap and unwrap run once they have the service's KEK.
+/// Software ML-KEM keys stand in for the Secure Enclave everywhere but the
+/// last test, so the format and its refusals are checked on CI's VMs too.
+@Suite
+struct HkdfGuardMLKEMKEKTests {
+    private static let service = "com.hkdfguard.tests.mlkem"
+
+    private static func randomDEK() -> [UInt8] {
+        (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+    }
+
+    @available(macOS 26.0, *)
+    private static func softwareKEK() throws -> (kek: KEMKEK, key: MLKEM1024.PrivateKey) {
+        let key = try MLKEM1024.PrivateKey()
+        let encapsulation = try key.publicKey.encapsulate()
+        return (KEMKEK(key: key, publicKey: key.publicKey.rawRepresentation, encapsulated: encapsulation.encapsulated), key)
+    }
+
+    private static func seal(_ dek: [UInt8], _ kek: KEK) -> (status: Int32, payload: Data?) {
+        dek.withUnsafeBytes { sealDek($0, kek: kek, service: service) }
+    }
+
+    @Test func theKeychainItemFormatKeepsP256BareAndBoxesMLKEM() throws {
+        // P-256 items stay exactly what they always were, so existing KEKs
+        // keep loading; ML-KEM items carry their ciphertext in a container.
+        let blob = Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) })
+        let ciphertext = Data(repeating: 0x5A, count: 1568)
+        #expect(encodeKeychainKEK(.p256(blob: blob)) == blob)
+        #expect(decodeKeychainKEK(blob) == .p256(blob: blob))
+
+        let boxed = try #require(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: ciphertext)))
+        #expect(boxed.prefix(6) == Data("HKGQ".utf8) + [0x01, 0x02])
+        #expect(boxed.count == 8 + blob.count + 1568)
+        #expect(decodeKeychainKEK(boxed) == .mlkem1024(blob: blob, encapsulated: ciphertext))
+
+        func set(_ index: Int, _ value: UInt8) -> Data {
+            var bytes = [UInt8](boxed)
+            bytes[index] = value
+            return Data(bytes)
+        }
+        #expect(decodeKeychainKEK(set(4, 0x02)) == nil, "format version")
+        #expect(decodeKeychainKEK(set(5, 0x01)) == nil, "suite")
+        #expect(decodeKeychainKEK(set(7, 0x00)) == nil, "blob length")
+        #expect(decodeKeychainKEK(boxed.dropLast()) == nil, "truncated")
+        #expect(decodeKeychainKEK(boxed + Data([0])) == nil, "trailing bytes")
+        #expect(decodeKeychainKEK(Data("HKGQ".utf8)) == nil, "magic alone")
+
+        #expect(encodeKeychainKEK(.p256(blob: Data("HKGQ".utf8) + blob)) == nil, "a P-256 blob that would read as a container")
+        #expect(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast())) == nil)
+        #expect(encodeKeychainKEK(.mlkem1024(blob: Data(), encapsulated: ciphertext)) == nil)
+    }
+
+    @Test func aMalformedContainerIsCorruptWithoutProbingTheEnclave() {
+        // No keybag state explains a container this build can't parse, so the
+        // probe that tells "locked" from "corrupt" isn't needed.
+        var probed = false
+        guard case .corrupt = reconstructKEK(Data("HKGQ".utf8) + [0x09], enclaveIsUsable: { probed = true; return false }) else {
+            Issue.record("a malformed container is corrupt"); return
+        }
+        #expect(!probed)
+    }
+
+    /// Before macOS 26 (really, on an older runner, or acted out on this
+    /// Mac), any ML-KEM KEK is refused without the probe: it is very likely
+    /// fine, and must never be reported corrupt.
+    @Test func anMLKEMKEKIsRefusedNeverCorruptWithoutMLKEM() throws {
+        let item = try #require(encodeKeychainKEK(.mlkem1024(
+            blob: Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) }),
+            encapsulated: Data(repeating: 0x5A, count: mlkem1024CiphertextLength))))
+        let check = {
+            var probed = false
+            guard case .enclaveRefused = reconstructKEK(item, enclaveIsUsable: { probed = true; return true }) else {
+                Issue.record("an ML-KEM KEK is refused, not corrupt"); return
+            }
+            #expect(!probed)
+        }
+        if #available(macOS 26.0, *) {
+            MachineScopeTestOverrides.$withoutMLKEM.withValue(true, operation: check)
+        } else {
+            check()
+        }
+    }
+
+    @available(macOS 26.0, *)
+    @Test func aPayloadRoundTripsAndNamesSuite2AndTheKEKsFingerprint() throws {
+        let (kem, _) = try Self.softwareKEK()
+        #expect(kem.publicKey.count == mlkem1024PublicKeyLength)
+        #expect(kem.encapsulated.count == mlkem1024CiphertextLength)
+        let kek = KEK.mlkem1024(kem)
+        let dek = Self.randomDEK()
+
+        let sealed = Self.seal(dek, kek)
+        #expect(sealed.status == 0)
+        let payload = try #require(sealed.payload)
+        #expect(payload.count == 125)
+        #expect(payload.prefix(32) == Data(SHA256.hash(data: kem.publicKey)))
+        #expect(kek.fingerprint == Data(SHA256.hash(data: kem.publicKey)))
+        #expect(payload[32] == 0x02)
+
+        let opened = openPayload(payload, kek: kek, service: Self.service)
+        #expect(opened.status == 0)
+        #expect(opened.plaintext.map(Array.init) == dek)
+    }
+
+    @available(macOS 26.0, *)
+    @Test func theWrappingKeyIsHKDFOverTheDecapsulatedSecret() throws {
+        // The construction, rebuilt independently: K = decapsulate(c), then
+        // HKDF-SHA512 with the payload salt and the usual `info`, then
+        // AES-256-GCM over the header -- a payload sealed this way opens.
+        let (kem, key) = try Self.softwareKEK()
+        let dek = Self.randomDEK()
+        let salt = Data((0..<32).map { _ in UInt8.random(in: .min ... .max) })
+        let nonceBytes = Data((0..<12).map { _ in UInt8.random(in: .min ... .max) })
+        var header = Data(SHA256.hash(data: kem.publicKey))
+        header.append(0x02)
+        header.append(salt)
+        header.append(nonceBytes)
+        let aesKey = HKDF<SHA512>.deriveKey(
+            inputKeyMaterial: try key.decapsulate(kem.encapsulated), salt: salt,
+            info: wrappingKeyInfo(service: Self.service, header: header), outputByteCount: 32)
+        let box = try AES.GCM.seal(dek, using: aesKey, nonce: AES.GCM.Nonce(data: nonceBytes), authenticating: header)
+
+        let kek = KEK.mlkem1024(kem)
+        #expect(try kek.wrappingKey(service: Self.service, header: header) == aesKey)
+        let opened = openPayload(header + box.ciphertext + box.tag, kek: kek, service: Self.service)
+        #expect(opened.status == 0)
+        #expect(opened.plaintext.map(Array.init) == dek)
+    }
+
+    @available(macOS 26.0, *)
+    @Test func theSameKeyWithAnotherCiphertextCantOpenThePayload() throws {
+        // The stored ciphertext is part of the KEK: the same enclave key with
+        // a different one has the same fingerprint, but a different K.
+        let (kem, key) = try Self.softwareKEK()
+        let other = KEMKEK(key: key, publicKey: kem.publicKey, encapsulated: try key.publicKey.encapsulate().encapsulated)
+        let payload = try #require(Self.seal(Self.randomDEK(), .mlkem1024(kem)).payload)
+        #expect(openPayload(payload, kek: .mlkem1024(other), service: Self.service).status == -11)
+    }
+
+    @available(macOS 26.0, *)
+    @Test func anotherKEKIsRefusedByFingerprint() throws {
+        let payload = try #require(Self.seal(Self.randomDEK(), .mlkem1024(try Self.softwareKEK().kek)).payload)
+        #expect(openPayload(payload, kek: .mlkem1024(try Self.softwareKEK().kek), service: Self.service).status == -16)
+    }
+
+    @available(macOS 26.0, *)
+    @Test func everyAlteredByteIsRefused() throws {
+        // Fingerprint bytes: -16, before any decapsulation. The suite byte,
+        // rewritten to 0x01 under a suite-0x02 KEK: -11. Every other byte:
+        // the tag fails, -11.
+        let kek = KEK.mlkem1024(try Self.softwareKEK().kek)
+        let payload = try #require(Self.seal(Self.randomDEK(), kek).payload)
+        for offset in 0..<payload.count {
+            var tampered = payload
+            tampered[offset] ^= offset == 32 ? 0x03 : 0x01
+            let expected: Int32 = offset < 32 ? -16 : -11
+            #expect(openPayload(tampered, kek: kek, service: Self.service).status == expected, "byte \(offset)")
+        }
+        #expect(openPayload(payload, kek: kek, service: "com.hkdfguard.tests.mlkem.other").status == -11)
+        #expect(openPayload(payload.prefix(124), kek: kek, service: Self.service).status == -10)
+    }
+
+    @available(macOS 26.0, *)
+    @Test(.enabled(if: SecureEnclave.isAvailable, "needs a Secure Enclave"))
+    func anEnclaveKEKSurvivesItsBlobAndOpensWhatItSealed() throws {
+        let access = try #require(SecAccessControlCreateWithFlags(
+            nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], nil))
+        let (kem, blob) = try #require(newMLKEM1024KEK(accessControl: access))
+        let dek = Self.randomDEK()
+        let payload = try #require(Self.seal(dek, .mlkem1024(kem)).payload)
+
+        // Rebuilt the way a stored KEK will be: blob plus ciphertext.
+        let reloaded = try #require(reconstructMLKEM1024KEK(blob: blob, encapsulated: kem.encapsulated))
+        #expect(reloaded.publicKey == kem.publicKey)
+        let opened = openPayload(payload, kek: .mlkem1024(reloaded), service: Self.service)
+        #expect(opened.status == 0)
+        #expect(opened.plaintext.map(Array.init) == dek)
+
+        #expect(reconstructMLKEM1024KEK(blob: blob, encapsulated: kem.encapsulated.prefix(100)) == nil)
+        #expect(reconstructMLKEM1024KEK(blob: Data((0..<48).map { UInt8($0) }), encapsulated: kem.encapsulated) == nil)
     }
 }

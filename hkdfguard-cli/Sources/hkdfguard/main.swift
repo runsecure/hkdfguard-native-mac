@@ -159,6 +159,25 @@ func hkdfguard_kek_fingerprint(
     _ outLen: UnsafeMutablePointer<Int32>?
 ) -> Int32
 
+// Read-only, macOS-only: the KEK's suite (1 P-256, 2 ML-KEM-1024). Printed
+// by `provision` and `status`.
+@_silgen_name("hkdfguard_kek_suite")
+func hkdfguard_kek_suite(_ service: UnsafePointer<CChar>?, _ outSuite: UnsafeMutablePointer<Int32>?) -> Int32
+
+// The suite's name as the policy's KekSuite spells it, or nil if the
+// library couldn't say.
+func kekSuiteName(service: String) -> String? {
+    var suite: Int32 = 0
+    guard service.withCString({ hkdfguard_kek_suite($0, &suite) }) == HKDFGuardStatus.success.rawValue else {
+        return nil
+    }
+    switch suite {
+    case 1: return "P-256"
+    case 2: return "ML-KEM-1024"
+    default: return nil
+    }
+}
+
 // Opt-in process hardening: core dumps off, debugger attachment denied. The
 // tool calls it before reading anything, as the Linux tool does.
 //
@@ -241,17 +260,17 @@ enum HKDFGuardStatus: Int32 {
         case .success: return "success"
         case .invalidInputLength: return "invalid argument (bad service name or DEK length)"
         case .outputBufferTooSmall: return "output buffer too small"
-        case .enclaveUnavailable: return "the Secure Enclave is not available on this machine"
+        case .enclaveUnavailable: return "the Secure Enclave is not available on this machine, or can't create the KEK suite the policy asks for (ML-KEM-1024 needs macOS 26 or later; KekSuite P-256 in the policy opts in to a classical KEK)"
         case .encryptionFailed: return "a cryptographic operation failed"
         case .unexpectedOutputLength: return "internal error: the library produced an unexpected output length"
         case .invalidServiceIdentifier: return "the service name is missing, empty, longer than 128 characters, or contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains \"..\""
         case .policyInvalid: return "the hkdfguard policy (a managed com.hkdfguard profile, or /Library/Application Support/HkdfGuard/policy.plist) can't be used -- run `\(programName) status` to see why"
         case .payloadMalformed: return "the wrapped payload is malformed"
         case .decryptionFailed: return "decryption failed"
-        case .unsupportedCiphersuite: return "the wrapped payload uses a ciphersuite this build does not support"
+        case .unsupportedCiphersuite: return "the wrapped payload uses a ciphersuite this build does not support, or one the policy refuses (RequirePostQuantum, and a P-256 payload)"
         case .fingerprintMismatch: return "the wrapped payload's embedded KEK fingerprint does not match the current key"
         case .kekNotFound: return "no key exists yet for this service -- call hkdfguard_create_kek first"
-        case .keychainAccessDenied: return "the keychain denied access (locked, no UI session, access prompt declined, or missing entitlement) -- a key for this service may already exist"
+        case .keychainAccessDenied: return "the keychain denied access (locked, no UI session, access prompt declined, or missing entitlement) -- a key for this service may already exist; or the policy's RequirePostQuantum refuses this service's P-256 KEK (see `hkdfguard status`)"
         case .kekCorrupted: return "a keychain item exists for this service but could not be reconstructed into a usable key"
         case .processHardeningFailed: return "the process could not be hardened (core dumps or debugger attachment could not be disabled, a debugger is already attached, or a distribution build's code signature lets other processes debug it)"
         case .fileNotFound: return "the key file does not exist"
@@ -694,11 +713,18 @@ func validateServiceCharset(_ service: String) throws {
     guard service.utf8.count <= maxServiceNameLength else {
         throw CLIError("service name \"\(service)\" must be at most \(maxServiceNameLength) characters, got \(service.utf8.count)")
     }
-    let isValid = service.utf8.allSatisfy { byte in
-        (byte >= 0x30 && byte <= 0x39) // '0'-'9'
-            || (byte >= 0x41 && byte <= 0x5A) // 'A'-'Z'
-            || (byte >= 0x61 && byte <= 0x7A) // 'a'-'z'
-            || byte == 0x2E // '.'
+    // A `switch`, not a chain of `||`: older Swift 6.2 type checkers
+    // (Xcode 26.3) give up on a long chain of literal comparisons.
+    let isValid = service.utf8.allSatisfy { (byte: UInt8) -> Bool in
+        switch byte {
+        case 0x30...0x39, // '0'-'9'
+             0x41...0x5A, // 'A'-'Z'
+             0x61...0x7A, // 'a'-'z'
+             0x2E:        // '.'
+            return true
+        default:
+            return false
+        }
     }
     guard isValid else {
         throw CLIError("service name \"\(service)\" must contain only alphanumeric characters or '.'")
@@ -755,6 +781,50 @@ func readKekFingerprint(service: String) -> (status: Int32, fingerprint: [UInt8]
 // Duplicated rather than exported: the library's C ABI deliberately has no
 // way to address its keychain items directly.
 let kekKeychainAccount = "kek-v1"
+
+// What a KEK item's own data reconstructs into, read in the library's item
+// format (`decodeKeychainKEK` in HkdfGuardNativeMacOS.swift): a bare P-256
+// Secure Enclave blob, or, for ML-KEM, "HKGQ" || format 0x01 || suite 0x02
+// || blob length (big-endian u16) || blob || 1568-byte ciphertext.
+enum StoredKEKCheck {
+    case key(fingerprint: [UInt8])
+    case unreconstructable
+    // An ML-KEM KEK on a macOS without ML-KEM in its Secure Enclave: very
+    // likely fine, so neither confirmable nor ever to be deleted as corrupt.
+    case unsupportedHere
+}
+
+func storedKEKCheck(_ data: Data) -> StoredKEKCheck {
+    let magic = Data("HKGQ".utf8)
+    guard data.starts(with: magic) else {
+        guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data) else {
+            return .unreconstructable
+        }
+        return .key(fingerprint: Array(SHA256.hash(data: key.publicKey.x963Representation))) // the library's kekFingerprint: SHA-256 of 0x04 || x || y
+    }
+    let start = data.startIndex
+    guard data.count > 8, data[start + 4] == 0x01, data[start + 5] == 0x02 else {
+        return .unreconstructable
+    }
+    let length = Int(data[start + 6]) << 8 | Int(data[start + 7])
+    guard length > 0, data.count == 8 + length + 1568 else {
+        return .unreconstructable
+    }
+    guard #available(macOS 26.0, *) else {
+        return .unsupportedHere
+    }
+    var blob = data.subdata(in: (start + 8)..<(start + 8 + length))
+    defer {
+        blob.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress, raw.count > 0 else { return }
+            _ = memset_s(base, raw.count, 0, raw.count)
+        }
+    }
+    guard let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob) else {
+        return .unreconstructable
+    }
+    return .key(fingerprint: Array(SHA256.hash(data: key.publicKey.rawRepresentation))) // the library's KEK.fingerprint for ML-KEM
+}
 
 // The first non-empty `keychain-access-groups` entry this executable is
 // signed with -- the same rule the library's detectKeychainMode applies.
@@ -827,10 +897,9 @@ func retireKEK(service: String, expectedFingerprint: [UInt8]) throws {
     // only ever remove the key the operator just confirmed.
     var item = try locateSingleKEKItem(service: service)
     defer { item.scrub() }
-    guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: item.blob) else {
+    guard case .key(let itemFingerprint) = storedKEKCheck(item.blob) else {
         throw CLIError("the KEK item for service \"\(service)\" could not be reconstructed when re-read for deletion; nothing was deleted -- inspect it again before retiring")
     }
-    let itemFingerprint = Array(SHA256.hash(data: key.publicKey.x963Representation)) // the library's kekFingerprint: SHA-256 of 0x04 || x || y
     guard itemFingerprint == expectedFingerprint else {
         throw CLIError("the KEK item for service \"\(service)\" changed between checks (now \(hexString(itemFingerprint))); nothing was deleted")
     }
@@ -898,7 +967,7 @@ func retireCorruptKEK(service: String) throws {
     // one is never what gets deleted.
     var item = try locateSingleKEKItem(service: service)
     defer { item.scrub() }
-    guard (try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: item.blob)) == nil else {
+    guard case .unreconstructable = storedKEKCheck(item.blob) else {
         throw CLIError("the KEK item for service \"\(service)\" reconstructs into a valid key when re-read for deletion; nothing was deleted -- retire a valid KEK with --fingerprint")
     }
 
@@ -1295,6 +1364,16 @@ let invalidBase64DekMessage = "the DEK input is not valid base64 (standard alpha
 // A DEK typed or pasted at a terminal is echoed and stays in the scrollback.
 let terminalDekMessage = "refusing to read the DEK from an interactive terminal, where it would be echoed and kept in the scrollback; pipe it in instead, e.g. printf '%s' \"$DEK_B64\" | hkdfguard wrap ... --dek-stdin"
 // The fix is on the sending side, so say what it is.
+/// Whether two bytes are a UTF-16 byte-order mark, either byte order.
+func isUTF16ByteOrderMark(_ first: UInt8, _ second: UInt8) -> Bool {
+    switch (first, second) {
+    case (0xFF, 0xFE), (0xFE, 0xFF):
+        return true
+    default:
+        return false
+    }
+}
+
 let utf16DekMessage = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text (in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)"
 
 // Branch-free helpers for decodeBase64ConstantTime. Every one returns 0 or 1
@@ -1433,7 +1512,7 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     guard total <= maxDekInputLength else {
         // UTF-16 doubles the text, so it is over the limit long before the
         // decoder could say why: name it here instead.
-        if total >= 2 && ((input[0] == 0xFF && input[1] == 0xFE) || (input[0] == 0xFE && input[1] == 0xFF)) {
+        if total >= 2 && isUTF16ByteOrderMark(input[0], input[1]) {
             throw CLIError(utf16DekMessage)
         }
         throw CLIError("\(flag): \(what) is longer than \(maxDekInputLength) bytes; expected base64 of a \(dekLen)-byte DEK")
@@ -1451,7 +1530,7 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     if total >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
         start = 3
     }
-    if total - start >= 2 && ((bytes[start] == 0xFF && bytes[start + 1] == 0xFE) || (bytes[start] == 0xFE && bytes[start + 1] == 0xFF)) {
+    if total - start >= 2 && isUTF16ByteOrderMark(bytes[start], bytes[start + 1]) {
         throw CLIError(utf16DekMessage)
     }
     var end = total
@@ -1637,9 +1716,10 @@ func keyFileNameIsTaken(_ folder: CheckedFolder) -> Bool {
     return fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0
 }
 
-// A wrapped payload's length, and its suite id byte (see hkdfguard.h).
+// A wrapped payload's length, and the suite id bytes the library
+// implements: 0x01 (P-256) and 0x02 (ML-KEM-1024) (see hkdfguard.h).
 let wrappedPayloadLength = 125
-let wrappedPayloadSuiteV1: UInt8 = 0x01
+let wrappedPayloadSuites: Set<UInt8> = [0x01, 0x02]
 
 // The KEK fingerprint embedded in the key file `--force` is about to
 // replace, or nil when there is nothing there that reads as a wrapped key
@@ -1661,7 +1741,7 @@ func existingKeyFileFingerprint(_ folder: CheckedFolder) -> [UInt8]? {
     }
     var payload = [UInt8](repeating: 0, count: wrappedPayloadLength)
     let count = payload.withUnsafeMutableBytes { pread(fd, $0.baseAddress, wrappedPayloadLength, 0) }
-    guard count == wrappedPayloadLength, payload[fingerprintLength] == wrappedPayloadSuiteV1 else {
+    guard count == wrappedPayloadLength, wrappedPayloadSuites.contains(payload[fingerprintLength]) else {
         return nil
     }
     let fingerprint = Array(payload.prefix(fingerprintLength))
@@ -1956,12 +2036,12 @@ func runProvision(_ args: ProvisionArgs) throws {
     // The Linux and Windows tools' wording, plus the keychain mode and the
     // fingerprint, which only this platform reports.
     if created {
-        print("KEK provisioned for service \"\(args.serviceName)\" (keychain: \(keychainModeName()))")
+        print("KEK provisioned for service \"\(args.serviceName)\" (keychain: \(keychainModeName()), suite: \(kekSuiteName(service: args.serviceName) ?? "unknown"))")
         print("fingerprint: \(hexString(fingerprint)) -- record this; retire requires it")
     } else {
         // A KEK this operator didn't create could have been planted by another
         // process; the fingerprint is how to tell.
-        print("KEK already provisioned for service \"\(args.serviceName)\"; verified, nothing to do (keychain: \(keychainModeName()))")
+        print("KEK already provisioned for service \"\(args.serviceName)\"; verified, nothing to do (keychain: \(keychainModeName()), suite: \(kekSuiteName(service: args.serviceName) ?? "unknown"))")
         print("fingerprint: \(hexString(fingerprint)) -- confirm it matches the one recorded when this service was provisioned")
     }
 }
@@ -2003,6 +2083,7 @@ func runStatus(serviceName: String) throws {
         print("scope: user\(policy.production ? " (production policy \(policy.source ?? "?") does not list this service)" : "")")
         print("keychain: \(keychainModeName())")
     }
+    print("provisions: \(policy.kekSuite)\(policy.requirePostQuantum ? " (RequirePostQuantum)" : "")")
 
     let (status, exists) = kekExistsStatus(service: service)
     switch status {
@@ -2013,6 +2094,9 @@ func runStatus(serviceName: String) throws {
         }
         print("kek: present")
         print("fingerprint: \(hexString(fingerprint))")
+        let suite = kekSuiteName(service: service) ?? "unknown"
+        let refused = policy.requirePostQuantum && suite == "P-256"
+        print("suite: \(suite)\(refused ? " (refused by the policy's RequirePostQuantum: retire it and provision again)" : "")")
     case HKDFGuardStatus.success.rawValue:
         print("kek: absent")
     case HKDFGuardStatus.kekCorrupted.rawValue:
@@ -2155,11 +2239,12 @@ func runProvisionMachine(service: String, policy: CLIPolicy) throws {
         throw CLIError("the machine KEK for service \"\(service)\" exists but its fingerprint could not be read: \(describeStatus(status))")
     }
     let group = policy.runnerGroup(service) ?? "(none: root only)"
+    let suite = kekSuiteName(service: service) ?? "unknown"
     if existed {
-        print("machine KEK already provisioned for service \"\(service)\"; verified, nothing to do (runner group: \(group))")
+        print("machine KEK already provisioned for service \"\(service)\"; verified, nothing to do (runner group: \(group), suite: \(suite))")
         print("fingerprint: \(hexString(fingerprint)) -- confirm it matches the one recorded when this service was provisioned")
     } else {
-        print("machine KEK provisioned for service \"\(service)\" at \(policy.keyFilePath(service)) (runner group: \(group))")
+        print("machine KEK provisioned for service \"\(service)\" at \(policy.keyFilePath(service)) (runner group: \(group), suite: \(suite))")
         print("fingerprint: \(hexString(fingerprint)) -- record this; retire requires it")
     }
 }

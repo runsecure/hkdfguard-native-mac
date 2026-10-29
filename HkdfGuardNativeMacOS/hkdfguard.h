@@ -150,7 +150,11 @@ extern "C" {
 
 /*
  * How macOS reports the common codes:
- *   PROVIDER_UNAVAILABLE (-3)  no Secure Enclave on this machine.
+ *   PROVIDER_UNAVAILABLE (-3)  no Secure Enclave on this machine; or, from
+ *                              hkdfguard_create_kek, one that can't create
+ *                              the KEK suite the policy asks for (ML-KEM-1024
+ *                              needs macOS 26 or later) -- never answered by
+ *                              quietly creating a P-256 KEK instead.
  *   CRYPTO_ERROR (-5)          the RNG failed, the Secure Enclave refused the
  *                              key agreement, or AES-GCM sealing failed.
  *   INTERNAL_ERROR (-6)        an internal failure the library detected: output
@@ -168,7 +172,9 @@ extern "C" {
  *   PAYLOAD_UNSUPPORTED (-12)  the payload's suite byte names a ciphersuite
  *                              this build does not implement (unwrap; the
  *                              same file read by hkdfguard_open_file is
- *                              FILE_MALFORMED, as on Linux and Windows).
+ *                              FILE_MALFORMED, as on Linux and Windows), or
+ *                              one the policy refuses (RequirePostQuantum,
+ *                              and suite 0x01).
  *   KEK_NOT_FOUND (-17)        no keychain item for this service in this
  *                              process's keychain mode -- including a
  *                              provisioner/consumer keychain-mode mismatch.
@@ -219,15 +225,18 @@ extern "C" {
 // wrapped payload is always exactly 125 bytes:
 //
 //   [ 32-byte KEK fingerprint (SHA-256 of the KEK's public key, 0x04||x||y) ]
-//   [  1-byte suite id: 0x01                                                ]
+//   [  1-byte suite id: HKDFGUARD_KEK_SUITE_*, the KEK's                    ]
 //   [ 32-byte random salt                                                   ]
 //   [ 12-byte random AES-GCM nonce                                          ]
 //   [ 32-byte AES-256-GCM ciphertext || 16-byte tag                         ]
 //
-// The Secure Enclave computes ECDH(KEK, H(salt)), where H hashes the salt
-// to a P-256 point; HKDF-SHA512 (salt = the salt) derives the AES-256 key.
-// The suite id names that construction; 0x01 is the only one this library
-// implements (see HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED). The header -- every
+// The suite id names the construction, which is the KEK's: a KEK has one.
+// 0x01 (P-256): the Secure Enclave computes ECDH(KEK, H(salt)), where H
+// hashes the salt to a P-256 point. 0x02 (ML-KEM-1024): the Secure Enclave
+// decapsulates the ciphertext stored with the KEK at provisioning; the
+// fingerprint is then SHA-256 of the ML-KEM-1024 public key. Either way
+// HKDF-SHA512 (salt = the salt) derives the AES-256 key from that secret.
+// Any other suite id is HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED. The header -- every
 // byte before the ciphertext -- is bound into both the derived key (HKDF
 // `info`, with the service name) and the tag (AES-GCM additional data), so a
 // payload is bound to its KEK, its suite, and its service.
@@ -311,8 +320,20 @@ extern "C" {
 //   MachineServices       dictionary: service name -> { RunnerGroup }
 //   SecurityAdminGroup    who may provision and retire machine KEKs (CLI)
 //   DeploymentAdminGroup  who may wrap DEKs under them (CLI)
+//   KekSuite              "ML-KEM-1024" (the default, with or without a
+//                         policy) or "P-256": what hkdfguard_create_kek
+//                         creates, for every service. P-256 is the opt-in
+//                         to a classical KEK
+//   RequirePostQuantum    boolean, default false: a P-256 KEK can't be
+//                         provisioned or wrap (HKDFGUARD_ERR_KEK_ACCESS_DENIED),
+//                         and a suite 0x01 payload can't be unwrapped
+//                         (HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED). Its existence,
+//                         fingerprint and suite can still be read, so it can
+//                         be found and retired. With KekSuite P-256 it makes
+//                         the policy invalid
 //
-// An unknown setting, a wrong type, or an unusable file makes the policy
+// The suite settings take effect with or without MachineServices: a policy
+// holding only them leaves every service user-scoped. An unknown setting, a wrong type, or an unusable file makes the policy
 // invalid, and then every call fails with HKDFGUARD_ERR_POLICY_INVALID
 // until it is fixed.
 //
@@ -453,6 +474,20 @@ int hkdfguard_kek_fingerprint(
     const char* HKDFGUARD_NONNULL service,
     uint8_t* HKDFGUARD_NONNULL out,
     int* HKDFGUARD_NONNULL out_len);
+
+#define HKDFGUARD_KEK_SUITE_P256 1        /* ECDH against a hashed point */
+#define HKDFGUARD_KEK_SUITE_MLKEM1024 2   /* ML-KEM-1024, stored ciphertext */
+
+// macOS-only. Writes the suite of the KEK for `service` to `*out_suite` --
+// HKDFGUARD_KEK_SUITE_P256 or HKDFGUARD_KEK_SUITE_MLKEM1024, the suite id
+// every payload wrapped under it carries -- so an operator or application
+// can confirm a KEK is post-quantum. `*out_suite` is 0 on every failure.
+// Answers as hkdfguard_kek_fingerprint does (a machine KEK from its file,
+// without the Secure Enclave), and is a setup call like it: the same floor
+// and serialization. Never creates a KEK.
+int hkdfguard_kek_suite(
+    const char* HKDFGUARD_NONNULL service,
+    int* HKDFGUARD_NONNULL out_suite);
 
 // Creates a Secure Enclave KEK for `service` if one doesn't already exist.
 // Idempotent, and safe under concurrent first use by several threads or
