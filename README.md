@@ -1264,12 +1264,29 @@ Xcode looks) and add
 ## Continuous integration
 
 Two GitHub Actions workflows, in `.github/workflows/`, both on
-GitHub-hosted Apple silicon runners (`macos-26`, Xcode 26.6):
+GitHub-hosted Apple silicon runners (`macos-26`, Xcode 26.6, and for one
+job `macos-15`):
 
 | Workflow | Runs on | Does | Credentials |
 |---|---|---|---|
-| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed | none |
+| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed; then the same test build run again on macOS 15 | none |
 | `release.yml` | a pushed `vX.Y.Z` tag, or by hand | `ci.yml`, then `build-release.sh` — signed, notarized, stapled — and, for a tag, the GitHub Release | the `release` environment's secrets |
+
+**macOS 15.** The library's deployment target is macOS 14, but ML-KEM is
+macOS 26 only. The `test-macos-15` job runs the test build from the
+`macos-26` job, unchanged, on `macos-15` (the oldest macOS GitHub hosts).
+An ML-KEM API reached without an availability check would fail there, and
+on every older Mac it would break the library for P-256 too. The job
+checks out the repositories in the same layout as the build job, because
+the test bundle finds them from the paths it was compiled at. It also needs
+an Xcode 26 on the image, since the CLI tests build the CLI with Swift 6.2+.
+
+What a macOS 15 VM can't show is the Secure Enclave side: provisioning
+failing with `-3` instead of creating a P-256 KEK, and a stored ML-KEM KEK
+being refused with `-18`, never reported corrupt. On real hardware, the
+`withoutMLKEM` tests act that out on macOS 26: a test-only switch,
+`MachineScopeTestOverrides.withoutMLKEM`, makes the Secure Enclave neither
+create nor load ML-KEM keys. Production never sets it.
 
 **What CI can't test.** A macOS VM has no Secure Enclave, so every test
 that wraps or unwraps skips itself there (see [Tests](#tests)), and the

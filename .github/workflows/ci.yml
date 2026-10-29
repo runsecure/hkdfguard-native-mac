@@ -1,4 +1,9 @@
-# Unsigned build and test on a GitHub-hosted Apple silicon runner.
+# Unsigned build and test on GitHub-hosted Apple silicon runners: built and
+# tested on macOS 26, then the same test build run again on macOS 15, the
+# oldest macOS with hosted runners (the deployment target is 14). That second
+# run is what catches an ML-KEM API -- macOS 26 only -- reached without an
+# availability check, which would break loading or calling the library on
+# every older Mac, P-256 included.
 #
 # Runs on every push to main, every pull request, by hand, and as the first
 # job of release.yml. Needs no Apple credentials: everything is ad-hoc signed
@@ -79,6 +84,18 @@ jobs:
             sh -n "$f"
           done
 
+      # Built once, then tested here and, unchanged, on macOS 15 below.
+      - name: Build the tests (unhosted, legacy keychain mode)
+        working-directory: hkdfguard-native-mac
+        run: |
+          set -o pipefail
+          XCODE_XCCONFIG_FILE="$PWD/.github/ci/unsigned.xcconfig" \
+          xcodebuild build-for-testing \
+            -project HkdfGuardNativeMacOS.xcodeproj \
+            -scheme HkdfGuardNativeMacOSTests \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData"
+
       - name: Test (unhosted, legacy keychain mode)
         working-directory: hkdfguard-native-mac
         run: |
@@ -87,12 +104,23 @@ jobs:
           # TEST_RUNNER_-prefixed variables reach the test process, which
           # builds the dylib and CLI itself (HkdfGuardCommandLineToolTests).
           XCODE_XCCONFIG_FILE="$xcconfig" TEST_RUNNER_XCODE_XCCONFIG_FILE="$xcconfig" \
-          xcodebuild test \
+          xcodebuild test-without-building \
             -project HkdfGuardNativeMacOS.xcodeproj \
             -scheme HkdfGuardNativeMacOSTests \
             -destination 'platform=macOS,arch=arm64' \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             -resultBundlePath "$RUNNER_TEMP/HkdfGuardNativeMacOSTests.xcresult"
+
+      # A tarball, so the bundles' symlinks and modes survive the artifact.
+      - name: Package the test build for macOS 15
+        run: tar -C "$RUNNER_TEMP/DerivedData/Build" -czf "$RUNNER_TEMP/test-build.tgz" Products
+
+      - name: Upload the test build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-build
+          path: ${{ runner.temp }}/test-build.tgz
+          retention-days: 1
 
       # The configurations build-dist.sh ships, compiled (not signed): the
       # framework in Release, and the CLI with HKDFGUARD_STRICT_HARDENING.
@@ -120,4 +148,82 @@ jobs:
         with:
           name: test-results
           path: ${{ runner.temp }}/HkdfGuardNativeMacOSTests.xcresult
+          retention-days: 14
+
+  # The macOS 26 job's test build, run on macOS 15. On a hosted runner's VM
+  # the Secure Enclave tests skip, as above; what runs is the rest -- the
+  # payload, keychain-item and KEK file formats, the policy, the C ABI --
+  # on the older macOS itself. (On a Mac with a Secure Enclave, the
+  # withoutMLKEM tests act out this macOS's provisioning on macOS 26.)
+  test-macos-15:
+    name: Test on macOS 15 (the macOS 26 build)
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 30
+    concurrency:
+      group: ci-macos-15-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      # The same layout as the build job's: the test bundle finds the repo,
+      # and ../hkdfguard-native-linux, from the paths it was compiled at.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: hkdfguard-native-mac
+          persist-credentials: false
+
+      - name: Check out hkdfguard-native-linux
+        id: linux
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: runsecure/hkdfguard-native-linux
+          path: hkdfguard-native-linux
+          token: ${{ secrets.LINUX_REPO_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Report a missing hkdfguard-native-linux
+        if: steps.linux.outcome != 'success'
+        run: echo "::warning::hkdfguard-native-linux could not be checked out (private? set the LINUX_REPO_TOKEN secret); the cross-platform ABI tests will be skipped"
+
+      - name: Download the test build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-build
+          path: ${{ runner.temp }}
+
+      # The CLI tests build the dylib and CLI themselves, which needs Swift
+      # 6.2+: the newest Xcode 26 on this image, rather than the workflow's.
+      - name: Toolchain
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$xcode" ]; then
+            echo "::error::no Xcode 26 on the macos-15 image; the CLI tests need Swift 6.2+"
+            exit 1
+          fi
+          echo "XCODE_26=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$xcode/Contents/Developer" xcodebuild -version
+          sw_vers
+
+      - name: Test (unhosted, legacy keychain mode)
+        working-directory: hkdfguard-native-mac
+        run: |
+          set -o pipefail
+          export DEVELOPER_DIR="$XCODE_26"
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/test-build.tgz"
+          xctestrun=$(find "$RUNNER_TEMP/Products" -maxdepth 1 -name '*.xctestrun' | head -n 1)
+          test -n "$xctestrun"
+          xcconfig="$PWD/.github/ci/unsigned.xcconfig"
+          XCODE_XCCONFIG_FILE="$xcconfig" TEST_RUNNER_XCODE_XCCONFIG_FILE="$xcconfig" \
+          xcodebuild test-without-building \
+            -xctestrun "$xctestrun" \
+            -destination 'platform=macOS,arch=arm64' \
+            -resultBundlePath "$RUNNER_TEMP/HkdfGuardNativeMacOSTests-macos-15.xcresult"
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-macos-15
+          path: ${{ runner.temp }}/HkdfGuardNativeMacOSTests-macos-15.xcresult
           retention-days: 14

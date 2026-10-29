@@ -742,6 +742,65 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         #expect(try Self.storedItem(service: service).starts(with: Data("HKGQ".utf8)))
     }
 
+    // MARK: - A Mac whose Secure Enclave has no ML-KEM (before macOS 26)
+
+    /// Runs `body` as a macOS before 26 would: no ML-KEM keys created or
+    /// loaded. For this test's calls only (task-local).
+    private static func withoutMLKEM<T>(_ body: () throws -> T) rethrows -> T {
+        try MachineScopeTestOverrides.$withoutMLKEM.withValue(true, operation: body)
+    }
+
+    @Test func withoutMLKEMProvisioningFailsRatherThanFallingBackToP256() {
+        let service = "com.hkdfguard.tests.without.mlkem.provision"
+        defer { Self.deleteKEK(service: service) }
+        Self.withoutMLKEM {
+            #expect(Self.createKEK(service: service) == -3)
+            #expect(Self.underSuitePolicy(SuitePolicy(requirePostQuantum: true)) {
+                Self.createKEK(service: service)
+            } == -3)
+        }
+        let result = Self.kekExists(service: service)
+        #expect(result.status == 0)
+        #expect(result.exists == false, "no P-256 KEK was created in its place")
+    }
+
+    @Test func withoutMLKEMKekSuiteP256StillProvisions() {
+        let service = "com.hkdfguard.tests.without.mlkem.classical"
+        defer { Self.deleteKEK(service: service) }
+        Self.withoutMLKEM {
+            #expect(Self.createClassicalKEK(service: service) == 0)
+            #expect(Self.kekSuite(service: service) == (0, 1))
+            let dek = Self.randomDEK()
+            let wrapped = Self.wrap(dek, service: service)
+            #expect(wrapped.status == 0)
+            #expect(wrapped.wrapped[32] == 0x01)
+            #expect(Self.unwrap(wrapped.wrapped, service: service).plaintext == dek)
+        }
+    }
+
+    /// An ML-KEM KEK this Mac can't load is refused (-18), never reported
+    /// corrupt (-19), which would invite deleting it.
+    @available(macOS 26.0, *)
+    @Test func withoutMLKEMAStoredMLKEMKEKIsRefusedNeverCorrupt() throws {
+        let service = "com.hkdfguard.tests.without.mlkem.stored"
+        defer { Self.deleteKEK(service: service) }
+        _ = try Self.plantMLKEMKEK(service: service)
+        let dek = Self.randomDEK()
+        let wrapped = Self.wrap(dek, service: service)
+        #expect(wrapped.status == 0)
+        let item = try Self.storedItem(service: service)
+
+        Self.withoutMLKEM {
+            #expect(Self.kekExists(service: service).status == -18)
+            #expect(Self.createKEK(service: service) == -18, "never replaced")
+            #expect(Self.wrap(Self.randomDEK(), service: service).status == -18)
+            #expect(Self.unwrap(wrapped.wrapped, service: service).status == -18)
+            #expect(Self.kekSuite(service: service).status == -18)
+        }
+        #expect(try Self.storedItem(service: service) == item, "the item is left as it was")
+        #expect(Self.unwrap(wrapped.wrapped, service: service).plaintext == dek)
+    }
+
     // MARK: - wrap/unwrap require an already-created KEK
 
     @Test func wrapFailsWithKekNotFoundWhenNoKekWasCreated() {
@@ -2031,6 +2090,27 @@ struct HkdfGuardMLKEMKEKTests {
             Issue.record("a malformed container is corrupt"); return
         }
         #expect(!probed)
+    }
+
+    /// Before macOS 26 (really, on an older runner, or acted out on this
+    /// Mac), any ML-KEM KEK is refused without the probe: it is very likely
+    /// fine, and must never be reported corrupt.
+    @Test func anMLKEMKEKIsRefusedNeverCorruptWithoutMLKEM() throws {
+        let item = try #require(encodeKeychainKEK(.mlkem1024(
+            blob: Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) }),
+            encapsulated: Data(repeating: 0x5A, count: mlkem1024CiphertextLength))))
+        let check = {
+            var probed = false
+            guard case .enclaveRefused = reconstructKEK(item, enclaveIsUsable: { probed = true; return true }) else {
+                Issue.record("an ML-KEM KEK is refused, not corrupt"); return
+            }
+            #expect(!probed)
+        }
+        if #available(macOS 26.0, *) {
+            MachineScopeTestOverrides.$withoutMLKEM.withValue(true, operation: check)
+        } else {
+            check()
+        }
     }
 
     @available(macOS 26.0, *)

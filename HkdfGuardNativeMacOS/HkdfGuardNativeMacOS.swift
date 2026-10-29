@@ -1066,7 +1066,7 @@ func reconstructStoredKEK(
     case .mlkem1024(let blob, let encapsulated):
         // Before macOS 26 the enclave has no ML-KEM: the KEK is very likely
         // fine, and must never be reported as corrupt (and so deleted).
-        guard #available(macOS 26.0, *) else {
+        guard !MachineScopeTestOverrides.withoutMLKEM, #available(macOS 26.0, *) else {
             return .enclaveRefused
         }
         if let kem = reconstructMLKEM1024KEK(blob: blob, encapsulated: encapsulated) {
@@ -1175,7 +1175,8 @@ private func createMLKEMKEK(
     accessControl access: SecAccessControl,
     service: String
 ) -> (status: Int32, created: (kek: KEMKEK, blob: Data)?) {
-    if #available(macOS 26.0, *), let created = newMLKEM1024KEK(accessControl: access) {
+    if !MachineScopeTestOverrides.withoutMLKEM, #available(macOS 26.0, *),
+       let created = newMLKEM1024KEK(accessControl: access) {
         return (HKDFGuardStatus.success.rawValue, created)
     }
     guard (try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access)) != nil else {
@@ -1482,13 +1483,16 @@ enum PolicyLoad: Equatable {
 }
 
 /// Test-only overrides of where the policy and the machine KEKs come
-/// from. `nil` (the default, and always in production) reads the real
-/// ones. Task-local, so a test's override applies to its own calls only,
+/// from, and of whether this Mac has ML-KEM. `nil` and `false` (the
+/// defaults, and always in production) use the real ones. Task-local, so a test's override applies to its own calls only,
 /// never to a suite running alongside it; internal, so only `@testable
 /// import` can reach them -- never part of the C ABI.
 enum MachineScopeTestOverrides {
     @TaskLocal static var policy: PolicyLoad?
     @TaskLocal static var keyFolder: String?
+    /// `true` acts as a macOS before 26 does: the Secure Enclave neither
+    /// creates nor loads ML-KEM keys. Lets a macOS 26 Mac test that path.
+    @TaskLocal static var withoutMLKEM = false
 }
 
 private struct PolicyError: Error {
