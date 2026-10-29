@@ -1389,8 +1389,8 @@ version, run the full suite on real hardware (see
 [Continuous integration](#continuous-integration)), then push a signed tag:
 
 ```sh
-git tag -s v0.9.0 -m v0.9.0   # must equal v<MARKETING_VERSION>
-git push origin v0.9.0
+git tag -s v0.9.1 -m v0.9.1   # must equal v<MARKETING_VERSION>
+git push origin v0.9.1
 ```
 
 The workflow checks that the tag matches `MARKETING_VERSION` and is on
@@ -1401,7 +1401,7 @@ To build and publish one by hand instead (the workflow runs the same
 steps):
 
 ```sh
-VERSION=v0.9.0   # must equal MARKETING_VERSION in the Xcode project
+VERSION=v0.9.1   # must equal MARKETING_VERSION in the Xcode project
 
 HKDFGUARD_RELEASE=1 \
 HKDFGUARD_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
@@ -1511,7 +1511,7 @@ package first, and install only if every check passes:
 
 ```sh
 set -e
-VERSION=v0.9.0
+VERSION=v0.9.1
 TEAM_ID=MFW3T8R8J3                        # the Team that signs this project's releases
 EXPECTED=<the SHA-256 from the release notes>
 PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"
