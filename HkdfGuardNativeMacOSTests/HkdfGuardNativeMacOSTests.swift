@@ -12,7 +12,9 @@ import os
 
 /// Before macOS 26, runs each test under a policy whose KekSuite is P-256,
 /// as such a Mac must be configured; from macOS 26 on, does nothing. A test
-/// that sets its own policy (`underSuitePolicy`) still gets that one.
+/// that sets its own policy (`underSuitePolicy`) still gets that one. The
+/// policy is a task-local: a test that calls in from GCD or its own
+/// threads must re-apply it there.
 struct ProvisionsP256BeforeMacOS26: SuiteTrait, TestTrait, TestScoping {
     var isRecursive: Bool { true }
 
@@ -357,10 +359,17 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         // a stall this records an issue and returns; the stuck threads are
         // abandoned (they hold no test state) and don't block the run.
         // A normal run completes in well under a second.
+        //
+        // GCD threads don't inherit task-locals, so each creator re-applies
+        // this test's policy (P-256 before macOS 26; see
+        // `ProvisionsP256BeforeMacOS26`).
+        let policy = MachineScopeTestOverrides.policy
         let creators = DispatchGroup()
         for _ in 0..<3 {
             DispatchQueue.global(qos: .userInitiated).async(group: creators) {
-                let status = Self.createKEK(service: service)
+                let status = MachineScopeTestOverrides.$policy.withValue(policy) {
+                    Self.createKEK(service: service)
+                }
                 statuses.withLock { $0.append(status) }
             }
         }
