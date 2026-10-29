@@ -10,6 +10,33 @@ import Security
 import os
 @testable import HkdfGuardNativeMacOS
 
+/// Before macOS 26, runs each test under a policy whose KekSuite is P-256,
+/// as such a Mac must be configured; from macOS 26 on, does nothing. A test
+/// that sets its own policy (`underSuitePolicy`) still gets that one.
+struct ProvisionsP256BeforeMacOS26: SuiteTrait, TestTrait, TestScoping {
+    var isRecursive: Bool { true }
+
+    func scopeProvider(for test: Test, testCase: Test.Case?) -> Self? {
+        guard testCase != nil else { return nil }
+        if #available(macOS 26.0, *) { return nil }
+        return self
+    }
+
+    // `@concurrent`: Testing's requirement, which this target's
+    // nonisolated(nonsending) default would otherwise not match.
+    @concurrent func provideScope(
+        for test: Test, testCase: Test.Case?, performing function: @concurrent @Sendable () async throws -> Void
+    ) async throws {
+        try await MachineScopeTestOverrides.$policy.withValue(.loaded(MachinePolicy(
+            source: "test", securityAdminGroup: nil, deploymentAdminGroup: nil, machineServices: [:],
+            suites: SuitePolicy(provisionSuite: .p256HashedPoint))), operation: function)
+    }
+}
+
+extension Trait where Self == ProvisionsP256BeforeMacOS26 {
+    static var provisionsP256BeforeMacOS26: Self { Self() }
+}
+
 /// Exercises the public C-ABI entry points exposed by
 /// `hkdfguard.h` — `hkdfguard_kek_exists`,
 /// `hkdfguard_create_kek`, `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`, and
@@ -62,12 +89,19 @@ import os
 /// naturally with (e.g. `wrapped.length`, not `wrapped-length`), and
 /// nowhere relies on `UUID().uuidString` verbatim (its dashes would fail
 /// validation too).
+///
+/// Before macOS 26 the enclave can't make the default suite's ML-KEM KEK,
+/// so provisioning under the default policy fails by design (no fallback).
+/// There each test runs under a KekSuite P-256 policy instead -- what such
+/// a Mac has to be configured with -- so the suite still covers wrap and
+/// unwrap end to end. See `ProvisionsP256BeforeMacOS26`.
 @Suite(
     .serialized,
     .enabled(
         if: SecureEnclave.isAvailable,
         "requires a real Secure Enclave — not available on CI/VM runners (e.g. GitHub-hosted macOS runners, where Apple's Virtualization framework doesn't pass the Secure Enclave through to the guest); run this suite on real Mac hardware before committing/requesting a build"
-    )
+    ),
+    .provisionsP256BeforeMacOS26
 )
 struct HkdfGuardNativeMacOSWrapUnwrapTests {
 
@@ -754,7 +788,8 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         let service = "com.hkdfguard.tests.without.mlkem.provision"
         defer { Self.deleteKEK(service: service) }
         Self.withoutMLKEM {
-            #expect(Self.createKEK(service: service) == -3)
+            // The default policy, even where the suite runs under P-256.
+            #expect(Self.underSuitePolicy(SuitePolicy()) { Self.createKEK(service: service) } == -3)
             #expect(Self.underSuitePolicy(SuitePolicy(requirePostQuantum: true)) {
                 Self.createKEK(service: service)
             } == -3)

@@ -1287,10 +1287,17 @@ job, on `macos-15` (the oldest macOS GitHub hosts), checks that in two ways:
 The job checks out the repositories in the same layout as the `macos-26`
 job, because the CLI finds the dylib by an absolute path.
 
-What a macOS 15 VM can't show is the Secure Enclave side: provisioning
-failing with `-3` instead of creating a P-256 KEK, and a stored ML-KEM KEK
-being refused with `-18`, never reported corrupt. On real hardware, the
-`withoutMLKEM` tests act that out on macOS 26: a test-only switch,
+The `macos-15` image reports a Secure Enclave that can make P-256 keys, so
+the tests that need one run there too. Before macOS 26 the in-process
+wrap/unwrap suite runs each test under a KekSuite P-256 policy, as such a
+Mac must be configured (the `ProvisionsP256BeforeMacOS26` trait); tests
+that need ML-KEM are macOS 26 only. The CLI tests that provision are
+macOS 26 only as well: the CLI reads its policy only from the root-owned
+policy files, so a test can't opt it into P-256.
+
+A stored ML-KEM KEK being refused with `-18`, never reported corrupt, needs
+macOS 26 to create that KEK. On real hardware, the `withoutMLKEM` tests act
+the older Mac out on macOS 26: a test-only switch,
 `MachineScopeTestOverrides.withoutMLKEM`, makes the Secure Enclave neither
 create nor load ML-KEM keys. Production never sets it.
 
