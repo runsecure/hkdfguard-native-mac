@@ -238,7 +238,7 @@ struct HkdfGuardOpenFileTests {
         // Linux and Windows answer; unwrap names the suite itself (-12).
         let dir = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
-        for suite: UInt8 in [0x00, 0x02, 0xFF] {
+        for suite: UInt8 in [0x00, 0x03, 0xFF] {
             let file = dir.appendingPathComponent("suite.\(suite)")
             var payload = Self.structurallyValidPayload()
             payload[32] = suite
@@ -246,6 +246,15 @@ struct HkdfGuardOpenFileTests {
             let result = Self.openFile(file.path)
             #expect(result.status == -38, "suite \(suite)")
             #expect(result.zeroed, "suite \(suite)")
+        }
+
+        // Both implemented suites are well-formed key files.
+        for suite: UInt8 in [0x01, 0x02] {
+            let file = dir.appendingPathComponent("suite.\(suite)")
+            var payload = Self.structurallyValidPayload()
+            payload[32] = suite
+            try Self.write(payload, to: file)
+            #expect(Self.openFile(file.path).status == 0, "suite \(suite)")
         }
     }
 

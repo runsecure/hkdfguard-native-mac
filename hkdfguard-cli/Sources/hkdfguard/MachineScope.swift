@@ -43,6 +43,9 @@ struct CLIPolicy {
     /// Normalized service -> its RunnerGroup (nil: root only).
     var machineServices: [String: String?]
     var machineKeyFolder: String
+    /// The suite `provision` creates (the policy's KekSuite).
+    var kekSuite: String
+    var requirePostQuantum: Bool
 
     func isMachineScoped(_ service: String) -> Bool {
         machineServices[service.lowercased()] != nil
@@ -86,7 +89,9 @@ func loadPolicy() throws -> CLIPolicy {
         securityAdminGroup: object["securityAdminGroup"] as? String,
         deploymentAdminGroup: object["deploymentAdminGroup"] as? String,
         machineServices: services,
-        machineKeyFolder: folder
+        machineKeyFolder: folder,
+        kekSuite: object["kekSuite"] as? String ?? "unknown",
+        requirePostQuantum: object["requirePostQuantum"] as? Bool ?? false
     )
 }
 
