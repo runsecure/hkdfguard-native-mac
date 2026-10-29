@@ -868,11 +868,18 @@ private let hkdfguardMaxServiceLength = 128
 /// / `isNumber` are Unicode-aware and would accept `é`, CJK, Arabic-Indic
 /// digits, `½`, and so on, while `String.count` counts grapheme clusters
 /// rather than bytes. The C header, the CLI, all promise (and enforce) ASCII bytes, so this must too.
+/// A `switch`, not a chain of `||`: older Swift 6.2 type checkers (Xcode
+/// 26.3) give up on a long chain of literal comparisons.
 private func isValidServiceByte(_ byte: UInt8) -> Bool {
-    (0x30...0x39).contains(byte)      // '0'-'9'
-        || (0x41...0x5A).contains(byte) // 'A'-'Z'
-        || (0x61...0x7A).contains(byte) // 'a'-'z'
-        || byte == 0x2E                 // '.'
+    switch byte {
+    case 0x30...0x39, // '0'-'9'
+         0x41...0x5A, // 'A'-'Z'
+         0x61...0x7A, // 'a'-'z'
+         0x2E:        // '.'
+        return true
+    default:
+        return false
+    }
 }
 
 /// The shared HkdfGuard service-name rule : 1-128 bytes, ASCII letters,
@@ -1505,9 +1512,17 @@ func validGroupName(_ name: String) -> Bool {
     guard !bytes.isEmpty, bytes.count <= 255, bytes.first != UInt8(ascii: "-") else {
         return false
     }
-    return bytes.allSatisfy { byte in
-        (0x30...0x39).contains(byte) || (0x41...0x5A).contains(byte) || (0x61...0x7A).contains(byte)
-            || byte == UInt8(ascii: "_") || byte == UInt8(ascii: "-") || byte == UInt8(ascii: ".")
+    return bytes.allSatisfy(isValidGroupNameByte)
+}
+
+/// A `switch` for the same reason as `isValidServiceByte`'s.
+private func isValidGroupNameByte(_ byte: UInt8) -> Bool {
+    switch byte {
+    case 0x30...0x39, 0x41...0x5A, 0x61...0x7A,
+         UInt8(ascii: "_"), UInt8(ascii: "-"), UInt8(ascii: "."):
+        return true
+    default:
+        return false
     }
 }
 

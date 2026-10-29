@@ -713,11 +713,18 @@ func validateServiceCharset(_ service: String) throws {
     guard service.utf8.count <= maxServiceNameLength else {
         throw CLIError("service name \"\(service)\" must be at most \(maxServiceNameLength) characters, got \(service.utf8.count)")
     }
-    let isValid = service.utf8.allSatisfy { byte in
-        (byte >= 0x30 && byte <= 0x39) // '0'-'9'
-            || (byte >= 0x41 && byte <= 0x5A) // 'A'-'Z'
-            || (byte >= 0x61 && byte <= 0x7A) // 'a'-'z'
-            || byte == 0x2E // '.'
+    // A `switch`, not a chain of `||`: older Swift 6.2 type checkers
+    // (Xcode 26.3) give up on a long chain of literal comparisons.
+    let isValid = service.utf8.allSatisfy { (byte: UInt8) -> Bool in
+        switch byte {
+        case 0x30...0x39, // '0'-'9'
+             0x41...0x5A, // 'A'-'Z'
+             0x61...0x7A, // 'a'-'z'
+             0x2E:        // '.'
+            return true
+        default:
+            return false
+        }
     }
     guard isValid else {
         throw CLIError("service name \"\(service)\" must contain only alphanumeric characters or '.'")
@@ -1357,6 +1364,16 @@ let invalidBase64DekMessage = "the DEK input is not valid base64 (standard alpha
 // A DEK typed or pasted at a terminal is echoed and stays in the scrollback.
 let terminalDekMessage = "refusing to read the DEK from an interactive terminal, where it would be echoed and kept in the scrollback; pipe it in instead, e.g. printf '%s' \"$DEK_B64\" | hkdfguard wrap ... --dek-stdin"
 // The fix is on the sending side, so say what it is.
+/// Whether two bytes are a UTF-16 byte-order mark, either byte order.
+func isUTF16ByteOrderMark(_ first: UInt8, _ second: UInt8) -> Bool {
+    switch (first, second) {
+    case (0xFF, 0xFE), (0xFE, 0xFF):
+        return true
+    default:
+        return false
+    }
+}
+
 let utf16DekMessage = "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text (in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)"
 
 // Branch-free helpers for decodeBase64ConstantTime. Every one returns 0 or 1
@@ -1495,7 +1512,7 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     guard total <= maxDekInputLength else {
         // UTF-16 doubles the text, so it is over the limit long before the
         // decoder could say why: name it here instead.
-        if total >= 2 && ((input[0] == 0xFF && input[1] == 0xFE) || (input[0] == 0xFE && input[1] == 0xFF)) {
+        if total >= 2 && isUTF16ByteOrderMark(input[0], input[1]) {
             throw CLIError(utf16DekMessage)
         }
         throw CLIError("\(flag): \(what) is longer than \(maxDekInputLength) bytes; expected base64 of a \(dekLen)-byte DEK")
@@ -1513,7 +1530,7 @@ func withSuppliedDek<T>(_ source: DekSource, _ body: (UnsafeRawBufferPointer) th
     if total >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
         start = 3
     }
-    if total - start >= 2 && ((bytes[start] == 0xFF && bytes[start + 1] == 0xFE) || (bytes[start] == 0xFE && bytes[start + 1] == 0xFF)) {
+    if total - start >= 2 && isUTF16ByteOrderMark(bytes[start], bytes[start + 1]) {
         throw CLIError(utf16DekMessage)
     }
     var end = total
