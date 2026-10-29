@@ -3663,8 +3663,14 @@ private let hkdfguardMaxPlaintextTextLength = 96
     let digit = ctInRange(c, 0x30, 0x39) // 0-9
     let s62 = ctEq(c, c62)
     let s63 = ctEq(c, c63)
-    let value = ((c &- 0x41) & (0 &- upper)) | ((c &- (0x61 - 26)) & (0 &- lower))
-        | ((c &+ (52 - 0x30)) & (0 &- digit)) | (62 & (0 &- s62)) | (63 & (0 &- s63))
+    // One typed term per class: as a single expression of untyped literals,
+    // this is more than older Swift 6.2 type checkers (Xcode 26.3) finish.
+    let upperValue: UInt32 = (c &- 0x41) & (0 &- upper)
+    let lowerValue: UInt32 = (c &- (0x61 - 26)) & (0 &- lower)
+    let digitValue: UInt32 = (c &+ (52 - 0x30)) & (0 &- digit)
+    let s62Value: UInt32 = 62 & (0 &- s62)
+    let s63Value: UInt32 = 63 & (0 &- s63)
+    let value = upperValue | lowerValue | digitValue | s62Value | s63Value
     return (upper | lower | digit | s62 | s63, value)
 }
 
