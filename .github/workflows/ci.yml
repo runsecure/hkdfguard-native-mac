@@ -115,7 +115,10 @@ jobs:
           xcodebuild -project HkdfGuardNativeMacOS.xcodeproj \
             -target HkdfGuardNativeMacOSDylib -configuration Release \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO BUILD_DIR="$PWD/build-ci" build
+          # --force-resolved-versions: the CLI has no package dependencies,
+          # and must never resolve one that isn't pinned.
           HKDFGUARD_DYLIB_DIR="$PWD/build-ci/Release" swift build -c release \
+            --force-resolved-versions \
             --arch arm64 \
             --package-path hkdfguard-cli \
             --scratch-path "$RUNNER_TEMP/cli-build" \
@@ -128,7 +131,7 @@ jobs:
         working-directory: hkdfguard-native-mac
         run: |
           bin=$(HKDFGUARD_DYLIB_DIR="$PWD/build-ci/Release" swift build -c release \
-            --arch arm64 --package-path hkdfguard-cli \
+            --force-resolved-versions --arch arm64 --package-path hkdfguard-cli \
             --scratch-path "$RUNNER_TEMP/cli-build" --show-bin-path)
           mkdir -p "$RUNNER_TEMP/shipped/build-ci/Release"
           cp build-ci/Release/libhkdfguard.dylib "$RUNNER_TEMP/shipped/build-ci/Release/"
@@ -145,7 +148,9 @@ jobs:
       - name: Show build errors
         if: failure()
         working-directory: hkdfguard-native-mac
-        run: python3 -I .github/ci/build-errors.py "$RUNNER_TEMP/HkdfGuardNativeMacOSTests.xcresult"
+        run: |
+          xcrun xcresulttool get build-results --path "$RUNNER_TEMP/HkdfGuardNativeMacOSTests.xcresult" \
+            | python3 -I .github/ci/build-errors.py
 
       - name: Upload test results
         if: failure()
@@ -262,7 +267,8 @@ jobs:
         working-directory: hkdfguard-native-mac
         run: |
           export DEVELOPER_DIR="$XCODE_26"
-          python3 -I .github/ci/build-errors.py "$RUNNER_TEMP/HkdfGuardNativeMacOSTests-macos-15.xcresult"
+          xcrun xcresulttool get build-results --path "$RUNNER_TEMP/HkdfGuardNativeMacOSTests-macos-15.xcresult" \
+            | python3 -I .github/ci/build-errors.py
 
       - name: Upload test results
         if: failure()

@@ -2,24 +2,28 @@
 
 xcodebuild's summary can name only the file that failed to compile ("The
 compiler is unable to type-check this expression in reasonable time"); the
-result bundle keeps where. Each error becomes a GitHub annotation.
+result bundle keeps where. Each error becomes a GitHub annotation. Reads
+`xcresulttool get build-results` output on stdin, and runs nothing itself:
 
-    python3 -I build-errors.py <path.xcresult>
+    xcrun xcresulttool get build-results --path <path.xcresult> \\
+        | python3 -I build-errors.py
 """
 
 import json
-import subprocess
 import sys
 import urllib.parse
 
-result = subprocess.run(
-    ["xcrun", "xcresulttool", "get", "build-results", "--path", sys.argv[1]],
-    capture_output=True, text=True)
-if result.returncode != 0:
-    print(result.stderr or result.stdout)
+text = sys.stdin.read()
+if not text.strip():
+    print("no build results (did the build start?)")
+    sys.exit(0)
+try:
+    results = json.loads(text)
+except json.JSONDecodeError:
+    print(text)
     sys.exit(0)
 
-errors = json.loads(result.stdout).get("errors", [])
+errors = results.get("errors", [])
 if not errors:
     print("no build errors in the result bundle")
 for error in errors:

@@ -42,13 +42,13 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
 fail_now() { echo "error: $*" >&2; exit 1; }
-[ "$(id -u)" -eq 0 ] || fail_now "run with sudo"
-[ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] || fail_now "run with sudo from your own (admin) account"
+[[ "$(id -u)" -eq 0 ]] || fail_now "run with sudo"
+[[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != root ]] || fail_now "run with sudo from your own (admin) account"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 CLI_SRC="$REPO/hkdfguard-cli/.build/release/hkdfguard"
 LIB_SRC="$REPO/build/Release/libhkdfguard.dylib"
-for f in "$CLI_SRC" "$LIB_SRC"; do [ -f "$f" ] || fail_now "missing $f -- build first (see the header)"; done
+for f in "$CLI_SRC" "$LIB_SRC"; do [[ -f "$f" ]] || fail_now "missing $f -- build first (see the header)"; done
 
 HG="/Library/Application Support/HkdfGuard"
 POLICY="$HG/policy.plist"
@@ -60,24 +60,24 @@ GROUP=_hkdfguardverify
 LABEL=com.hkdfguard.verify.consumer
 JOBPLIST=/Library/LaunchDaemons/$LABEL.plist
 MLKEM_AVAILABLE=0
-[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ] && MLKEM_AVAILABLE=1
+[[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ]] && MLKEM_AVAILABLE=1
 
-[ -e "$POLICY" ] && fail_now "$POLICY already exists; not touching a real policy"
-[ -e "$MANAGED" ] && fail_now "$MANAGED exists (an MDM policy); run this on a Mac without one"
-for s in $SERVICES; do [ -e "$KEKS/$s.kek" ] && fail_now "$KEKS/$s.kek already exists"; done
+[[ -e "$POLICY" ]] && fail_now "$POLICY already exists; not touching a real policy"
+[[ -e "$MANAGED" ]] && fail_now "$MANAGED exists (an MDM policy); run this on a Mac without one"
+for s in $SERVICES; do [[ -e "$KEKS/$s.kek" ]] && fail_now "$KEKS/$s.kek already exists"; done
 dscl . -read "/Groups/$GROUP" >/dev/null 2>&1 && fail_now "group $GROUP already exists"
 
 CREATED_HG=0; CREATED_KEKS=0
-[ -d "$HG" ] || { mkdir -m 0755 "$HG" && chown root:wheel "$HG" && CREATED_HG=1; }
-[ -d "$KEKS" ] || CREATED_KEKS=1
+[[ -d "$HG" ]] || { mkdir -m 0755 "$HG" && chown root:wheel "$HG" && CREATED_HG=1; }
+[[ -d "$KEKS" ]] || CREATED_KEKS=1
 
 cleanup() {
     launchctl bootout system/$LABEL 2>/dev/null; rm -f "$JOBPLIST"
     rm -f "$POLICY"
     for s in $SERVICES; do rm -f "$KEKS/$s.kek"; done
-    [ "$CREATED_KEKS" -eq 1 ] && rmdir "$KEKS" 2>/dev/null
+    [[ "$CREATED_KEKS" -eq 1 ]] && rmdir "$KEKS" 2>/dev/null
     rm -rf "$STAGE"
-    [ "$CREATED_HG" -eq 1 ] && rmdir "$HG" 2>/dev/null
+    [[ "$CREATED_HG" -eq 1 ]] && rmdir "$HG" 2>/dev/null
     dseditgroup -o delete -n . "$GROUP" >/dev/null 2>&1
     # The Secure Enclave prototype's watcher, if it is still installed.
     launchctl bootout system/com.hkdfguard.sepoc.watch 2>/dev/null
@@ -175,10 +175,10 @@ consumer_daemon() { # consumer_daemon <user> <tag>
 </dict></plist>
 PLIST
     chown root:wheel "$JOBPLIST"; chmod 0644 "$JOBPLIST"
-    [ "$1" = nobody ] || touch "$out"
+    [[ "$1" = nobody ]] || touch "$out"
     chown "$1" "$out" 2>/dev/null
     launchctl bootstrap system "$JOBPLIST"
-    for _ in $(seq 1 40); do [ -s "$out" ] && break; sleep 0.25; done
+    for _ in $(seq 1 40); do [[ -s "$out" ]] && break; sleep 0.25; done
     launchctl bootout system/$LABEL 2>/dev/null; rm -f "$JOBPLIST"
     cat "$out" 2>/dev/null || echo "(no output)"
 }
@@ -205,9 +205,9 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     expect "provision creates the machine KEK" "machine KEK provisioned" "$OUT"
     expect "of suite $suite" "suite: $suite" "$OUT"
     FP=$(sed -n 's/^fingerprint: \([0-9a-f]\{64\}\) .*/\1/p' <<<"$OUT")
-    [ ${#FP} -eq 64 ] && pass "provision printed a fingerprint" || fail "provision printed no fingerprint: $OUT"
+    [[ ${#FP} -eq 64 ]] && pass "provision printed a fingerprint" || fail "provision printed no fingerprint: $OUT"
     expect "the KEK file is root:$GROUP 0640" "root:$GROUP 640" "$(stat -f '%Su:%Sg %Lp' "$KEKS/$SERVICE.kek" 2>&1)"
-    [ "$(byte_at 4 "$KEKS/$SERVICE.kek")" = "$format_byte" ] && pass "the KEK file is format $format_byte" \
+    [[ "$(byte_at 4 "$KEKS/$SERVICE.kek")" = "$format_byte" ]] && pass "the KEK file is format $format_byte" \
         || fail "the KEK file is format $(byte_at 4 "$KEKS/$SERVICE.kek"), not $format_byte"
     expect "the KEK folder is excluded from Time Machine" "\\[Excluded\\]" "$(tmutil isexcluded "$KEKS" 2>&1)"
     OUT=$("$CLI" provision -sn $SERVICE 2>&1)
@@ -220,13 +220,13 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     ( umask 077; xxd -r -p <<<"$DEK_HEX" | base64 > "$STAGE/dek.b64" )
     OUT=$("$CLI" wrap -kf "$KEYFILE" -sn $SERVICE --dek-file "$STAGE/dek.b64" 2>&1)
     expect "wrap by an admin outside DeploymentAdminGroup is refused" "not a member of $GROUP, the policy's DeploymentAdminGroup" "$OUT"
-    [ ! -e "$KEYFILE" ] && pass "and nothing was written" || fail "a key file was written despite the refusal"
+    [[ ! -e "$KEYFILE" ]] && pass "and nothing was written" || fail "a key file was written despite the refusal"
 
     write_policy admin admin
     OUT=$("$CLI" wrap -kf "$KEYFILE" -sn $SERVICE --dek-file "$STAGE/dek.b64" -fp "$FP" 2>&1)
     expect "wrap succeeds in the system job" "wrapped key written" "$OUT"
     expect "under the provisioned KEK" "fingerprint: $FP (confirmed)" "$OUT"
-    [ "$(byte_at 32 "$KEYFILE")" = "$suite_byte" ] && pass "the payload names suite $suite_byte" \
+    [[ "$(byte_at 32 "$KEYFILE")" = "$suite_byte" ]] && pass "the payload names suite $suite_byte" \
         || fail "the payload names suite $(byte_at 32 "$KEYFILE"), not $suite_byte"
     expect "the key file goes to the runner group by default" "root:$GROUP 640" "$(stat -f '%Su:%Sg %Lp' "$KEYFILE" 2>&1)"
 
@@ -241,7 +241,7 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     echo "        $SUDO_USER daemon (not in the group): $OUT"
     if grep -q 'unwrap=0' <<<"$OUT"; then fail "an account outside the runner group unwrapped"; else pass "an account outside the runner group can't unwrap"; fi
 
-    if [ "$tag" = p256 ]; then
+    if [[ "$tag" = p256 ]]; then
         echo "== $suite: RequirePostQuantum"
         SUITE_KEYS="<key>RequirePostQuantum</key><true/>"
         write_policy admin admin
@@ -253,7 +253,7 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
         expect "it can't wrap" "RequirePostQuantum" "$OUT"
         OUT=$("$CLI" provision -sn $SERVICE 2>&1)
         expect "provision refuses it rather than verifying it" "RequirePostQuantum" "$OUT"
-        [ -e "$KEKS/$SERVICE.kek" ] && pass "and leaves it in place" || fail "the KEK file was removed"
+        [[ -e "$KEKS/$SERVICE.kek" ]] && pass "and leaves it in place" || fail "the KEK file was removed"
         # Retired with RequirePostQuantum still set: how a migration ends.
     fi
 
@@ -261,10 +261,10 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     WRONG=$(printf '%064d' 0)
     OUT=$("$CLI" retire -sn $SERVICE -fp "$WRONG" 2>&1)
     expect "retire with the wrong fingerprint is refused" "nothing was deleted" "$OUT"
-    [ -e "$KEKS/$SERVICE.kek" ] && pass "the KEK file is still there" || fail "the KEK file was deleted"
+    [[ -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is still there" || fail "the KEK file was deleted"
     OUT=$("$CLI" retire -sn $SERVICE -fp "$FP" 2>&1)
     expect "retire with the right fingerprint deletes the KEK" "retired machine KEK" "$OUT"
-    [ ! -e "$KEKS/$SERVICE.kek" ] && pass "the KEK file is gone" || fail "the KEK file is still there"
+    [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is gone" || fail "the KEK file is still there"
     SUITE_KEYS="$5"
     write_policy admin admin
     OUT=$(consumer_daemon nobody "$tag-nobody-2")
@@ -273,7 +273,7 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     expect "status reports it absent" "kek: absent" "$("$CLI" status -sn $SERVICE 2>&1)"
 }
 
-if [ "$MLKEM_AVAILABLE" -eq 1 ]; then
+if [[ "$MLKEM_AVAILABLE" -eq 1 ]]; then
     verify_suite mlkem ML-KEM-1024 02 02 ""
 else
     echo "== ML-KEM-1024: this macOS is before 26, so provisioning must refuse"
@@ -281,10 +281,10 @@ else
     write_policy admin admin
     OUT=$("$CLI" provision -sn $SERVICE 2>&1)
     expect "provision fails, naming the opt-in" "KekSuite P-256" "$OUT"
-    [ ! -e "$KEKS/$SERVICE.kek" ] && pass "and creates no KEK of another suite" || fail "a KEK file was created"
+    [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "and creates no KEK of another suite" || fail "a KEK file was created"
 fi
 verify_suite p256 P-256 01 01 "<key>KekSuite</key><string>P-256</string>"
 
 echo
 echo "== $PASS passed, $FAILS failed"
-[ "$FAILS" -eq 0 ]
+[[ "$FAILS" -eq 0 ]]
