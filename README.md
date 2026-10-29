@@ -1269,17 +1269,23 @@ job `macos-15`):
 
 | Workflow | Runs on | Does | Credentials |
 |---|---|---|---|
-| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed; then the same test build run again on macOS 15 | none |
+| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed; then, on macOS 15, those Release binaries run and the test suite | none |
 | `release.yml` | a pushed `vX.Y.Z` tag, or by hand | `ci.yml`, then `build-release.sh` — signed, notarized, stapled — and, for a tag, the GitHub Release | the `release` environment's secrets |
 
 **macOS 15.** The library's deployment target is macOS 14, but ML-KEM is
-macOS 26 only. The `test-macos-15` job runs the test build from the
-`macos-26` job, unchanged, on `macos-15` (the oldest macOS GitHub hosts).
-An ML-KEM API reached without an availability check would fail there, and
-on every older Mac it would break the library for P-256 too. The job
-checks out the repositories in the same layout as the build job, because
-the test bundle finds them from the paths it was compiled at. It also needs
-an Xcode 26 on the image, since the CLI tests build the CLI with Swift 6.2+.
+macOS 26 only. An ML-KEM API reached without an availability check would
+break the library on every older Mac, for P-256 too. The `test-macos-15`
+job, on `macos-15` (the oldest macOS GitHub hosts), checks that in two ways:
+
+- It loads the `macos-26` job's Release dylib and runs its CLI, the
+  binaries a release ships. A missing symbol kills them at load. The
+  unsigned strict-hardening CLI then refuses to go on, which is expected.
+- It builds and runs the test suite with the newest Xcode 26 on that image.
+  The tests can't be built on `macos-26` and moved, because a test bundle
+  only loads under the Xcode that built it.
+
+The job checks out the repositories in the same layout as the `macos-26`
+job, because the CLI finds the dylib by an absolute path.
 
 What a macOS 15 VM can't show is the Secure Enclave side: provisioning
 failing with `-3` instead of creating a P-256 KEK, and a stored ML-KEM KEK
