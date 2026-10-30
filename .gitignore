@@ -12,6 +12,8 @@ dist/
 build-arm64/
 build-x64/
 build-x86_64/
+## xcodebuild output directory used by the CI workflow (BUILD_DIR=build-ci)
+build-ci/
 ## Per-architecture SwiftPM scratch directories used by build-dist.sh
 hkdfguard-cli/.build-*/
 

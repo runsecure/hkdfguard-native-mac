@@ -109,6 +109,19 @@ struct HkdfGuardCommandLineToolTests {
     private static let secureEnclaveAvailableComment: Comment =
         "requires a real Secure Enclave — not available on CI/VM runners; run on real Mac hardware before committing/requesting a build"
 
+    /// The tests that have the CLI provision a KEK also need macOS 26: the
+    /// CLI provisions the default suite, ML-KEM, and fails before macOS 26
+    /// rather than falling back. Its policy comes only from the root-owned
+    /// policy files, so a test can't opt it into P-256 the way the
+    /// in-process suite does.
+    private static let cliCanProvision: Bool = {
+        guard #available(macOS 26.0, *) else { return false }
+        return SecureEnclave.isAvailable
+    }()
+
+    private static let cliCanProvisionComment: Comment =
+        "requires a real Secure Enclave and macOS 26 (the CLI provisions ML-KEM by default; before macOS 26 that needs a KekSuite P-256 policy file) — run on real Mac hardware before committing/requesting a build"
+
     private static let interactiveKeychainAndSecureEnclaveComment: Comment =
         "requires a real Secure Enclave and a one-time interactive keychain approval; set HKDFGUARD_RUN_INTERACTIVE_KEYCHAIN_TESTS=1 on real Mac hardware to opt in — see this suite's doc comment"
 
@@ -405,7 +418,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(recovered.dek == dek)
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliWrappedFileHasExpectedLengthAndPermissions() throws {
         let service = "com.hkdfguard.tests.cli.file.attributes"
         defer { Self.deleteKEK(service: service) }
@@ -442,7 +455,7 @@ struct HkdfGuardCommandLineToolTests {
         return (status, Array(out.prefix(Int(max(outLen, 0)))))
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliWrappedFileIsReadByOpenFile() throws {
         // The file format contract between the CLI (writer) and the library
         // (reader): whatever `wrap` writes -- 0600, fsynced, 125 bytes --
@@ -606,7 +619,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!Self.kekItemExists(service: service))
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliForceRefusesToOverwriteThroughHardLink() throws {
         // The hard-link twin of the symlink case: O_NOFOLLOW can't see a
         // hard link, and it is a regular file, so only the link count
@@ -775,7 +788,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!ok.stderr.contains("requires a value"), "\(ok.stderr)")
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliGroupWritesTheFile0640WithThatGroup() throws {
         guard let group = Self.eligibleGroup() else {
             // Every group this account is in is a broad one; nothing to grant.
@@ -799,7 +812,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(info.st_uid == geteuid())
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliDekStdinWrapsTheSuppliedDek() throws {
         let service = "com.hkdfguard.tests.cli.dek.stdin"
         defer { Self.deleteKEK(service: service) }
@@ -835,7 +848,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(recovered.dek == dek)
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliDekFileWrapsTheSuppliedDek() throws {
         let service = "com.hkdfguard.tests.cli.dek.file"
         defer { Self.deleteKEK(service: service) }
@@ -889,7 +902,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!Self.kekItemExists(service: "com.hkdfguard.tests.cli.empty.stdin"))
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliWrapWritesWhereThePathWasCheckedNotWhereALinkBeforeDotDotLeads() throws {
         // keys/link -> elsewhere/deep: to the kernel keys/link/.. is
         // `elsewhere`, while the folder check resolves `..` as text, to
@@ -934,7 +947,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)) == original, "the file is left untouched")
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliForceOverwritesAFileUpToTheSizeCapBeforeReplacingIt() throws {
         // --force overwrites a file of up to 64 KiB (the Linux tool's cap; a
         // bigger one is refused, tested separately). A file of exactly
@@ -1056,7 +1069,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliAcceptsDekInputWithOneTrailingCRLF() throws {
         let service = "com.hkdfguard.tests.cli.dek.crlf"
         defer { Self.deleteKEK(service: service) }
@@ -1310,7 +1323,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.stderr.contains("has an access control list"), "stderr: \(result.stderr)")
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliWrapStripsAnACLInheritedFromTheKeyFilesFolder() throws {
         // A folder with an inheritable ACE passes it to every new file, and
         // neither the 0600 at creation nor fchmod removes it. The written key
@@ -1367,7 +1380,7 @@ struct HkdfGuardCommandLineToolTests {
         }
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliLeavesNoPartialKeyFileWhenTheFileSizeLimitIsHit() throws {
         // With RLIMIT_FSIZE below a payload, the default SIGXFSZ would kill
         // the CLI mid-write and leave a truncated key file that blocks the
@@ -1456,7 +1469,7 @@ struct HkdfGuardCommandLineToolTests {
 
     // MARK: - provision / wrap
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliProvisionCreatesKekAndIsIdempotent() throws {
         let service = "com.hkdfguard.tests.cli.provision.idempotent"
         defer { Self.deleteKEK(service: service) }
@@ -1732,7 +1745,7 @@ struct HkdfGuardCommandLineToolTests {
         return nil
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliRetireRequiresTheMatchingFingerprint() throws {
         let service = "com.hkdfguard.tests.cli.retire.roundtrip"
         defer { Self.deleteKEK(service: service) }
@@ -1782,7 +1795,7 @@ struct HkdfGuardCommandLineToolTests {
         fingerprint(fromProvisionOutput: stdout)
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliWrapPrintsTheFingerprintOfTheKekItUsedAndAcceptsAMatchingPin() throws {
         let service = "com.hkdfguard.tests.cli.wrap.fingerprint.match"
         defer { Self.deleteKEK(service: service) }
@@ -1820,7 +1833,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(FileManager.default.fileExists(atPath: pinnedPath))
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliForceWithoutFingerprintIsPinnedToTheReplacedKeyFilesKek() throws {
         // Two services stand in for one service whose keychain item was
         // replaced (planted ahead of provision, or swapped since): the key
@@ -1877,7 +1890,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(embedded == swappedFingerprint)
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliWrapWithTheWrongFingerprintWritesNothing() throws {
         let service = "com.hkdfguard.tests.cli.wrap.fingerprint.mismatch"
         defer { Self.deleteKEK(service: service) }
@@ -1937,7 +1950,7 @@ struct HkdfGuardCommandLineToolTests {
 
     // MARK: - status
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliStatusReportsAbsentThenPresentWithoutCreatingAnything() throws {
         let service = "com.hkdfguard.tests.cli.status"
         defer { Self.deleteKEK(service: service) }
@@ -2000,7 +2013,7 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!Self.kekItemExists(service: service))
     }
 
-    @Test(.enabled(if: SecureEnclave.isAvailable, secureEnclaveAvailableComment))
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
     func cliRetireCorruptRefusesAValidKek() throws {
         let service = "com.hkdfguard.tests.cli.retire.corrupt.valid"
         defer { Self.deleteKEK(service: service) }

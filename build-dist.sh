@@ -397,14 +397,18 @@ build_arch() {
     # HKDFGUARD_STRICT_HARDENING: this CLI is signed below with the
     # Hardened Runtime and no entitlements, so it can require that of itself
     # (HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE). The --help smoke test
-    # after signing proves it does start.
+    # after signing proves it does start. --force-resolved-versions: the CLI
+    # has no package dependencies, and must never resolve one that isn't
+    # pinned.
     HKDFGUARD_DYLIB_DIR="$dylib_dir" swift build -c release \
+        --force-resolved-versions \
         --arch "$arch" \
         --package-path "$CLI_PKG" \
         --scratch-path "$scratch" \
         -Xswiftc -DHKDFGUARD_STRICT_HARDENING
     local cli_bin_dir
     cli_bin_dir="$(HKDFGUARD_DYLIB_DIR="$dylib_dir" swift build -c release \
+        --force-resolved-versions \
         --arch "$arch" \
         --package-path "$CLI_PKG" \
         --scratch-path "$scratch" \

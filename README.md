@@ -20,42 +20,67 @@ for pipelines.
 ## What it does
 
 Each calling application identifies itself with a **service name** (see
-below). A service's KEK is a P-256 key-agreement key generated inside the
-Secure Enclave; its private half never leaves the enclave and can only be
-*used*, never extracted. What the library persists in the keychain is the
-enclave's opaque, device-bound reference to that key.
+below). A service's KEK is a key generated inside the Secure Enclave: an
+ML-KEM-1024 key by default, or a P-256 key-agreement key where the policy
+opts in to one (see [KEK suites](#kek-suites)). Its private half never
+leaves the enclave and can only be *used*, never extracted. What the
+library persists, in the keychain or a machine KEK file, is the enclave's
+opaque, device-bound reference to that key.
 
 Provisioning is explicit. `hkdfguard_create_kek` is the only function that
 creates a KEK; every wrap/unwrap function requires one to already exist and
 fails with `kekNotFound` (-17) otherwise. Nothing is ever created "on first
 use".
 
-Wrapping is the same construction as the Linux and Windows libraries:
-**ECDH against a hashed per-payload point, HKDF-SHA512, AES-256-GCM**, with
-CryptoKit doing every primitive:
+Every payload is sealed the same way: **a secret only the Secure Enclave
+can compute, HKDF-SHA512, AES-256-GCM**, with CryptoKit doing every
+primitive. The KEK's suite decides where the secret comes from:
 
-1. A fresh random 32-byte **salt** is hashed to a P-256 point `H` with
-   RFC 9380 hash-to-curve, suite `P256_XMD:SHA-256_SSWU_RO_`, under the DST
-   `"HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_"`
-   (the Linux library's hash, byte for byte).
-2. The **Secure Enclave** computes `Z = ECDH(KEK_priv, H)`.
-3. **HKDF-SHA512** turns `Z` into the 32-byte AES key, with the salt as
-   HKDF's salt and an `info` of `"hkdfguard-wrap-v1:"` ‖ the service name's
-   length (u16, little-endian) ‖ the service name ‖ the payload header.
-4. **AES-256-GCM** seals the DEK under a fresh random 12-byte nonce, with
-   the payload header as additional authenticated data.
+1. A fresh random 32-byte **salt** and 12-byte **nonce** are drawn.
+2. The **Secure Enclave** computes the secret:
+   - **ML-KEM-1024** (suite `0x02`): it decapsulates the ciphertext stored
+     with the KEK, which was encapsulated to it once, at provisioning, and
+     gets back the 32-byte secret `K`.
+   - **P-256** (suite `0x01`), the Linux and Windows libraries'
+     construction: the salt is hashed to a P-256 point `H` with RFC 9380
+     hash-to-curve, suite `P256_XMD:SHA-256_SSWU_RO_`, under the DST
+     `"HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_"`
+     (the Linux library's hash, byte for byte), and the enclave computes
+     `Z = ECDH(KEK_priv, H)`.
+3. **HKDF-SHA512** turns the secret into the 32-byte AES key, with the salt
+   as HKDF's salt and an `info` of `"hkdfguard-wrap-v1:"` ‖ the service
+   name's length (u16, little-endian) ‖ the service name ‖ the payload
+   header. The header holds the suite byte, so the two suites never derive
+   the same key.
+4. **AES-256-GCM** seals the DEK under the nonce, with the payload header
+   as additional authenticated data.
 
-Unwrapping reverses this: the salt in the payload gives the same point, the
-Secure Enclave the same `Z`. Every wrap draws a new salt and nonce, so two
+Unwrapping reverses this: the payload names the suite, the Secure Enclave
+computes the same secret. Every wrap draws a new salt and nonce, so two
 wraps of the same DEK never produce the same bytes, and a payload wrapped
 for one service can never be opened under another.
 
-### Why a hashed point: only this Mac can create a payload
+### KEK suites
 
-Nobody knows the private key of a point that came out of a hash, so `Z` can
-only be computed with the KEK's private key, which never leaves the Secure
-Enclave. Creating a payload therefore needs the enclave as much as opening
-one does. Knowing the KEK's **public** key is not enough.
+| | ML-KEM-1024 (`0x02`) | P-256 (`0x01`) |
+|---|---|---|
+| Provisioned | by default, on macOS 26 and later | only with `KekSuite` `P-256` in the [policy](#the-policy) |
+| The secret | `K`: one per KEK | `Z`: one per payload |
+| A quantum computer that sees the public key | learns nothing that gives `K` | recovers the private key, and with it every payload |
+| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key | SHA-256 of `0x04 ‖ x ‖ y` |
+| Same construction on Linux and Windows | not yet | yes |
+
+Both keep the payload at 125 bytes, and with both only this Mac can create
+a payload, not merely open one. A KEK has exactly one suite, fixed when it
+is provisioned: changing a service's suite means retiring its KEK and
+provisioning a new one (see [Moving to post-quantum KEKs](#moving-to-post-quantum-keks)).
+
+### Why only this Mac can create a payload
+
+For **P-256**, nobody knows the private key of a point that came out of a
+hash, so `Z` can only be computed with the KEK's private key, which never
+leaves the Secure Enclave. Creating a payload therefore needs the enclave
+as much as opening one does. Knowing the KEK's **public** key is not enough.
 
 That is the difference from ordinary public-key encryption (ECIES, HPKE base
 mode), where the sender picks an ephemeral key `e` and computes `e · KEK_pub`.
@@ -65,18 +90,40 @@ isn't secret, and once it has been seen it can't be made secret again, so
 with that design the key file's permissions would be the only thing standing
 in the way.
 
-Each payload gets its own point, rather than one fixed point per service,
-so `Z` is unique to the payload: if one `Z` is ever captured (from memory,
-say), it opens that one payload, not the service's history, and still lets
-nobody create a new one.
+For **ML-KEM-1024**, `K` came out of one encapsulation, made at
+provisioning and then dropped; from then on only decapsulating the stored
+ciphertext gives it back, and that takes the enclave. The public key lets
+anyone encapsulate a secret of their own, not recover `K`, so it can't be
+used to forge a payload either. Neither the public key nor the stored
+ciphertext needs to stay secret.
+
+### What each suite gives up
+
+**P-256** gives each payload its own point, so `Z` is unique to the
+payload: if one `Z` is ever captured (from memory, say), it opens that one
+payload, not the service's history, and still lets nobody create a new one.
+What it can't survive is a quantum computer that has seen the KEK's public
+key: Shor's algorithm turns the public key into the private key, and that
+opens every payload ever wrapped under the KEK, offline, without this Mac.
+No payload or fingerprint carries the public key, but a P-256 machine KEK
+file does, in the clear, and so does every copy of that file a backup or
+snapshot keeps.
+
+**ML-KEM-1024** has one secret per KEK, not one per payload. `K` passes
+through the process on every wrap and unwrap, as `Z` does; captured once,
+it opens every payload under that KEK, and lets its holder create new ones,
+until the KEK is retired. That is the price of keeping the payload at 125
+bytes. The alternative, a fresh encapsulation per payload with an ML-DSA
+signature to keep payloads unforgeable, has P-256's one-secret-per-payload
+property but makes every payload about 4.5 KB.
 
 ## Wrapped payload format
 
 Always exactly **125 bytes**:
 
 ```
-[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key, 0x04 || x || y ]
-[  1-byte suite id — 0x01                                                  ]
+[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key                 ]
+[  1-byte suite id — 0x01 (P-256) or 0x02 (ML-KEM-1024), the KEK's suite    ]
 [ 32-byte random salt                                                       ]
 [ 12-byte random AES-GCM nonce                                              ]
 [ 32-byte AES-256-GCM ciphertext || 16-byte tag                             ]
@@ -87,29 +134,35 @@ Linux: into the derived key (HKDF `info`, with the service name) and into
 the tag (AES-GCM additional data). No header byte can be changed without the
 open failing.
 
-The fingerprint identifies *which* KEK a payload was wrapped under. It hashes
-the uncompressed public key (`0x04 || x || y`), as Linux does. Windows hashes
-the raw `x || y`, without the `0x04` prefix, so the same key would fingerprint
-differently there; that is harmless, since a payload is only ever opened on the
-machine that wrapped it, but a fingerprint is only meaningful on the platform
-that produced it. On
-unwrap it is compared to the current KEK's public key **before** any key
-agreement or decryption is attempted, so "wrong or rotated KEK" is reported
-as `fingerprintMismatch` (-16) rather than as a generic decryption failure.
+The fingerprint identifies *which* KEK a payload was wrapped under. For a
+P-256 KEK it hashes the uncompressed public key (`0x04 || x || y`), as Linux
+does; Windows hashes the raw `x || y`, without the `0x04` prefix, so the same
+key would fingerprint differently there. That is harmless, since a payload
+is only ever opened on the machine that wrapped it, but a fingerprint is
+only meaningful on the platform that produced it. For an ML-KEM-1024 KEK it
+hashes the raw 1568-byte public key. On unwrap it is compared to the current
+KEK's **before** any key agreement, decapsulation or decryption is
+attempted, so "wrong or rotated KEK" is reported as `fingerprintMismatch`
+(-16) rather than as a generic decryption failure. That includes a payload
+of the other suite: no KEK of one suite has the other's fingerprint.
 Pipelines and consumers pin a KEK by comparing these 32 bytes with the
 fingerprint recorded at provisioning.
 
-The **suite id** names the construction above. This build implements exactly
-one, `0x01`; any other value is `unsupportedCiphersuite` (-12) from unwrap,
-reported before the keychain is consulted (`fileMalformed`, -38, from
-`hkdfguard_open_file`, as on Linux and Windows), so a future construction is a parse-time
-dispatch rather than a new file format.
+The **suite id** names the construction above: `0x01` or `0x02`, the suite
+of the KEK that wrapped it. Any other value is `unsupportedCiphersuite`
+(-12) from unwrap, reported before the keychain is consulted (`fileMalformed`,
+-38, from `hkdfguard_open_file`, as on Linux and Windows), so a future
+construction is a parse-time dispatch rather than a new file format. The
+right fingerprint with the other suite's byte can only be an alteration, and
+is `decryptionFailed` (-11). With the policy's `RequirePostQuantum`, a `0x01`
+payload is `unsupportedCiphersuite` (-12) too, before the keychain is
+consulted.
 
 Unwrap failures are kept apart: the Secure Enclave refusing the key
-agreement (locked, unavailable) is `encryptionFailed` (-5, CRYPTO_ERROR), a
-fact about this machine; only a tag that doesn't verify is
-`decryptionFailed` (-11, PAYLOAD_AUTH_FAILED): the payload was altered, or
-sealed for a different service.
+agreement or the decapsulation (locked, unavailable) is `encryptionFailed`
+(-5, CRYPTO_ERROR), a fact about this machine; only a tag that doesn't
+verify is `decryptionFailed` (-11, PAYLOAD_AUTH_FAILED): the payload was
+altered, or sealed for a different service.
 
 ### The trust boundary
 
@@ -134,7 +187,8 @@ sealed for a different service.
 
 The macOS, Linux, and Windows libraries share one C ABI: the function names
 and signatures, the status codes, the `HKDFGUARD_*` flags, and what every
-call does. They also share the construction above. The payload **layout**
+call does. They also share the P-256 construction above; the ML-KEM-1024
+suite is this library's alone for now. The payload **layout**
 is not shared: Linux adds a version byte, a provider tag and a key id
 (132–276 bytes), and this library's is the fixed 125 bytes above. That's why
 `HKDFGUARD_WRAPPED_MAX_LEN` has the same name everywhere but a per-platform
@@ -166,14 +220,16 @@ Declared in
 (plain C; `extern "C"`-guarded; nullability-annotated). All pointers are
 required — a NULL is reported, never dereferenced — except `out` in a size
 probe (`out = NULL`, `*out_len = 0`), as on Linux. `hkdfguard_keychain_mode`,
-`hkdfguard_kek_fingerprint` and `hkdfguard_machine_policy` (the KEK policy in
-effect, as JSON; the CLI uses it to enforce the admin roles) are macOS-only;
-everything else is the C ABI shared with Linux and Windows.
+`hkdfguard_kek_fingerprint`, `hkdfguard_kek_suite` and `hkdfguard_machine_policy`
+(the KEK policy in effect, as JSON; the CLI uses it to enforce the admin
+roles and to show the suite settings) are macOS-only; everything else is the
+C ABI shared with Linux and Windows.
 
 ```c
 int hkdfguard_keychain_mode(int* out_mode);          // macOS-only: 0 legacy, 1 data-protection
 int hkdfguard_kek_exists(const char* service, int* out_exists);
 int hkdfguard_kek_fingerprint(const char* service, uint8_t* out, int* out_len); // macOS-only: 32 bytes, public
+int hkdfguard_kek_suite(const char* service, int* out_suite); // macOS-only: HKDFGUARD_KEK_SUITE_P256 (1) or _MLKEM1024 (2)
 int hkdfguard_create_kek(const char* service);        // the only function that creates a KEK
 int hkdfguard_wrap_dek(const char* service, const uint8_t* dek, int dek_len,
                        uint8_t* out, int* out_len);
@@ -407,7 +463,8 @@ reach `out` only on success; on any failure the whole declared capacity of
   now. Its bytes never reach the caller's buffer, and the library zeroes
   its own read buffer on every return.
 - **Malformed.** A 125-byte file whose KEK fingerprint is all zeros is
-  `fileMalformed` (-38), and so is one whose suite byte is not `0x01`: as
+  `fileMalformed` (-38), and so is one whose suite byte is neither `0x01`
+  nor `0x02`: as
   on Linux and Windows, every format problem in a key file is this one code
   (unwrap, given the same bytes, reports the suite as -12). These are structural checks only: whether the payload is genuine,
   unaltered, and for this service is decided by `hkdfguard_unwrap_dek`
@@ -427,17 +484,17 @@ here are defined there but never returned on macOS.
 | `0`   | `OK` | `success` | success |
 | `-1`  | `ERR_INVALID_ARGUMENT` | `invalidInputLength` | `dek_len != 32`, a NULL buffer/length pointer, or a NULL or empty `path` |
 | `-2`  | `ERR_BUFFER_TOO_SMALL` | `outputBufferTooSmall` | `*out_len` set to the required size |
-| `-3`  | `ERR_PROVIDER_UNAVAILABLE` | `enclaveUnavailable` | no Secure Enclave on this machine |
+| `-3`  | `ERR_PROVIDER_UNAVAILABLE` | `enclaveUnavailable` | no Secure Enclave on this machine; or, from `hkdfguard_create_kek`, one that can't create the KEK suite the policy asks for (ML-KEM-1024 needs macOS 26 or later). Never answered by creating a P-256 KEK instead: `KekSuite` `P-256` is the opt-in |
 | `-5`  | `ERR_CRYPTO_ERROR` | `encryptionFailed` | the RNG failed, the Secure Enclave refused the key agreement (wrap or unwrap), or AES-GCM sealing failed |
 | `-6`  | `ERR_INTERNAL_ERROR` | `unexpectedOutputLength` | an internal failure the library detected: output of an impossible length, or a buffer that should exist not existing (a bug). Linux also returns it for a caught panic; a Swift runtime trap can't be caught, so this library has no force-unwrap, `try!`, `fatalError` or `precondition` on its export paths (a test enforces it), and returns -6 where Linux would have caught one |
 | `-8`  | `ERR_INVALID_SERVICE_NAME` | `invalidServiceIdentifier` | see `service` above |
 | `-9`  | `ERR_POLICY_INVALID` | `policyInvalid` | the production policy can't be used (an unknown setting, a wrong type, not root's, or a runner group that doesn't exist or is too broad); **every** call fails until it is fixed |
 | `-10` | `ERR_PAYLOAD_MALFORMED` | `payloadMalformed` | `wrapped_len != 125` |
 | `-11` | `ERR_PAYLOAD_AUTH_FAILED` | `decryptionFailed` | the AES-GCM tag did not verify: an altered payload, or one wrapped for a different service under the same KEK |
-| `-12` | `ERR_PAYLOAD_UNSUPPORTED` | `unsupportedCiphersuite` | the payload's suite byte is not one this build implements; a newer or different build wrote it. Not tampering |
+| `-12` | `ERR_PAYLOAD_UNSUPPORTED` | `unsupportedCiphersuite` | the payload's suite byte is not one this build implements; a newer or different build wrote it. Not tampering. Also a P-256 (`0x01`) payload under the policy's `RequirePostQuantum`: wrap the DEK again under the service's new KEK |
 | `-16` | `ERR_KEK_FINGERPRINT_MISMATCH` | `fingerprintMismatch` | payload was wrapped under a different KEK |
 | `-17` | `ERR_KEK_NOT_FOUND` | `kekNotFound` | no KEK for this service in this process's keychain mode; call `hkdfguard_create_kek` |
-| `-18` | `ERR_KEK_ACCESS_DENIED` | `keychainAccessDenied` | locked keychain / no UI session / ACL denial / declined prompt / missing entitlement / Secure Enclave won't load keys in this session (keybag locked, e.g. SSH after `security unlock-keychain`). **A key likely exists**; don't create or delete anything |
+| `-18` | `ERR_KEK_ACCESS_DENIED` | `keychainAccessDenied` | locked keychain / no UI session / ACL denial / declined prompt / missing entitlement / Secure Enclave won't load keys in this session (keybag locked, e.g. SSH after `security unlock-keychain`) / an ML-KEM KEK on a macOS before 26. **A key likely exists**; don't create or delete anything. Also, from wrap and provision, a P-256 KEK under the policy's `RequirePostQuantum`: `hkdfguard status` says so; retire it and provision again |
 | `-19` | `ERR_KEK_INVALID` | `kekCorrupted` | an item exists but can't be reconstructed into a key, and a throwaway probe key shows the enclave works in this session; never auto-replaced |
 | `-20` | `ERR_PROCESS_HARDENING_FAILED` | `processHardeningFailed` | `hkdfguard_harden_process` couldn't disable core dumps or debugger attachment, or (with `HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE`) the process can still be debugged by its own user |
 | `-32` | `ERR_FILE_NOT_FOUND` | `fileNotFound` | no file at the path, or a path component is not a directory (`hkdfguard_open_file` only, as are `-33` to `-39`) |
@@ -663,6 +720,53 @@ why. Services the policy doesn't list stay user-scoped. Leaving out
 `SecurityAdminGroup` or `DeploymentAdminGroup` lets any admin who can
 `sudo` act in that role.
 
+### KEK suites in the policy
+
+Two more settings choose the [KEK suite](#kek-suites). They apply to every
+service, user-scoped and machine-scoped alike, and a policy may hold only
+them: it then leaves every service user-scoped, as no policy does.
+
+| Setting | Values | Without it |
+|---|---|---|
+| `KekSuite` | `ML-KEM-1024` or `P-256` | `ML-KEM-1024`, also with no policy at all |
+| `RequirePostQuantum` | a boolean (`<true/>`, `<false/>`; not `<integer>`) | `false` |
+
+```xml
+<dict>
+  <!-- The opt-in to classical KEKs, e.g. for Macs before macOS 26: -->
+  <key>KekSuite</key><string>P-256</string>
+</dict>
+```
+
+- **`KekSuite`** is what `hkdfguard_create_kek` (and `hkdfguard provision`)
+  creates. A Mac that can't create that suite -- ML-KEM-1024 needs macOS 26
+  or later -- fails with `-3` (`PROVIDER_UNAVAILABLE`) and logs why; it
+  never quietly creates a P-256 KEK instead, so the default can't silently
+  mean nothing. It doesn't touch existing KEKs: a KEK keeps the suite it was
+  provisioned with, and provisioning never replaces one.
+- **`RequirePostQuantum`** refuses what is left of P-256: a P-256 KEK can't
+  wrap or be provisioned (`-18`), and a `0x01` payload can't be unwrapped
+  (`-12`). Its existence, fingerprint and suite can still be read, so
+  `hkdfguard status` shows it, flagged, and `hkdfguard retire` removes it.
+  `KekSuite` `P-256` with `RequirePostQuantum` `true` contradict each other,
+  and make the policy invalid.
+
+`hkdfguard status` prints what the policy provisions and each KEK's suite;
+an application can read a KEK's with `hkdfguard_kek_suite`.
+
+### Moving to post-quantum KEKs
+
+A KEK's suite can't change, so a P-256 service moves by rotation:
+
+1. Make sure the policy provisions ML-KEM-1024 (no `KekSuite`, or
+   `ML-KEM-1024`), on macOS 26 or later.
+2. `hkdfguard retire` the old KEK, `hkdfguard provision` a new one, and
+   wrap the service's DEKs again under it -- or, to keep the old payloads
+   readable while the new ones go out, provision under a new service name
+   and retire the old one last (see [If a KEK is compromised](#if-a-kek-is-compromised)).
+3. Once no service has a P-256 KEK left (`hkdfguard status`), set
+   `RequirePostQuantum` so none can come back.
+
 ### The service account and its runner group
 
 Run the service's LaunchDaemon as a dedicated account that cannot log in,
@@ -731,8 +835,12 @@ machine-scoped service:
 - **Only root and `RunnerGroup` members can read the KEK file**; anyone else
   gets `-18`.
 - **The KEK file** is `/Library/Application Support/HkdfGuard/keks/<service>.kek`,
-  `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). It holds the
-  public key and the Secure Enclave key blob, which is usable only by this
+  `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). A P-256 KEK's
+  (format 1) holds the public key and the Secure Enclave key blob; an
+  ML-KEM-1024 KEK's (format 2) holds the suite, the 32-byte fingerprint,
+  the blob and the stored ciphertext, and no public key. Either way
+  `status` and `retire` read the fingerprint from the file, without the
+  Secure Enclave. The blob is usable only by this
   Mac's Secure Enclave, in the system context, after the first unlock since
   boot (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). `provision`
   excludes the `keks` folder from Time Machine; local APFS snapshots still
@@ -747,12 +855,19 @@ machine-scoped service:
 ### Verifying it on a Mac
 
 `scripts/verify-machine-scope.sh` runs the whole flow against this repo's
-builds, as root:
-- provisioning, with both role refusals;
-- wrapping in the system job;
+builds, as root, once per KEK suite (ML-KEM-1024 by default, then P-256
+through `KekSuite`):
+- provisioning, with both role refusals, and the KEK file in its suite's
+  format;
+- wrapping in the system job, the payload naming the suite;
 - a `nobody` LaunchDaemon unwrapping, while root in Terminal and an account
   outside the group are refused;
+- for P-256, `RequirePostQuantum`: the KEK flagged by `status`, refused for
+  wrap, provision and unwrap, and still retirable;
 - `retire`.
+
+Before macOS 26 the ML-KEM pass only checks that provisioning refuses
+rather than creating a P-256 KEK.
 
 It cleans up after itself, and refuses to run where a real policy exists.
 
@@ -787,12 +902,15 @@ hkdfguard retire --service-name|-sn <name> \
   item and rebuilds the Secure Enclave key from it, so a KEK that exists but
   can't be used fails here, at deployment, not at the first wrap; a second
   run reports "already provisioned …; verified" and exits 0. Prints the
-  keychain mode it used and the KEK's **fingerprint** (SHA-256 of its
-  public key) — record it. On "already provisioned", compare it with the
+  keychain mode it used, the KEK's suite (`ML-KEM-1024`, or `P-256` where
+  the policy's `KekSuite` opts in; see [KEK suites in the policy](#kek-suites-in-the-policy)),
+  and its **fingerprint** (SHA-256 of its public key) — record it. On "already provisioned", compare it with the
   recorded value: a mismatch means the KEK under that name is not the one
   you provisioned.
-- **`status`** reports the keychain mode, whether a KEK exists for `<name>`
-  (`present`, `absent`, or `corrupt`), and its fingerprint. Read-only: it
+- **`status`** reports the keychain mode, the suite the policy provisions,
+  whether a KEK exists for `<name>` (`present`, `absent`, or `corrupt`), and
+  its fingerprint and suite -- flagging a P-256 KEK the policy's
+  `RequirePostQuantum` refuses. Read-only: it
   never creates or deletes anything, so it is the safe way to check a
   service's KEK against its recorded fingerprint, or which keychain mode a
   build of the CLI runs in. Exits `0` when the keychain gave a definite
@@ -1146,12 +1264,42 @@ Xcode looks) and add
 ## Continuous integration
 
 Two GitHub Actions workflows, in `.github/workflows/`, both on
-GitHub-hosted Apple silicon runners (`macos-26`, Xcode 26.6):
+GitHub-hosted Apple silicon runners (`macos-26`, Xcode 26.6, and for one
+job `macos-15`):
 
 | Workflow | Runs on | Does | Credentials |
 |---|---|---|---|
-| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed | none |
+| `ci.yml` | every push to `main`, every pull request, by hand, and as the first job of `release.yml` | the unhosted test suite and the shipped Release configurations, all ad-hoc signed; then, on macOS 15, those Release binaries run and the test suite | none |
 | `release.yml` | a pushed `vX.Y.Z` tag, or by hand | `ci.yml`, then `build-release.sh` — signed, notarized, stapled — and, for a tag, the GitHub Release | the `release` environment's secrets |
+
+**macOS 15.** The library's deployment target is macOS 14, but ML-KEM is
+macOS 26 only. An ML-KEM API reached without an availability check would
+break the library on every older Mac, for P-256 too. The `test-macos-15`
+job, on `macos-15` (the oldest macOS GitHub hosts), checks that in two ways:
+
+- It loads the `macos-26` job's Release dylib and runs its CLI, the
+  binaries a release ships. A missing symbol kills them at load. The
+  unsigned strict-hardening CLI then refuses to go on, which is expected.
+- It builds and runs the test suite with the newest Xcode 26 on that image.
+  The tests can't be built on `macos-26` and moved, because a test bundle
+  only loads under the Xcode that built it.
+
+The job checks out the repositories in the same layout as the `macos-26`
+job, because the CLI finds the dylib by an absolute path.
+
+The `macos-15` image reports a Secure Enclave that can make P-256 keys, so
+the tests that need one run there too. Before macOS 26 the in-process
+wrap/unwrap suite runs each test under a KekSuite P-256 policy, as such a
+Mac must be configured (the `ProvisionsP256BeforeMacOS26` trait); tests
+that need ML-KEM are macOS 26 only. The CLI tests that provision are
+macOS 26 only as well: the CLI reads its policy only from the root-owned
+policy files, so a test can't opt it into P-256.
+
+A stored ML-KEM KEK being refused with `-18`, never reported corrupt, needs
+macOS 26 to create that KEK. On real hardware, the `withoutMLKEM` tests act
+the older Mac out on macOS 26: a test-only switch,
+`MachineScopeTestOverrides.withoutMLKEM`, makes the Secure Enclave neither
+create nor load ML-KEM keys. Production never sets it.
 
 **What CI can't test.** A macOS VM has no Secure Enclave, so every test
 that wraps or unwraps skips itself there (see [Tests](#tests)), and the
@@ -1254,8 +1402,8 @@ version, run the full suite on real hardware (see
 [Continuous integration](#continuous-integration)), then push a signed tag:
 
 ```sh
-git tag -s v0.9.0 -m v0.9.0   # must equal v<MARKETING_VERSION>
-git push origin v0.9.0
+git tag -s v0.9.1 -m v0.9.1   # must equal v<MARKETING_VERSION>
+git push origin v0.9.1
 ```
 
 The workflow checks that the tag matches `MARKETING_VERSION` and is on
@@ -1266,7 +1414,7 @@ To build and publish one by hand instead (the workflow runs the same
 steps):
 
 ```sh
-VERSION=v0.9.0   # must equal MARKETING_VERSION in the Xcode project
+VERSION=v0.9.1   # must equal MARKETING_VERSION in the Xcode project
 
 HKDFGUARD_RELEASE=1 \
 HKDFGUARD_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
@@ -1376,7 +1524,7 @@ package first, and install only if every check passes:
 
 ```sh
 set -e
-VERSION=v0.9.0
+VERSION=v0.9.1
 TEAM_ID=MFW3T8R8J3                        # the Team that signs this project's releases
 EXPECTED=<the SHA-256 from the release notes>
 PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"
@@ -1788,7 +1936,7 @@ carried by the install folder `HkdfGuard/v1/` here and by the
 
 ## Tests
 
-Nine Swift Testing suites. The three largest:
+Ten Swift Testing suites. The three largest:
 
 - **`HkdfGuardNativeMacOSWrapUnwrapTests`** (`.serialized`) exercises
   every C entry point in-process: provisioning, idempotence and the first-use race,
@@ -1797,8 +1945,11 @@ Nine Swift Testing suites. The three largest:
   fingerprint and ciphertext tamper detection, buffer sizing before any
   enclave work, NULL-pointer handling, corrupt-item reporting, and the
   keychain-mode decision (including that data-protection mode from an
-  unentitled process is reported as `-18`, never as "no key"), and a
-  wrap → write file → `hkdfguard_open_file` → unwrap round trip.
+  unentitled process is reported as `-18`, never as "no key"), a
+  wrap → write file → `hkdfguard_open_file` → unwrap round trip, and the KEK
+  suites: ML-KEM-1024 provisioned by default and stored in its keychain item
+  format, the `KekSuite` P-256 opt-in, `hkdfguard_kek_suite`, and
+  `RequirePostQuantum` refusing a P-256 KEK while still letting it be found.
 - **`HkdfGuardOpenFileTests`** covers `hkdfguard_open_file` without the
   enclave: exact-length success, too short/too long, plaintext DEKs in
   every accepted encoding (`-37`, never copied out) versus short text that
@@ -1822,9 +1973,11 @@ Nine Swift Testing suites. The three largest:
 Smaller suites cover the audit records (`HkdfGuardAuditTests`), process
 hardening (`HkdfGuardHardenProcessTests`), the setup gate
 (`HkdfGuardSetupGateTests`), the salt-to-point hash
-(`HkdfGuardPayloadPointTests`), the production policy
-(`HkdfGuardMachineScopeTests`), and the shared C ABI against the Linux
-header (`HkdfGuardCrossPlatformABITests`).
+(`HkdfGuardPayloadPointTests`), the ML-KEM-1024 suite's payload crypto, its
+refusals and its keychain item format, with software ML-KEM keys so they run
+on CI too (`HkdfGuardMLKEMKEKTests`), the production policy, its suite
+settings and both machine KEK file formats (`HkdfGuardMachineScopeTests`),
+and the shared C ABI against the Linux header (`HkdfGuardCrossPlatformABITests`).
 
 The wrap/unwrap suite needs a real Secure Enclave and is skipped as a whole on
 CI/VM runners; `HkdfGuardOpenFileTests` runs everywhere; in the CLI suite only the tests that reach the enclave are
@@ -1909,5 +2062,7 @@ provisioning and the unhosted scheme is unaffected.
 Shared with the Linux tool (`hkdfguard-native-linux/src/bin/hkdfguard.rs`):
 the `provision` and `wrap` commands, `--key-file-path`, DEK input from stdin
 or a file only, `0600` output, and process hardening at startup. Mac-only:
-the `retire` and `status` commands, and `wrap` printing the KEK fingerprint
-it used and accepting `--fingerprint` to pin it.
+the `retire` and `status` commands, `wrap` printing the KEK fingerprint
+it used and accepting `--fingerprint` to pin it, and, for now, the
+ML-KEM-1024 KEK suite with the policy's `KekSuite` and `RequirePostQuantum`
+(the Linux and Windows tools provision only the P-256 construction).
