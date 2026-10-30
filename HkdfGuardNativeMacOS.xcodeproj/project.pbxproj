@@ -8,8 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		9A8F3F2E610A4537A82FD401 /* HkdfGuardNativeMacOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FDB1512DACA46AC9A6F7B19 /* HkdfGuardNativeMacOS.swift */; };
+		D2E5F1A00001000000000003 /* HkdfGuardP256.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2E5F1A00001000000000001 /* HkdfGuardP256.swift */; };
+		D2E5F1A00001000000000004 /* HkdfGuardMLKEM.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2E5F1A00001000000000002 /* HkdfGuardMLKEM.swift */; };
 		A5982B6B0203454B85A86462 /* HkdfGuardNativeMacOS.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 219DF893D63442E9B2C50B4A /* HkdfGuardNativeMacOS.framework */; };
 		B16F94D28F484D4CBFAA263E /* HkdfGuardNativeMacOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FDB1512DACA46AC9A6F7B19 /* HkdfGuardNativeMacOS.swift */; };
+		D2E5F1A00001000000000005 /* HkdfGuardP256.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2E5F1A00001000000000001 /* HkdfGuardP256.swift */; };
+		D2E5F1A00001000000000006 /* HkdfGuardMLKEM.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2E5F1A00001000000000002 /* HkdfGuardMLKEM.swift */; };
 		C1A7E5700001000000000004 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A7E5700001000000000003 /* main.swift */; };
 		C1A7E570000100000000000B /* HkdfGuardNativeMacOS.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 219DF893D63442E9B2C50B4A /* HkdfGuardNativeMacOS.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		C1A7E5700002000000000004 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A7E5700002000000000003 /* main.swift */; };
@@ -74,6 +78,8 @@
 		5163436780C947B1A0E2BAC7 /* HkdfGuardNativeMacOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HkdfGuardNativeMacOS.entitlements; sourceTree = "<group>"; };
 		6F7623D1D4864AF684EF4BEE /* hkdfguard.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = hkdfguard.h; sourceTree = "<group>"; };
 		9FDB1512DACA46AC9A6F7B19 /* HkdfGuardNativeMacOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HkdfGuardNativeMacOS.swift; sourceTree = "<group>"; };
+		D2E5F1A00001000000000001 /* HkdfGuardP256.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HkdfGuardP256.swift; sourceTree = "<group>"; };
+		D2E5F1A00001000000000002 /* HkdfGuardMLKEM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HkdfGuardMLKEM.swift; sourceTree = "<group>"; };
 		A8009863305CDD39003A51EC /* HkdfGuardNativeMacOSTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HkdfGuardNativeMacOSTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB5BB5BC98F7425A9B7B35FB /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		C1A7E5700001000000000002 /* HkdfGuardNativeMacOSTestHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = HkdfGuardNativeMacOSTestHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -157,6 +163,8 @@
 			isa = PBXGroup;
 			children = (
 				9FDB1512DACA46AC9A6F7B19 /* HkdfGuardNativeMacOS.swift */,
+				D2E5F1A00001000000000001 /* HkdfGuardP256.swift */,
+				D2E5F1A00001000000000002 /* HkdfGuardMLKEM.swift */,
 				6F7623D1D4864AF684EF4BEE /* hkdfguard.h */,
 				AB5BB5BC98F7425A9B7B35FB /* Info.plist */,
 				5163436780C947B1A0E2BAC7 /* HkdfGuardNativeMacOS.entitlements */,
@@ -383,6 +391,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				9A8F3F2E610A4537A82FD401 /* HkdfGuardNativeMacOS.swift in Sources */,
+				D2E5F1A00001000000000003 /* HkdfGuardP256.swift in Sources */,
+				D2E5F1A00001000000000004 /* HkdfGuardMLKEM.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -391,6 +401,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				B16F94D28F484D4CBFAA263E /* HkdfGuardNativeMacOS.swift in Sources */,
+				D2E5F1A00001000000000005 /* HkdfGuardP256.swift in Sources */,
+				D2E5F1A00001000000000006 /* HkdfGuardMLKEM.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -1102,7 +1102,9 @@ hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 | `hkdfguard-app` | `hkdfguard.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
 | `HkdfGuardNativeMacOSTestHost` | `HkdfGuardNativeMacOSTestHost.app` | Minimal entitled host app for the test bundle, so the suite can run in data-protection mode (see Tests) |
 
-All library targets build from the single `HkdfGuardNativeMacOS.swift`.
+All library targets build from the same three sources: `HkdfGuardNativeMacOS.swift`
+(the C entry points, payload format, keychain, machine scope, audit and key
+files) and the per-suite `HkdfGuardP256.swift` and `HkdfGuardMLKEM.swift`.
 Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). Every
 target -- the framework, the dylib, both CLI builds, the test bundle, and
 the test host -- targets **macOS 14.0+**, set explicitly rather than left

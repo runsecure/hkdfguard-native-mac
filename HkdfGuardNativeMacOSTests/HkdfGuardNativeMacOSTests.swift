@@ -1662,20 +1662,26 @@ struct HkdfGuardCrossPlatformABITests {
         // `preconditionFailure` or `assertionFailure` -- a failure that
         // "can't happen" returns INTERNAL_ERROR (-6) instead (see `copyOut`).
         // Comments and string literals are skipped; `!=` and prefix `!`
-        // (negation) are not unwraps.
-        let source = try String(
-            contentsOf: Self.macRoot.appendingPathComponent("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift"),
-            encoding: .utf8)
+        // (negation) are not unwraps. Every Swift file of the library is
+        // read, so code split out of HkdfGuardNativeMacOS.swift stays covered.
+        let folder = Self.macRoot.appendingPathComponent("HkdfGuardNativeMacOS")
+        let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .filter { $0.hasSuffix(".swift") }
+            .sorted()
+        #expect(files.contains("HkdfGuardNativeMacOS.swift"), "the library's sources were not found in \(folder.path)")
         let trap = try Regex(#"(?:[\w)\]]!(?!=))|\btry!|\bas!|\bfatalError\(|\bprecondition\(|\bpreconditionFailure\(|\bassertionFailure\("#)
         let stringLiteral = try Regex(#""(?:[^"\\]|\\.)*""#)
         var offenders: [String] = []
-        for (number, line) in source.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-            var code = String(line).replacing(stringLiteral, with: "\"\"")
-            if let comment = code.range(of: "//") {
-                code = String(code[..<comment.lowerBound])
-            }
-            if code.contains(trap) {
-                offenders.append("line \(number + 1): \(line.trimmingCharacters(in: .whitespaces))")
+        for file in files {
+            let source = try String(contentsOf: folder.appendingPathComponent(file), encoding: .utf8)
+            for (number, line) in source.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                var code = String(line).replacing(stringLiteral, with: "\"\"")
+                if let comment = code.range(of: "//") {
+                    code = String(code[..<comment.lowerBound])
+                }
+                if code.contains(trap) {
+                    offenders.append("\(file):\(number + 1): \(line.trimmingCharacters(in: .whitespaces))")
+                }
             }
         }
         #expect(offenders.isEmpty, "a runtime trap on an export path would crash the host process:\n\(offenders.joined(separator: "\n"))")
