@@ -20,6 +20,8 @@
 #     still be retired
 #   - retire: refused with the wrong fingerprint; with the right one the KEK
 #     file is deleted and the payload no longer unwraps
+#   - retire --corrupt: refused for a healthy KEK file the library rejects
+#     only for its permissions; deletes a file that is not a KEK file
 #
 # Before macOS 26 the ML-KEM pass only checks that provisioning refuses,
 # rather than creating a P-256 KEK in its place.
@@ -262,6 +264,16 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     OUT=$("$CLI" retire -sn $SERVICE -fp "$WRONG" 2>&1)
     expect "retire with the wrong fingerprint is refused" "nothing was deleted" "$OUT"
     [[ -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is still there" || fail "the KEK file was deleted"
+
+    # A healthy KEK the library refuses only for its permissions is not corrupt.
+    chmod o+r "$KEKS/$SERVICE.kek"
+    expect "a KEK file others can read is reported as -19" "kek: corrupt" "$("$CLI" status -sn $SERVICE 2>&1)"
+    OUT=$("$CLI" retire -sn $SERVICE --corrupt 2>&1)
+    expect "retire --corrupt refuses it: its key is usable" "holds a usable KEK" "$OUT"
+    [[ -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is still there" || fail "the KEK file was deleted"
+    chmod 0640 "$KEKS/$SERVICE.kek"
+    expect "with its permissions restored it is present again" "fingerprint: $FP" "$("$CLI" status -sn $SERVICE 2>&1)"
+
     OUT=$("$CLI" retire -sn $SERVICE -fp "$FP" 2>&1)
     expect "retire with the right fingerprint deletes the KEK" "retired machine KEK" "$OUT"
     [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is gone" || fail "the KEK file is still there"
@@ -271,6 +283,14 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     echo "        nobody daemon after retire: $OUT"
     expect "the payload no longer unwraps (-17)" "unwrap=-17" "$OUT"
     expect "status reports it absent" "kek: absent" "$("$CLI" status -sn $SERVICE 2>&1)"
+
+    # A file that is not a KEK file is what --corrupt is for.
+    ( umask 077; echo "not a KEK file" > "$KEKS/$SERVICE.kek" )
+    chown root:wheel "$KEKS/$SERVICE.kek"
+    expect "a file the library didn't write is reported as -19" "kek: corrupt" "$("$CLI" status -sn $SERVICE 2>&1)"
+    OUT=$("$CLI" retire -sn $SERVICE --corrupt 2>&1)
+    expect "retire --corrupt deletes it" "retired corrupt machine KEK file" "$OUT"
+    [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "the file is gone" || fail "the file is still there"
 }
 
 if [[ "$MLKEM_AVAILABLE" -eq 1 ]]; then

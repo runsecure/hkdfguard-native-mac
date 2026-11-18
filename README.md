@@ -799,7 +799,19 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
 
 - **The role is checked against the admin behind `sudo`**: the account that
   logged in to the session, which `sudo` doesn't change. `sudo` alone isn't
-  enough. A root login is trusted.
+  enough. Root itself is trusted: a root login, or a process with no login
+  behind it and no `sudo` (a LaunchDaemon, an MDM script). Where the
+  session records no login but `sudo` was used (a cron job, say), the
+  account `sudo` ran for is checked instead. An admin who can't be
+  identified, or whose membership can't be looked up, is refused.
+- **The roles bind only admins whose `sudo` is limited to `hkdfguard`.**
+  They are enforced by this tool, not by the library or the system: an
+  admin with unrestricted `sudo` is root, and root can do either role's
+  work without it. To separate the roles, give each group a sudoers rule
+  for its own commands only. Pin the deployment admins' `wrap` rule to the
+  key file paths they may write: `wrap` runs as root, so it writes its
+  output wherever `--key-file-path` says, and with `--force` replaces a
+  small file already there.
 - **The Secure Enclave work runs in a one-off LaunchDaemon job.** The
   Secure Enclave binds a key to the context it was created in, so a key
   made from Terminal, `sudo` included, would be unusable by the service's
@@ -846,7 +858,9 @@ machine-scoped service:
   excludes the `keks` folder from Time Machine; local APFS snapshots still
   hold it. A file that
   isn't root's, that anyone else can write, that others can read, or that
-  this library didn't write is `-19` (`KEK_INVALID`).
+  this library didn't write is `-19` (`KEK_INVALID`). Of those, `retire
+  --corrupt` deletes only a file whose content is bad; wrong ownership or
+  permissions on a sound file are to be fixed, not retired.
 - **Root is trusted.** Root can read the file and install a LaunchDaemon, so
   an admin who can `sudo` can ultimately use the key, as with every secret
   store on macOS. If admins reaching a Mac over SSH is a concern, turn off
@@ -949,7 +963,16 @@ hkdfguard retire --service-name|-sn <name> \
   acts on exactly one item, by persistent reference, after confirming that
   item's own blob is the unreconstructable one. Afterwards the service can
   be provisioned again. `--fingerprint` and `--corrupt` are mutually
-  exclusive.
+  exclusive. For a **machine-scoped** service `-19` is not enough, because
+  the library also reports it for a sound KEK file it refuses to trust (a
+  stray `chmod`, an added ACL, a folder someone else can write). The file is
+  deleted only if its own content is bad: it is not a KEK file, or it is a
+  well-formed one whose key the Secure Enclave can't rebuild, or that isn't
+  the key it records. That is judged by a one-off system job, the only
+  place a machine KEK loads, with the enclave proven usable there, and the
+  file deleted must still hold exactly the bytes that were judged. A file
+  whose key loads is never deleted: restore its ownership and permissions,
+  then use it or retire it with `--fingerprint`.
 - **`wrap`** wraps the pipeline's existing 32-byte DEK — base64, read from
   **stdin** (`--dek-stdin`) or a **file** (`--dek-file`), exactly one of the
   two — under the already-provisioned KEK and writes the 125-byte payload to
