@@ -786,8 +786,10 @@ let kekKeychainAccount = "kek-v1"
 
 // What a KEK item's own data reconstructs into, read in the library's item
 // format (`decodeKeychainKEK` in HkdfGuardNativeMacOS.swift): a bare P-256
-// Secure Enclave blob, or, for ML-KEM, "HKGQ" || format 0x01 || suite 0x02
-// || blob length (big-endian u16) || blob || 1568-byte ciphertext.
+// Secure Enclave blob, or, for ML-KEM, "HKGQ" || format 0x02 || suite 0x02
+// || fingerprint (32) || blob length (big-endian u16) || blob || 1568-byte
+// ciphertext. An ML-KEM item whose key is not the one its fingerprint
+// records is unreconstructable, as it is to the library.
 enum StoredKEKCheck {
     case key(fingerprint: [UInt8])
     case unreconstructable
@@ -796,10 +798,12 @@ enum StoredKEKCheck {
     case unsupportedHere
 }
 
-// What a Secure Enclave key blob of the given suite reconstructs into, in
-// this session -- a keychain item's blob, or a machine KEK file's.
-func enclaveBlobCheck(mlkem: Bool, blob: Data) -> StoredKEKCheck {
-    guard mlkem else {
+// What a Secure Enclave key blob reconstructs into, in this session -- a
+// keychain item's blob, or a machine KEK file's. `encapsulated` is an
+// ML-KEM KEK's stored ciphertext (nil: a P-256 KEK); its fingerprint
+// covers it.
+func enclaveBlobCheck(blob: Data, encapsulated: Data?) -> StoredKEKCheck {
+    guard let encapsulated else {
         guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) else {
             return .unreconstructable
         }
@@ -811,30 +815,40 @@ func enclaveBlobCheck(mlkem: Bool, blob: Data) -> StoredKEKCheck {
     guard let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob) else {
         return .unreconstructable
     }
-    return .key(fingerprint: Array(SHA256.hash(data: key.publicKey.rawRepresentation))) // the library's KEK.fingerprint for ML-KEM
+    // The library's KEMKEK.fingerprint: SHA-256 of public key || ciphertext.
+    var hash = SHA256()
+    hash.update(data: key.publicKey.rawRepresentation)
+    hash.update(data: encapsulated)
+    return .key(fingerprint: Array(hash.finalize()))
 }
 
 func storedKEKCheck(_ data: Data) -> StoredKEKCheck {
     let magic = Data("HKGQ".utf8)
     guard data.starts(with: magic) else {
-        return enclaveBlobCheck(mlkem: false, blob: data)
+        return enclaveBlobCheck(blob: data, encapsulated: nil)
     }
     let start = data.startIndex
-    guard data.count > 8, data[start + 4] == 0x01, data[start + 5] == 0x02 else {
+    let header = 4 + 1 + 1 + fingerprintLength + 2
+    guard data.count > header, data[start + 4] == 0x02, data[start + 5] == 0x02 else {
         return .unreconstructable
     }
-    let length = Int(data[start + 6]) << 8 | Int(data[start + 7])
-    guard length > 0, data.count == 8 + length + 1568 else {
+    let recorded = Array(data[(start + 6)..<(start + 6 + fingerprintLength)])
+    let length = Int(data[start + header - 2]) << 8 | Int(data[start + header - 1])
+    guard length > 0, data.count == header + length + 1568 else {
         return .unreconstructable
     }
-    var blob = data.subdata(in: (start + 8)..<(start + 8 + length))
+    var blob = data.subdata(in: (start + header)..<(start + header + length))
     defer {
         blob.withUnsafeMutableBytes { raw in
             guard let base = raw.baseAddress, raw.count > 0 else { return }
             _ = memset_s(base, raw.count, 0, raw.count)
         }
     }
-    return enclaveBlobCheck(mlkem: true, blob: blob)
+    let check = enclaveBlobCheck(blob: blob, encapsulated: data.subdata(in: (start + header + length)..<data.endIndex))
+    if case .key(let fingerprint) = check, fingerprint != recorded {
+        return .unreconstructable
+    }
+    return check
 }
 
 // The first non-empty `keychain-access-groups` entry this executable is

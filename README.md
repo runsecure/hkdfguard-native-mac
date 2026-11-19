@@ -67,7 +67,7 @@ for one service can never be opened under another.
 | Provisioned | by default, on macOS 26 and later | only with `KekSuite` `P-256` in the [policy](#the-policy) |
 | The secret | `K`: one per KEK | `Z`: one per payload |
 | A quantum computer that sees the public key | learns nothing that gives `K` | recovers the private key, and with it every payload |
-| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key | SHA-256 of `0x04 ‖ x ‖ y` |
+| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key ‖ the 1568-byte stored ciphertext | SHA-256 of `0x04 ‖ x ‖ y` |
 | Same construction on Linux and Windows | not yet | yes |
 
 Both keep the payload at 125 bytes, and with both only this Mac can create
@@ -97,6 +97,21 @@ anyone encapsulate a secret of their own, not recover `K`, so it can't be
 used to forge a payload either. Neither the public key nor the stored
 ciphertext needs to stay secret.
 
+The stored ciphertext is part of the KEK: the same enclave key with another
+ciphertext gives another `K`, and ML-KEM decapsulation never fails on a
+wrong one. So the fingerprint covers the public key and the ciphertext. A
+ciphertext swapped or damaged in storage makes the KEK a different KEK:
+a payload wrapped under the original is refused by it with `-16`
+(`KEK_FINGERPRINT_MISMATCH`). The KEK's own store records the fingerprint
+beside the ciphertext, in the keychain item and in the machine KEK file
+alike, so damage there is caught at the source: the KEK is `-19`
+(`KEK_INVALID`), never loaded as a different one. That record guards
+against damage, not against someone able to rewrite the store, who can
+record a fingerprint to match; the fingerprint in each payload, and the one
+you recorded at provisioning, are what catch a substituted KEK. The
+fingerprint is in the payload header, so the ciphertext is bound into every
+payload's key and tag as well.
+
 ### What each suite gives up
 
 **P-256** gives each payload its own point, so `Z` is unique to the
@@ -122,7 +137,7 @@ property but makes every payload about 4.5 KB.
 Always exactly **125 bytes**:
 
 ```
-[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key                 ]
+[ 32-byte KEK fingerprint — see the Fingerprint row under "KEK suites"      ]
 [  1-byte suite id — 0x01 (P-256) or 0x02 (ML-KEM-1024), the KEK's suite    ]
 [ 32-byte random salt                                                       ]
 [ 12-byte random AES-GCM nonce                                              ]
@@ -918,7 +933,7 @@ hkdfguard retire --service-name|-sn <name> \
   run reports "already provisioned …; verified" and exits 0. Prints the
   keychain mode it used, the KEK's suite (`ML-KEM-1024`, or `P-256` where
   the policy's `KekSuite` opts in; see [KEK suites in the policy](#kek-suites-in-the-policy)),
-  and its **fingerprint** (SHA-256 of its public key) — record it. On "already provisioned", compare it with the
+  and its **fingerprint** (see [KEK suites](#kek-suites)) — record it. On "already provisioned", compare it with the
   recorded value: a mismatch means the KEK under that name is not the one
   you provisioned.
 - **`status`** reports the keychain mode, the suite the policy provisions,

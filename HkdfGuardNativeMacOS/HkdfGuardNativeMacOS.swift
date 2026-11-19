@@ -382,6 +382,16 @@ let mlkem1024CiphertextLength = 1568
 /// this KEK, and lets its holder create new ones, until the KEK is retired.
 /// That is the price of keeping the payload at 125 bytes.
 ///
+/// The ciphertext is therefore part of the KEK's identity: the same enclave
+/// key with another ciphertext has another `K`. The fingerprint covers
+/// both, so a ciphertext that was swapped or damaged in storage shows up as
+/// a different KEK -- to a payload's fingerprint check, to an operator's
+/// recorded fingerprint, and to the fingerprint a machine KEK file records
+/// -- rather than as a KEK of the same name that quietly derives other keys.
+/// (ML-KEM decapsulation never fails on a wrong ciphertext; it returns a
+/// different secret.) The fingerprint is in every payload's header, so the
+/// ciphertext is bound into each payload's key and tag through it.
+///
 /// `key` is any `KEMPrivateKey` so tests can use a software ML-KEM key;
 /// production keys are always `SecureEnclave.MLKEM1024.PrivateKey`.
 struct KEMKEK {
@@ -389,6 +399,15 @@ struct KEMKEK {
     /// The ML-KEM-1024 encapsulation key, raw; only ever fingerprinted.
     let publicKey: Data
     let encapsulated: Data
+
+    /// SHA-256 of the public key followed by the stored ciphertext. Both
+    /// are a fixed 1568 bytes, so the split is unambiguous.
+    var fingerprint: Data {
+        var hash = SHA256()
+        hash.update(data: publicKey)
+        hash.update(data: encapsulated)
+        return Data(hash.finalize())
+    }
 }
 
 /// A service's KEK, whichever suite it is.
@@ -405,12 +424,13 @@ enum KEK {
     }
 
     /// The fingerprint at the front of every payload: SHA-256 of the public
-    /// key (see `kekFingerprint`). An ML-KEM key is 1568 bytes and a P-256
-    /// one 65, so the two kinds can't produce the same fingerprint.
+    /// key (see `kekFingerprint`) and, for ML-KEM, the stored ciphertext
+    /// (see `KEMKEK`). The ML-KEM input is 3136 bytes and the P-256 one 65,
+    /// so the two kinds can't produce the same fingerprint.
     var fingerprint: Data {
         switch self {
         case .p256(let key): return kekFingerprint(key.publicKey)
-        case .mlkem1024(let kem): return Data(SHA256.hash(data: kem.publicKey))
+        case .mlkem1024(let kem): return kem.fingerprint
         }
     }
 
@@ -974,16 +994,32 @@ enum StoredKEK: Equatable {
 
 // A user-scoped KEK's keychain item data. A P-256 KEK's is its bare Secure
 // Enclave blob, as it always has been. An ML-KEM KEK's is a container:
-// magic "HKGQ", format 1, the suite byte (0x02), the blob length-prefixed
-// (big-endian u16), then the 1568-byte ciphertext. Secure Enclave blobs
-// begin 0x04 0x82 (a DER octet string), so no P-256 item starts with the
-// magic. The CLI's `retire` reads this format too (`storedKEKCheck`
-// in main.swift).
+// magic "HKGQ", format 2, the suite byte (0x02), the KEK's 32-byte
+// fingerprint, the blob length-prefixed (big-endian u16), then the
+// 1568-byte ciphertext. Secure Enclave blobs begin 0x04 0x82 (a DER octet
+// string), so no P-256 item starts with the magic. The CLI's `retire`
+// reads this format too (`storedKEKCheck` in main.swift).
+//
+// The fingerprint is recorded because it covers the ciphertext (see
+// `KEMKEK`), and decapsulating a damaged ciphertext doesn't fail: without
+// the record, an item whose ciphertext was damaged would load as a KEK
+// with another fingerprint; with it, the item is corrupt. As in a machine
+// KEK file, this catches damage, not someone who can rewrite the item --
+// they can record a fingerprint to match; the payloads' and the operator's
+// copies of the fingerprint are what catch that.
 private let keychainKEKMagic = Data("HKGQ".utf8)
-private let keychainKEKFormatVersion: UInt8 = 1
-private let keychainKEKHeaderLength = 4 + 1 + 1 + 2
+private let keychainKEKFormatVersion: UInt8 = 2
+private let keychainKEKHeaderLength = 4 + 1 + 1 + hkdfguardFingerprintLength + 2
 
-func encodeKeychainKEK(_ stored: StoredKEK) -> Data? {
+/// A keychain item's KEK, and the fingerprint the item records for it (an
+/// ML-KEM item always does; a P-256 item has nowhere to).
+struct KeychainKEK: Equatable {
+    var stored: StoredKEK
+    var fingerprint: Data?
+}
+
+/// `fingerprint` is the KEK's, required for ML-KEM and unused for P-256.
+func encodeKeychainKEK(_ stored: StoredKEK, fingerprint: Data? = nil) -> Data? {
     switch stored {
     case .p256(let blob):
         guard !blob.isEmpty, !blob.starts(with: keychainKEKMagic) else {
@@ -992,12 +1028,14 @@ func encodeKeychainKEK(_ stored: StoredKEK) -> Data? {
         return blob
     case .mlkem1024(let blob, let encapsulated):
         guard !blob.isEmpty, blob.count <= Int(UInt16.max),
-              encapsulated.count == mlkem1024CiphertextLength else {
+              encapsulated.count == mlkem1024CiphertextLength,
+              let fingerprint, fingerprint.count == hkdfguardFingerprintLength else {
             return nil
         }
         var out = keychainKEKMagic
         out.append(keychainKEKFormatVersion)
         out.append(KEKSuite.mlkem1024StoredCiphertext.rawValue)
+        out.append(fingerprint)
         out.append(UInt8(blob.count >> 8))
         out.append(UInt8(blob.count & 0xFF))
         out.append(blob)
@@ -1009,9 +1047,9 @@ func encodeKeychainKEK(_ stored: StoredKEK) -> Data? {
 /// Nil only for data that has the container's magic but isn't a container
 /// this build understands: corrupt, or from a newer build. Anything else is
 /// taken as a P-256 blob, for the enclave to accept or refuse.
-func decodeKeychainKEK(_ data: Data) -> StoredKEK? {
+func decodeKeychainKEK(_ data: Data) -> KeychainKEK? {
     guard data.starts(with: keychainKEKMagic) else {
-        return .p256(blob: data)
+        return KeychainKEK(stored: .p256(blob: data), fingerprint: nil)
     }
     var bytes = [UInt8](data)
     defer { secureZero(&bytes) }
@@ -1020,12 +1058,14 @@ func decodeKeychainKEK(_ data: Data) -> StoredKEK? {
           bytes[5] == KEKSuite.mlkem1024StoredCiphertext.rawValue else {
         return nil
     }
-    let length = Int(bytes[6]) << 8 | Int(bytes[7])
+    let length = Int(bytes[keychainKEKHeaderLength - 2]) << 8 | Int(bytes[keychainKEKHeaderLength - 1])
     guard length > 0, bytes.count == keychainKEKHeaderLength + length + mlkem1024CiphertextLength else {
         return nil
     }
     let blobEnd = keychainKEKHeaderLength + length
-    return .mlkem1024(blob: Data(bytes[keychainKEKHeaderLength..<blobEnd]), encapsulated: Data(bytes[blobEnd...]))
+    return KeychainKEK(
+        stored: .mlkem1024(blob: Data(bytes[keychainKEKHeaderLength..<blobEnd]), encapsulated: Data(bytes[blobEnd...])),
+        fingerprint: Data(bytes[6..<(6 + hkdfguardFingerprintLength)]))
 }
 
 /// What a stored KEK blob turned out to be.
@@ -1053,10 +1093,16 @@ func reconstructKEK(
     _ data: Data,
     enclaveIsUsable: () -> Bool = secureEnclaveIsUsableNow
 ) -> KEKReconstruction {
-    guard let stored = decodeKeychainKEK(data) else {
+    guard let item = decodeKeychainKEK(data) else {
         return .corrupt // a malformed container: no keybag state explains that
     }
-    return reconstructStoredKEK(stored, enclaveIsUsable: enclaveIsUsable)
+    let result = reconstructStoredKEK(item.stored, enclaveIsUsable: enclaveIsUsable)
+    // The key loaded, but is not the KEK the item records: its ciphertext
+    // (or the record) was damaged. No keybag state explains that either.
+    if case .key(let kek) = result, let recorded = item.fingerprint, kek.fingerprint != recorded {
+        return .corrupt
+    }
+    return result
 }
 
 /// `reconstructKEK` for a KEK already split into its parts -- a keychain
@@ -1271,7 +1317,8 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
             return createStatus
         }
         defer { secureZero(&created.blob) }
-        guard let encoded = encodeKeychainKEK(.mlkem1024(blob: created.blob, encapsulated: created.kek.encapsulated)) else {
+        guard let encoded = encodeKeychainKEK(.mlkem1024(blob: created.blob, encapsulated: created.kek.encapsulated),
+                                              fingerprint: created.kek.fingerprint) else {
             return HKDFGuardStatus.unexpectedOutputLength.rawValue
         }
         representation = encoded
@@ -2271,7 +2318,7 @@ func machinePolicyJSON() -> Data? {
 
 // MARK: - Wrap (seal) a DEK under the Secure Enclave KEK
 //
-// Wrapped format: [KEK fingerprint, 32-byte SHA-256 of the KEK's public key]
+// Wrapped format: [KEK fingerprint, 32 bytes: see `KEK.fingerprint`]
 //                  [suite id, 1 byte: the KEK's `KEKSuite`]
 //                  [salt, 32 random bytes]
 //                  [nonce, 12 random bytes]
@@ -2916,7 +2963,8 @@ public func hkdfguard_kek_exists(
     return status
 }
 
-/// Writes the 32-byte fingerprint (SHA-256 of the public key) of the KEK
+/// Writes the 32-byte fingerprint (SHA-256 of the public key and, for
+/// ML-KEM, the stored ciphertext) of the KEK
 /// `service` currently resolves to -- the same value embedded at the front
 /// of every payload wrapped under it. Public-key material only, so safe to
 /// expose; lets an operator pin which KEK a service uses and confirm it

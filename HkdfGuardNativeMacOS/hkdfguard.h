@@ -224,7 +224,7 @@ extern "C" {
 // must describe real, readable/writable memory of exactly that size. A
 // wrapped payload is always exactly 125 bytes:
 //
-//   [ 32-byte KEK fingerprint (SHA-256 of the KEK's public key, 0x04||x||y) ]
+//   [ 32-byte KEK fingerprint (P-256: SHA-256 of the public key, 0x04||x||y)]
 //   [  1-byte suite id: HKDFGUARD_KEK_SUITE_*, the KEK's                    ]
 //   [ 32-byte random salt                                                   ]
 //   [ 12-byte random AES-GCM nonce                                          ]
@@ -234,7 +234,9 @@ extern "C" {
 // 0x01 (P-256): the Secure Enclave computes ECDH(KEK, H(salt)), where H
 // hashes the salt to a P-256 point. 0x02 (ML-KEM-1024): the Secure Enclave
 // decapsulates the ciphertext stored with the KEK at provisioning; the
-// fingerprint is then SHA-256 of the ML-KEM-1024 public key. Either way
+// fingerprint is then SHA-256 of the ML-KEM-1024 public key followed by
+// that ciphertext, so a KEK whose stored ciphertext was swapped or damaged
+// is a different KEK to every payload and recorded fingerprint. Either way
 // HKDF-SHA512 (salt = the salt) derives the AES-256 key from that secret.
 // Any other suite id is HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED. The header -- every
 // byte before the ciphertext -- is bound into both the derived key (HKDF
@@ -459,7 +461,8 @@ int hkdfguard_kek_exists(
     const char* HKDFGUARD_NONNULL service,
     int* HKDFGUARD_NONNULL out_exists);
 
-// Writes the 32-byte fingerprint (SHA-256 of the KEK's public key, uncompressed 0x04 || x || y) of
+// Writes the 32-byte fingerprint (P-256: SHA-256 of the KEK's public key, uncompressed 0x04 || x || y;
+// ML-KEM-1024: SHA-256 of the public key followed by the stored ciphertext) of
 // the KEK for `service` to `out` -- the same value embedded at the front of
 // every payload wrapped under it. Public-key material, not a secret. Lets an
 // operator record which KEK a service uses after provisioning, and confirm
