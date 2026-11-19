@@ -861,8 +861,11 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
   work without it. To separate the roles, give each group a sudoers rule
   for its own commands only. Pin the deployment admins' `wrap` rule to the
   key file paths they may write: `wrap` runs as root, so it writes its
-  output wherever `--key-file-path` says, and with `--force` replaces a
-  small file already there.
+  output wherever `--key-file-path` says. It limits the damage a loose rule
+  can do: `--force` replaces only an existing wrapped key, never any other
+  file; a path containing `..` is refused under `sudo`; and nothing is
+  written among hkdfguard's own files (machine KEKs, the policy, the
+  installed tool).
 - **The Secure Enclave work runs in a one-off LaunchDaemon job.** The
   Secure Enclave binds a key to the context it was created in, so a key
   made from Terminal, `sudo` included, would be unusable by the service's
@@ -1110,21 +1113,39 @@ hkdfguard retire --service-name|-sn <name> \
   get the same guarantee by comparing the first 32 bytes of the payload
   `hkdfguard_wrap_dek` returns against their recorded fingerprint before
   storing it.
-- **`--force`** securely overwrites an existing `<path>` (eight alternating
-  zero/random passes, each flushed with `F_FULLFSYNC`) before replacing it.
-  It refuses a file over 64 KiB, as the Linux tool does: a wrapped key is
-  125 bytes, so anything far bigger at the key path isn't one. When the
-  existing file is a wrapped key and `--fingerprint` is not given, the KEK
-  that file was wrapped under is the pin. A wrap under a different KEK is
+- **`--force`** replaces an existing wrapped key at `<path>`, and nothing
+  else. The file there must read as a wrapped key: 125 bytes, a suite this
+  library implements, a fingerprint that isn't all zeros. Any other file is
+  refused and left untouched, whoever runs the command; remove it yourself
+  if it really should be replaced. (This is stricter than the Linux tool,
+  which replaces any file up to 64 KiB. `wrap` is often run as root by
+  admins whose `sudo` is limited to it, and must not double as a way to
+  destroy some other file.)
+  The replacement is atomic. The new key is written to a temporary file in
+  the same folder (`.hkdfguard-<random>.tmp`), given its group and
+  permissions and flushed, then renamed over the old one. Anything that
+  fails before the rename (a `--group` you can't give, a full disk) leaves
+  the old key file exactly as it was. Only then are the old file's contents
+  securely overwritten: eight alternating zero/random passes, each flushed
+  with `F_FULLFSYNC`. If that last step fails, the new key is in place and
+  the command exits `1`, saying so.
+  When `--fingerprint` is not given, the KEK the existing file was wrapped
+  under is the pin. A wrap under a different KEK is
   refused, with both fingerprints named. To move a service to a deliberately
   replaced KEK (re-provisioned after `retire`), name the new KEK with
-  `--fingerprint`. Either mismatch is detected before the overwrite
-  starts, so the existing file is left intact. It only ever
+  `--fingerprint`. Either mismatch is detected before anything is written,
+  so the existing file is left intact. It only ever
   touches a **regular file with a single link**: a symlink at `<path>` is
   refused rather than followed (`O_NOFOLLOW` + `fstat`), and so is a file
   with more than one hard link, since overwriting it would also destroy
   whatever other file shares its contents. A FIFO, device, or directory is
   refused too.
+- **Reserved locations.** `wrap` never writes a key file among hkdfguard's
+  own files: the machine KEK folder, the installed tool's folder
+  (`/Library/Application Support/HkdfGuard/v1`), `/Library/Managed
+  Preferences`, or the local `policy.plist`. Run as root, it also refuses a
+  `<path>` containing `..`, so a sudoers rule that pins `wrap` to a folder
+  can't be walked out of.
 
 Exit codes: `0` success, `1` runtime failure, `2` argument error (usage
 printed). Nothing persistent is touched until every argument is validated.
@@ -2042,8 +2063,10 @@ Ten Swift Testing suites. The three largest:
   rejected arguments, `wrap --fingerprint` (match, mismatch leaves an
   existing file untouched, malformed, the unpinned-wrap warning), `wrap
   --force` pinned to the replaced key file's KEK, `retire` by fingerprint and
-  `--corrupt`, `--force` symlink/hard-link/FIFO refusal, the 64 KiB size cap
-  and a full overwrite at that cap, file permissions, exit codes, and —
+  `--corrupt`, `--force` symlink/hard-link/FIFO refusal, its refusal of any
+  file that isn't a wrapped key, the atomic replacement (a failed write
+  leaves the old key) and the overwrite of the replaced file, the reserved
+  locations, file permissions, exit codes, and —
   hosted — the bundled CLI's data-protection provision/wrap/retire with
   this host unwrapping.
 

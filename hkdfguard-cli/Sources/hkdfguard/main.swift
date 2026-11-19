@@ -97,10 +97,11 @@
 // atomically at file-creation time -- or, with --group <name>, 0640 with
 // that group: the owner plus one group, read-only, as the Linux tool's
 // --group does (see resolveKeyFileGroup for the groups refused). With --force against a pre-existing
-// file, that file's old contents are securely overwritten in place (8
-// alternating all-zero/random passes) and then deleted before the new file
-// is created -- see secureOverwriteAndRemoveIfExists/writeWrappedKeyFile
-// below for the exact sequence and its one intentional fallback. --force
+// file, the new key is written beside it and renamed over it in one atomic
+// step, and only then are that file's old contents securely overwritten (8
+// alternating all-zero/random passes) -- see writeWrappedKeyFile and
+// secureOverwrite below for the exact sequence. --force replaces a wrapped
+// key and nothing else (openReplaceableKeyFile), and
 // only ever overwrites and removes a *regular file*: a symbolic link at
 // <key-file-path> is refused rather than followed (so a planted link can't
 // redirect the destructive overwrite onto some other file), as is a regular
@@ -425,7 +426,8 @@ func printUsage() {
           --fingerprint|-fp <hex>  refuse to write unless the KEK actually used has this
                       fingerprint (64 hex characters, as printed by provision).
                       Recommended on every wrap, and the only check on a first wrap
-          --force|-f          securely overwrite an existing <path>; without --fingerprint,
+          --force|-f          replace an existing wrapped key at <path>, securely overwriting
+                      the old one (any other file there is refused); without --fingerprint,
                       only if the KEK used is the one <path> was wrapped under
 
         The DEK is never accepted as a command-line argument (it would be visible
@@ -1681,8 +1683,8 @@ func resolveKeyFileGroup(_ spec: String) throws -> (gid: gid_t, name: String) {
     return (gid, name)
 }
 
-// Number of secure-overwrite passes secureOverwriteAndRemoveIfExists below
-// performs on a pre-existing file before deleting it, alternating an
+// Number of secure-overwrite passes secureOverwrite below performs on the
+// file --force replaced, alternating an
 // all-zero pass and a random-bytes pass, four times each (zero, random,
 // zero, random, zero, random, zero, random).
 let secureOverwritePassCount = 8
@@ -1703,6 +1705,9 @@ func writeAll(fd: Int32, bytes: UnsafeBufferPointer<UInt8>, context: String) thr
     while offset < bytes.count {
         let n = write(fd, bytes.baseAddress! + offset, bytes.count - offset)
         if n < 0 {
+            if errno == EINTR {
+                continue
+            }
             throw CLIError("failed to write \(context): \(String(cString: strerror(errno)))")
         }
         offset += n
@@ -1730,26 +1735,11 @@ func requireRegularFile(_ st: stat, path: String) throws {
     }
 }
 
-// Largest existing file --force will overwrite: 64 KiB, as on Linux.
+// Largest existing file the Linux tool's --force will overwrite: 64 KiB.
+// Here --force replaces only a wrapped key (openReplaceableKeyFile), so
+// this only decides which refusal a far larger file gets: Linux's wording.
 let maxReplaceableKeyFileSize = 64 * 1024
 
-
-// Fail-fast twin of the checks secureOverwriteAndRemoveIfExists enforces at
-// open time: with --force, refuse before any Secure Enclave or keychain
-// work if <key-file-path> exists and is a symlink or anything other than a
-// regular file. `lstat`, not `stat`, so a symlink is judged as itself, not
-// as its target. Advisory only -- the path can change between here and the
-// open -- the O_NOFOLLOW/fstat checks at open time are the guarantee.
-func refuseUnlessAbsentOrRegularFile(_ folder: CheckedFolder, display: String) throws {
-    var st = stat()
-    guard fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
-        if errno == ENOENT {
-            return
-        }
-        throw CLIError("failed to stat \(display): \(String(cString: strerror(errno)))")
-    }
-    try requireRegularFile(st, path: display)
-}
 
 // Whether anything at all -- a dangling symlink included -- occupies the
 // key file's name in its checked folder.
@@ -1763,77 +1753,123 @@ func keyFileNameIsTaken(_ folder: CheckedFolder) -> Bool {
 let wrappedPayloadLength = 125
 let wrappedPayloadSuites: Set<UInt8> = [0x01, 0x02]
 
-// The KEK fingerprint embedded in the key file `--force` is about to
-// replace, or nil when there is nothing there that reads as a wrapped key
-// (absent, unreadable, wrong length, unknown suite, zero fingerprint). That
-// is the KEK the service's existing payload was sealed to: when the
-// keychain item now resolves to a different one -- planted ahead of
-// `provision` or swapped since -- `wrap` refuses unless the operator names
-// the new KEK with --fingerprint. Read through the checked folder without
-// following a link; only a regular file is examined. Not a guarantee: the
-// file can change before the overwrite, but whoever can change it is the
-// owning user, already inside the trust boundary.
-func existingKeyFileFingerprint(_ folder: CheckedFolder) -> [UInt8]? {
-    let fd = openat(folder.fd, folder.leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-    guard fd >= 0 else { return nil }
-    defer { close(fd) }
+// The file `--force` is about to replace: open, and confirmed -- on that
+// descriptor -- to be a wrapped key.
+struct ReplaceableKeyFile {
+    let fd: Int32
+    /// Whether `fd` is open for writing, so the old contents can be
+    /// overwritten once the new key is in place. False for a file this
+    /// account may read and replace (it can write the folder) but not write.
+    let writable: Bool
+    /// The KEK fingerprint the file's payload carries: the KEK the service's
+    /// existing payload was sealed to, and so the pin for a re-wrap without
+    /// --fingerprint (see runWrap).
+    let fingerprint: [UInt8]
+}
+
+// Opens the file `--force` would replace, or returns nil when nothing has
+// the key file's name. `--force` replaces a wrapped key and nothing else:
+// the file must be a regular file with one link (requireRegularFile) whose
+// contents read as a wrapped payload -- 125 bytes, a suite this library
+// implements, a fingerprint that isn't all zeros. Anything else is refused
+// and left untouched, for the operator to remove if it really should go.
+//
+// Why so strict: `wrap` is often run as root, and by deployment admins
+// whose sudo is limited to this tool. If --force replaced any small file,
+// that rule would also let them destroy a machine KEK file, the policy, or
+// /etc/sudoers -- and the pin to the replaced file's KEK would be skipped
+// exactly when the file isn't a key. It also keeps a mistyped path from
+// costing the operator some other file.
+//
+// The name is examined first without opening it (so a device node or FIFO
+// is never opened, and a symbolic link is judged as itself), then opened
+// with O_NOFOLLOW and judged again on the descriptor: what is checked is
+// the file that will be replaced, whatever the name refers to by then. A
+// file that can't be read can't be confirmed to be a key, and is refused.
+//
+// Called twice by `wrap --force`: early, before any Secure Enclave or
+// keychain work, to fail fast and to read the fingerprint; and again by
+// writeWrappedKeyFile, which holds the descriptor through the replacement.
+func openReplaceableKeyFile(_ folder: CheckedFolder, display path: String) throws -> ReplaceableKeyFile? {
+    var named = stat()
+    guard fstatat(folder.fd, folder.leaf, &named, AT_SYMLINK_NOFOLLOW) == 0 else {
+        if errno == ENOENT {
+            return nil
+        }
+        throw CLIError("failed to stat \(path): \(String(cString: strerror(errno)))")
+    }
+    try requireRegularFile(named, path: path)
+
+    let notAKey = "--force replaces only a wrapped key file, so it was left untouched -- remove \(path) yourself if it should be replaced"
+    var writable = true
+    var fd = openat(folder.fd, folder.leaf, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    if fd < 0 && (errno == EACCES || errno == EPERM) {
+        writable = false
+        fd = openat(folder.fd, folder.leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    }
+    guard fd >= 0 else {
+        let err = errno
+        switch err {
+        case ENOENT:
+            return nil // removed since the stat above
+        case ELOOP:
+            throw CLIError("\(path) is a symbolic link; refusing to overwrite through it -- remove the link, or point <key-file-path> at a regular file")
+        case EACCES, EPERM:
+            throw CLIError("\(path) can't be read (\(String(cString: strerror(err)))), so it can't be confirmed to be a wrapped key; \(notAKey)")
+        default:
+            throw CLIError("failed to open \(path) to replace it: \(String(cString: strerror(err)))")
+        }
+    }
+    var keep = false
+    defer {
+        if !keep {
+            close(fd)
+        }
+    }
+
     var st = stat()
-    guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_size == off_t(wrappedPayloadLength) else {
-        return nil
+    guard fstat(fd, &st) == 0 else {
+        throw CLIError("failed to stat \(path): \(String(cString: strerror(errno)))")
+    }
+    try requireRegularFile(st, path: path)
+    guard st.st_size == off_t(wrappedPayloadLength) else {
+        throw CLIError("\(path) is not a wrapped key (it is \(st.st_size) bytes; a wrapped key is \(wrappedPayloadLength)); \(notAKey)")
     }
     var payload = [UInt8](repeating: 0, count: wrappedPayloadLength)
     let count = payload.withUnsafeMutableBytes { pread(fd, $0.baseAddress, wrappedPayloadLength, 0) }
-    guard count == wrappedPayloadLength, wrappedPayloadSuites.contains(payload[fingerprintLength]) else {
-        return nil
-    }
     let fingerprint = Array(payload.prefix(fingerprintLength))
-    return fingerprint.contains(where: { $0 != 0 }) ? fingerprint : nil
+    guard count == wrappedPayloadLength,
+          wrappedPayloadSuites.contains(payload[fingerprintLength]),
+          fingerprint.contains(where: { $0 != 0 }) else {
+        throw CLIError("\(path) is not a wrapped key (it has a wrapped key's length, but not its format); \(notAKey)")
+    }
+    keep = true
+    return ReplaceableKeyFile(fd: fd, writable: writable, fingerprint: fingerprint)
 }
 
-// Removes `folder.leaf` -- but only while that name still refers to the
-// file open as `fd` (same device and inode): a file someone put at the name
-// in the meantime is left alone.
-func unlinkIfStillSame(_ folder: CheckedFolder, fd: Int32) -> Bool {
+// Removes `name` (by default the key file's own, `folder.leaf`) from the
+// checked folder -- but only while that name still refers to the file open
+// as `fd` (same device and inode): a file someone put at the name in the
+// meantime is left alone.
+func unlinkIfStillSame(_ folder: CheckedFolder, name: String? = nil, fd: Int32) -> Bool {
+    let name = name ?? folder.leaf
     var opened = stat()
     var named = stat()
-    guard fstat(fd, &opened) == 0, fstatat(folder.fd, folder.leaf, &named, AT_SYMLINK_NOFOLLOW) == 0,
+    guard fstat(fd, &opened) == 0, fstatat(folder.fd, name, &named, AT_SYMLINK_NOFOLLOW) == 0,
           opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else {
         return false
     }
-    return unlinkat(folder.fd, folder.leaf, 0) == 0
+    return unlinkat(folder.fd, name, 0) == 0
 }
 
-// Before a --force overwrite is allowed to destroy an existing wrapped-key
-// file, this overwrites its *current* contents in place --
-// secureOverwritePassCount (8) alternating all-zero/random passes, each
-// flushed to the storage device (F_FULLFSYNC) before the next pass starts so they're
-// genuinely sequential rather than coalesced by the page cache -- and only
-// then deletes it. Only ever called when --force was passed; without
-// --force, an existing file is never touched at all (writeWrappedKeyFile's
-// plain O_EXCL create fails outright instead).
-//
-// If the file doesn't exist, this is a no-op. If it exists but can't be
-// opened for writing (EACCES/EPERM -- this tool doesn't own it), the
-// overwrite passes are skipped entirely and this falls back to a plain
-// `unlink`: destroying the old bytes first
-// is worth attempting, but not worth failing the whole command over when
-// this process isn't even allowed to write to the file it's about to
-// replace. That fallback still refuses anything that isn't a regular file.
-//
-// Only a regular file is ever written to or removed. The open uses
-// O_NOFOLLOW, so a symbolic link at `path` fails with ELOOP and is refused
-// outright rather than followed -- without it, a link planted at
-// <key-file-path> (trivial in a shared or world-writable directory) would
-// redirect the eight destructive passes onto whatever file it points at,
-// after which `unlink` would remove only the link. O_NONBLOCK keeps an
-// open on a reader-less FIFO from blocking forever, and the fstat check
-// after open rejects a FIFO, device node, or directory before a single
-// byte is written (a device node opened for writing by a privileged
-// invocation would otherwise be overwritten). It also rejects a regular
-// file with more than one hard link: a hard link planted at <key-file-path>
-// is indistinguishable from the original file to O_NOFOLLOW and S_IFREG,
-// so without this check the passes would destroy the shared contents of
-// whatever file it was linked to.
+// Overwrites the contents of the wrapped-key file `--force` has just
+// replaced: secureOverwritePassCount (8) alternating all-zero/random
+// passes, each flushed to the storage device (F_FULLFSYNC) before the next
+// pass starts so they're genuinely sequential rather than coalesced by the
+// page cache. `fd` is the descriptor openReplaceableKeyFile checked, and by
+// now the file has no name: the new key was renamed over it first (see
+// writeWrappedKeyFile), so a failure here can no longer cost the operator
+// the only wrapped copy of a key.
 //
 // Caveat this can't fully solve, worth knowing rather than assuming away:
 // on copy-on-write/log-structured filesystems (e.g. APFS) and on SSDs
@@ -1844,108 +1880,65 @@ func unlinkIfStillSame(_ folder: CheckedFolder, fd: Int32) -> Bool {
 // This is a best-effort measure against casual recovery (e.g. `strings` on
 // the raw device, a filesystem-level undelete), not a cryptographic
 // guarantee against a determined attacker with access to the raw flash.
-func secureOverwriteAndRemoveIfExists(_ folder: CheckedFolder, display path: String) throws {
-    let fd = openat(folder.fd, folder.leaf, O_WRONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-    guard fd >= 0 else {
-        let err = errno
-        if err == ENOENT {
-            return // nothing to overwrite or delete
-        }
-        if err == ELOOP {
-            throw CLIError("\(path) is a symbolic link; refusing to overwrite through it -- remove the link, or point <key-file-path> at a regular file")
-        }
-        if err == EACCES || err == EPERM {
-            // Can't write to it -- skip the overwrite passes and go
-            // straight to removing it, but only once it is confirmed to be a
-            // regular file (one link, within the size cap). If it can't even
-            // be examined, nothing is removed.
-            var st = stat()
-            guard fstatat(folder.fd, folder.leaf, &st, AT_SYMLINK_NOFOLLOW) == 0 else {
-                throw CLIError("failed to stat \(path): \(String(cString: strerror(errno))); refusing to remove it")
-            }
-            try requireRegularFile(st, path: path)
-            if unlinkat(folder.fd, folder.leaf, 0) != 0 && errno != ENOENT {
-                throw CLIError("failed to remove \(path): \(String(cString: strerror(errno)))")
-            }
-            return
-        }
-        throw CLIError("failed to open \(path) for secure overwrite: \(String(cString: strerror(err)))")
-    }
-    // Every path out of this function from here on must still close `fd`
-    // and, on success, `unlink` the file -- rather than duplicating that in
-    // every throw site below, the passes loop below propagates failures by
-    // `throw`ing out of this function entirely with `fd` closed via
-    // `defer`, and the unlink happens once, after the loop, on the
-    // fall-through success path.
-    defer { close(fd) }
-
+func secureOverwrite(fd: Int32, display path: String) throws {
     var st = stat()
     guard fstat(fd, &st) == 0 else {
-        throw CLIError("failed to stat \(path): \(String(cString: strerror(errno)))")
+        throw CLIError("failed to stat the replaced \(path): \(String(cString: strerror(errno)))")
     }
-    // Checked on the opened descriptor, so it can't be raced by swapping
-    // the path out between a separate stat and this open.
-    try requireRegularFile(st, path: path)
     let fileSize = Int(st.st_size)
+    guard fileSize > 0 else {
+        return
+    }
 
-    if fileSize > 0 {
-        // One fixed-size chunk, reused for every write of every pass: memory
-        // use is bounded by secureOverwriteChunkSize however large the file
-        // is, so a --force pointed at a multi-gigabyte file by mistake
-        // doesn't also cost gigabytes of RAM.
-        let chunkCapacity = min(fileSize, secureOverwriteChunkSize)
-        var chunk = [UInt8](repeating: 0, count: chunkCapacity)
-        // Scrub the chunk (random bytes from the last random pass, or zeros)
-        // on every exit path once the passes are done with it.
-        defer {
+    // One fixed-size chunk, reused for every write of every pass: memory
+    // use is bounded by secureOverwriteChunkSize whatever the file's size.
+    let chunkCapacity = min(fileSize, secureOverwriteChunkSize)
+    var chunk = [UInt8](repeating: 0, count: chunkCapacity)
+    // Scrub the chunk (random bytes from the last random pass, or zeros)
+    // on every exit path once the passes are done with it.
+    defer {
+        _ = chunk.withUnsafeMutableBytes { raw in
+            raw.initializeMemory(as: UInt8.self, repeating: 0)
+        }
+    }
+
+    for pass in 0..<secureOverwritePassCount {
+        let randomPass = pass % 2 == 1 // zero, random, zero, random, ...
+        let context = "\(path) (secure-overwrite pass \(pass + 1))"
+
+        guard lseek(fd, 0, SEEK_SET) == 0 else {
+            throw CLIError("failed to seek \(path) during secure-overwrite pass \(pass + 1): \(String(cString: strerror(errno)))")
+        }
+
+        if !randomPass {
             _ = chunk.withUnsafeMutableBytes { raw in
                 raw.initializeMemory(as: UInt8.self, repeating: 0)
             }
         }
 
-        for pass in 0..<secureOverwritePassCount {
-            let randomPass = pass % 2 == 1 // zero, random, zero, random, ...
-            let context = "\(path) (secure-overwrite pass \(pass + 1))"
-
-            guard lseek(fd, 0, SEEK_SET) == 0 else {
-                throw CLIError("failed to seek \(path) during secure-overwrite pass \(pass + 1): \(String(cString: strerror(errno)))")
-            }
-
-            if !randomPass {
-                _ = chunk.withUnsafeMutableBytes { raw in
-                    raw.initializeMemory(as: UInt8.self, repeating: 0)
+        // Covers exactly the fileSize bytes measured by fstat above, in
+        // order, from offset 0.
+        var remaining = fileSize
+        while remaining > 0 {
+            let count = min(remaining, chunkCapacity)
+            if randomPass {
+                // Fresh CSPRNG bytes for every chunk, so no two regions
+                // of the file receive the same random pattern -- same
+                // source as every other random value this project
+                // generates (salts, nonces).
+                let status = chunk.withUnsafeMutableBytes { raw in
+                    SecRandomCopyBytes(kSecRandomDefault, count, raw.baseAddress!)
+                }
+                guard status == errSecSuccess else {
+                    throw CLIError("failed to generate random bytes for secure-overwrite pass \(pass + 1) of \(path)")
                 }
             }
-
-            // Covers exactly the fileSize bytes measured by fstat above, in
-            // order, from offset 0.
-            var remaining = fileSize
-            while remaining > 0 {
-                let count = min(remaining, chunkCapacity)
-                if randomPass {
-                    // Fresh CSPRNG bytes for every chunk, so no two regions
-                    // of the file receive the same random pattern -- same
-                    // source as every other random value this project
-                    // generates (salts, nonces).
-                    let status = chunk.withUnsafeMutableBytes { raw in
-                        SecRandomCopyBytes(kSecRandomDefault, count, raw.baseAddress!)
-                    }
-                    guard status == errSecSuccess else {
-                        throw CLIError("failed to generate random bytes for secure-overwrite pass \(pass + 1) of \(path)")
-                    }
-                }
-                try chunk.withUnsafeBufferPointer { buf in
-                    try writeAll(fd: fd, bytes: UnsafeBufferPointer(rebasing: buf[0..<count]), context: context)
-                }
-                remaining -= count
+            try chunk.withUnsafeBufferPointer { buf in
+                try writeAll(fd: fd, bytes: UnsafeBufferPointer(rebasing: buf[0..<count]), context: context)
             }
-            try flushToStorage(fd: fd, context: "\(path) during secure-overwrite pass \(pass + 1)")
+            remaining -= count
         }
-    }
-
-    // Only while the name still refers to the file just overwritten.
-    guard unlinkIfStillSame(folder, fd: fd) else {
-        throw CLIError("failed to remove \(path) after secure overwrite: it was moved or replaced, or \(String(cString: strerror(errno)))")
+        try flushToStorage(fd: fd, context: "\(path) during secure-overwrite pass \(pass + 1)")
     }
 }
 
@@ -1990,50 +1983,81 @@ func stripACL(fd: Int32, path: String) throws {
     }
 }
 
-// Writes `bytes` to a new file at `path` with `keyFilePermissions`, durably,
-// or leaves no file behind.
+// Gives the temporary file `tempName` the key file's name, only if nothing
+// has that name: one atomic step (renameatx_np RENAME_EXCL), so a file that
+// appeared since any earlier check is never clobbered and a symbolic link
+// at the name is never followed. Where the filesystem has no exclusive
+// rename, a hard link does the same job -- link(2) fails if the name
+// exists -- and the caller removes the temporary name. Returns false when
+// the name is taken.
+func renameIfNameIsFree(_ folder: CheckedFolder, from tempName: String, display path: String) throws -> Bool {
+    if renameatx_np(folder.fd, tempName, folder.fd, folder.leaf, UInt32(RENAME_EXCL)) == 0 {
+        return true
+    }
+    var err = errno
+    if err == ENOTSUP || err == EINVAL {
+        if linkat(folder.fd, tempName, folder.fd, folder.leaf, 0) == 0 {
+            return true
+        }
+        err = errno
+    }
+    if err == EEXIST {
+        return false
+    }
+    throw CLIError("failed to put the new key file in place at \(path): \(String(cString: strerror(err)))")
+}
+
+// Writes `bytes` to the key file at `path`, durably. The key file's name
+// either ends up holding the complete new payload, or is left exactly as
+// it was -- absent, or (with `force`) still the wrapped key it held.
 //
-// 1. O_CREAT|O_EXCL makes "does it exist" and "create it" one kernel
-//    operation, so a file that appeared since the pre-check in `runWrap` is
-//    never clobbered, and a symlink at `path` is refused (EEXIST) rather
-//    than followed. `mode` sets 0600 at creation; the fchmod after is
-//    defense in depth against an unusual umask/ACL inheritance.
-// 2. The data, then the directory entry, are flushed to the storage device
-//    before success is reported. A pipeline may discard its only plaintext
-//    copy of the DEK once `wrap` exits 0; a power loss after that must not
-//    be able to take the wrapped copy with it.
-// 3. If anything fails after the file was created (short write, full disk,
-//    flush error), the partial file is removed -- but only if the name still
-//    refers to the very inode this call created (same st_dev/st_ino), so a
-//    file someone else put at that path in the meantime is never deleted. A
-//    truncated payload left behind would also block a retry with EEXIST.
+// 1. With `force`, the existing file is opened and confirmed to be a
+//    wrapped key (openReplaceableKeyFile) before anything is created.
+// 2. The payload is written to a new file under a random temporary name in
+//    the same checked folder (O_CREAT|O_EXCL, 0600), given its group and
+//    mode, stripped of any inherited ACL, and flushed to the storage device.
+//    Everything that can fail -- a group this account can't give, an ACL
+//    that can't be removed, a full disk -- fails here, with the old key
+//    file untouched and the temporary file removed (only if its name still
+//    refers to the inode this call created).
+// 3. The temporary file then takes the key file's name in one atomic step.
+//    Without an existing file: only if the name is free
+//    (renameIfNameIsFree), so a file that appeared since the pre-check in
+//    `runWrap` is never clobbered and a symlink there is never followed.
+//    With one: rename(2) over it, after confirming the name still refers
+//    to the file checked in step 1 -- a reader sees the old key or the new
+//    one, never neither. The folder is then flushed: a pipeline may discard
+//    its only plaintext copy of the DEK once `wrap` exits 0, and a power
+//    loss after that must not be able to take the wrapped copy with it.
+// 4. Only then are the replaced file's old contents overwritten
+//    (secureOverwrite), through the descriptor from step 1. The file has no
+//    name by then. If this account can replace the file but not write to
+//    it, the passes are skipped. If they fail, the new key stays in place
+//    and the command reports the failure.
 //
 // With `group`, the file is given that group on the open descriptor
 // (fchown) before its mode widens to 0640 and before a byte is written, so
 // the payload never sits in it under any other group.
 // A caller who isn't root can only give a group they belong to: the
-// kernel's rule, reported plainly, and the empty file removed.
+// kernel's rule, reported plainly.
 func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [UInt8], force: Bool, group: (gid: gid_t, name: String)?) throws {
-    if force {
-        try secureOverwriteAndRemoveIfExists(folder, display: path)
-    }
-
-    // O_CREAT | O_EXCL never follows a link at the name, and openat() keeps
-    // it in the checked folder.
-    let fd = openat(folder.fd, folder.leaf, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, keyFilePermissions)
-    guard fd >= 0 else {
-        let err = errno
-        if err == EEXIST {
-            throw CLIError("\(path) already exists; pass --force|-f to overwrite")
-        }
-        throw CLIError("failed to open \(path) for writing: \(String(cString: strerror(err)))")
-    }
-
-    var committed = false
+    let replaced = force ? try openReplaceableKeyFile(folder, display: path) : nil
     defer {
-        if !committed {
-            _ = unlinkIfStillSame(folder, fd: fd) // only the file this call created
+        if let replaced {
+            close(replaced.fd)
         }
+    }
+
+    // Not derived from the key file's name, which may already be as long as
+    // a name can be.
+    let tempName = ".hkdfguard-\(String(UInt64.random(in: .min ... .max), radix: 16)).tmp"
+    let fd = openat(folder.fd, tempName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, keyFilePermissions)
+    guard fd >= 0 else {
+        throw CLIError("failed to create a file in \(folder.path) for \(path): \(String(cString: strerror(errno)))")
+    }
+    defer {
+        // A no-op once the rename below has taken the temporary name away.
+        _ = unlinkIfStillSame(folder, name: tempName, fd: fd)
         close(fd)
     }
 
@@ -2056,8 +2080,54 @@ func writeWrappedKeyFile(_ folder: CheckedFolder, display path: String, bytes: [
         try writeAll(fd: fd, bytes: buf, context: path)
     }
     try flushToStorage(fd: fd, context: path)
-    try flushFolder(folder)
-    committed = true
+
+    guard let replaced else {
+        guard try renameIfNameIsFree(folder, from: tempName, display: path) else {
+            throw CLIError(force
+                ? "\(path) appeared while the new key was being written; nothing was replaced -- run the command again"
+                : "\(path) already exists; pass --force|-f to overwrite")
+        }
+        do {
+            try flushFolder(folder)
+        } catch {
+            _ = unlinkIfStillSame(folder, fd: fd) // not durable: leave no file behind, as if nothing was written
+            throw error
+        }
+        return
+    }
+
+    // rename(2) replaces whatever has the name at that instant, so the name
+    // must still be the file that was checked.
+    var checked = stat()
+    var named = stat()
+    guard fstat(replaced.fd, &checked) == 0,
+          fstatat(folder.fd, folder.leaf, &named, AT_SYMLINK_NOFOLLOW) == 0,
+          checked.st_dev == named.st_dev, checked.st_ino == named.st_ino else {
+        throw CLIError("\(path) was moved or replaced while the new key was being written; nothing was changed -- run the command again")
+    }
+    guard renameat(folder.fd, tempName, folder.fd, folder.leaf) == 0 else {
+        throw CLIError("failed to replace \(path): \(String(cString: strerror(errno))); the existing key file was left as it was")
+    }
+    do {
+        try flushFolder(folder)
+    } catch {
+        throw CLIError("\(path) now holds the new wrapped key, but that could not be confirmed durable (\(error)); the replaced file's contents were not overwritten")
+    }
+
+    guard replaced.writable else {
+        return // this account could replace the file but not write to it
+    }
+    // The checked file must be the one the rename replaced: no name left.
+    // One that still has a name was linked or swapped in that instant, and
+    // overwriting it would destroy a file that is still someone's.
+    guard fstat(replaced.fd, &checked) == 0, checked.st_nlink == 0 else {
+        throw CLIError("\(path) now holds the new wrapped key, but the file it replaced was linked or moved elsewhere while being replaced, so its old contents were not overwritten")
+    }
+    do {
+        try secureOverwrite(fd: replaced.fd, display: path)
+    } catch {
+        throw CLIError("\(path) now holds the new wrapped key, but the old contents of the file it replaced could not be securely overwritten: \(error)")
+    }
 }
 
 
@@ -2148,12 +2218,102 @@ func runStatus(serviceName: String) throws {
     }
 }
 
+// As root, a `--key-file-path` with a `..` in it is refused. A sudoers rule
+// that pins a deployment admin's `wrap` to a folder does it with a wildcard
+// (`-kf /Library/Application\ Support/Orders/*`), and sudo's `*` matches
+// `/` too: `Orders/../HkdfGuard/keks/x.kek` would satisfy the rule and
+// name a file outside the folder. Without `..` the path stays under the
+// prefix the rule spells -- openRealFolder then refuses any symbolic link
+// in it that root didn't make.
+func refuseParentReferencesAsRoot(_ path: String) throws {
+    guard geteuid() == 0, path.split(separator: "/").contains("..") else {
+        return
+    }
+    throw CLIError("--key-file-path \(path) contains \"..\"; as root, give the path without it")
+}
+
+// Where a wrapped key file is never written, whoever asks: the places that
+// hold hkdfguard's own files. `wrap` runs as root for deployment admins,
+// whose role covers writing key files -- not planting a file among the
+// machine KEKs (a stray `<service>.kek` there reads as a corrupt KEK and
+// blocks provisioning), in the installed tool's folder, or where the
+// policy is read from.
+let hkdfguardSupportFolder = "/Library/Application Support/HkdfGuard"
+let hkdfguardInstallFolder = hkdfguardSupportFolder + "/v1"
+let hkdfguardLocalPolicyName = "policy.plist"
+let managedPreferencesFolder = "/Library/Managed Preferences"
+
+// Refuses a key file path inside one of those folders, or naming the local
+// policy file. Folders are compared by identity (device and inode), walking
+// up from the checked folder's own descriptor to `/`, so another spelling
+// of the same folder -- different case on a case-insensitive volume, a
+// root-made link -- is the same folder. Fails closed: if the walk can't be
+// completed, the path is refused.
+func refuseHkdfGuardOwnLocations(_ folder: CheckedFolder, display path: String, machineKeyFolder: String) throws {
+    func identity(_ path: String) -> (dev: dev_t, ino: ino_t)? {
+        var st = stat()
+        return stat(path, &st) == 0 ? (st.st_dev, st.st_ino) : nil
+    }
+    func same(_ st: stat, _ other: (dev: dev_t, ino: ino_t)?) -> Bool {
+        other.map { st.st_dev == $0.dev && st.st_ino == $0.ino } ?? false
+    }
+    let reserved = "\(path) is where hkdfguard keeps its own files (machine KEKs, the policy, the installed tool); a wrapped key file can't be written there"
+
+    // The policy file itself: by name (any case), or whatever file already
+    // there is the policy by another name.
+    var own = stat()
+    guard fstat(folder.fd, &own) == 0 else {
+        throw CLIError("failed to examine the folder of \(path): \(String(cString: strerror(errno)))")
+    }
+    if same(own, identity(hkdfguardSupportFolder)) {
+        var leaf = stat()
+        let isPolicy = fstatat(folder.fd, folder.leaf, &leaf, AT_SYMLINK_NOFOLLOW) == 0
+            && same(leaf, identity(hkdfguardSupportFolder + "/" + hkdfguardLocalPolicyName))
+        if isPolicy || folder.leaf.lowercased() == hkdfguardLocalPolicyName {
+            throw CLIError(reserved)
+        }
+    }
+
+    let protected = [machineKeyFolder, hkdfguardInstallFolder, managedPreferencesFolder].compactMap(identity)
+    var current = dup(folder.fd)
+    guard current >= 0 else {
+        throw CLIError("failed to examine the folder of \(path): \(String(cString: strerror(errno)))")
+    }
+    defer { close(current) }
+    for _ in 0..<Int(MAXPATHLEN) { // a path has at most this many folders
+        var st = stat()
+        guard fstat(current, &st) == 0 else {
+            throw CLIError("failed to examine the folders above \(path): \(String(cString: strerror(errno)))")
+        }
+        if protected.contains(where: { same(st, $0) }) {
+            throw CLIError(reserved)
+        }
+        let parent = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard parent >= 0 else {
+            throw CLIError("failed to examine the folders above \(path): \(String(cString: strerror(errno)))")
+        }
+        var parentInfo = stat()
+        guard fstat(parent, &parentInfo) == 0 else {
+            close(parent)
+            throw CLIError("failed to examine the folders above \(path): \(String(cString: strerror(errno)))")
+        }
+        if parentInfo.st_dev == st.st_dev && parentInfo.st_ino == st.st_ino {
+            close(parent)
+            return // "/" is its own parent: nothing above is reserved
+        }
+        close(current)
+        current = parent
+    }
+    throw CLIError("failed to examine the folders above \(path): too many of them")
+}
+
 func runWrap(_ spelledArgs: WrapArgs) throws {
     // The key file's folder must be a real folder with no symbolic link in
     // it (openRealFolder), checked first, before any Secure Enclave or
     // keychain work. It is held open, and every filesystem call below goes
     // through it; messages name the path as the operator spelled it.
     let args = spelledArgs
+    try refuseParentReferencesAsRoot(spelledArgs.keyFilePath)
     let keyFolder = try openRealFolder(spelledArgs.keyFilePath, what: "--key-file-path")
     defer { keyFolder.close() }
 
@@ -2166,16 +2326,18 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     if !args.force && keyFileNameIsTaken(keyFolder) { // a dangling symlink counts
         throw CLIError("\(args.keyFilePath) already exists; pass --force|-f to overwrite")
     }
-    // Same fail-fast idea for --force: a symlink or non-regular file at the
-    // path will be refused by the overwrite step anyway; refusing it here
-    // first means no Secure Enclave/keychain work is spent on a command
-    // that cannot complete.
-    if args.force {
-        try refuseUnlessAbsentOrRegularFile(keyFolder, display: args.keyFilePath)
+    // Same fail-fast idea for --force: anything at the path that isn't a
+    // wrapped key -- a symlink, a non-regular file, some other file -- will
+    // be refused at the replacement anyway (writeWrappedKeyFile checks
+    // again, on the descriptor it then holds); refusing it here first means
+    // no Secure Enclave/keychain work is spent on a command that cannot
+    // complete. What is there is always a wrapped key, so its KEK is always
+    // the pin when --fingerprint isn't given (see the check below).
+    var replacedFingerprint: [UInt8]?
+    if args.force, let existing = try openReplaceableKeyFile(keyFolder, display: args.keyFilePath) {
+        replacedFingerprint = existing.fingerprint
+        close(existing.fd)
     }
-    // The KEK the file being replaced was wrapped under, if it is a wrapped
-    // key: the pin when --fingerprint isn't given (see the check below).
-    let replacedFingerprint = args.force ? existingKeyFileFingerprint(keyFolder) : nil
 
     // `args.serviceName` is not secret -- it's a logical identifier, not key
     // material -- so no special scoping is needed for it. Validated before
@@ -2186,6 +2348,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // the DEK is read; and the key file goes, by default, to the runner
     // group whose daemons unwrap it.
     let policy = try loadPolicy()
+    try refuseHkdfGuardOwnLocations(keyFolder, display: args.keyFilePath, machineKeyFolder: policy.machineKeyFolder)
     let machine = policy.isMachineScoped(args.serviceName)
     if machine {
         try requireAdminRole(.deployment, policy: policy, service: args.serviceName.lowercased(), command: "wrap")
@@ -2201,8 +2364,8 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // provision first".
     // The DEK exists in plaintext only inside this closure: withSuppliedDek
     // zeroes every copy it made (raw input, decoded bytes) as soon as wrapDek
-    // returns the wrapped form -- before the potentially slow --force
-    // secure overwrite and the file write below.
+    // returns the wrapped form -- before the file write and the --force
+    // secure overwrite below.
     let wrapped = try withSuppliedDek(args.dekSource) { dek in
         machine
             ? try wrapDekInSystemContext(service: args.serviceName.lowercased(), dek: dek)
@@ -2230,7 +2393,7 @@ func runWrap(_ spelledArgs: WrapArgs) throws {
     // it replaces. A different KEK under the same service name means the
     // keychain item is not the one the existing payload was sealed to: in
     // legacy mode, any process running as this user can create or replace
-    // that item. Checked before the secure overwrite, so the old file is
+    // that item. Checked before anything is written, so the old file is
     // left intact. A deliberate change of KEK (re-provisioned after
     // `retire`) is confirmed by naming the new one with --fingerprint.
     if args.expectedFingerprint == nil, let replaced = replacedFingerprint, usedFingerprint != replaced {
@@ -2364,7 +2527,7 @@ func runOrExit(_ body: () throws -> Void) -> Never {
 }
 
 // A write past RLIMIT_FSIZE fails with EFBIG instead of killing the process,
-// so writeWrappedKeyFile still removes the partial file it created.
+// so writeWrappedKeyFile still removes the temporary file it created.
 signal(SIGXFSZ, SIG_IGN)
 
 // Before anything is read: this process holds a plaintext DEK, so it must

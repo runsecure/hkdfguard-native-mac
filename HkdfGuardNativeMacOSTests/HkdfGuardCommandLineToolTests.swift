@@ -393,6 +393,16 @@ struct HkdfGuardCommandLineToolTests {
             .path
     }
 
+    /// A new folder of the test's own, for tests that check what else `wrap`
+    /// leaves beside the key file: the shared temporary folder holds other,
+    /// concurrently running tests' files too.
+    private static func makeTempFolder() throws -> String {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hkdfguard-cli-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        return folder.path
+    }
+
     // MARK: - Round trip: CLI wraps, application code decrypts
 
     @Test(.enabled(if: legacyCrossProcessRoundTripEnabled && SecureEnclave.isAvailable, interactiveKeychainAndSecureEnclaveComment))
@@ -931,7 +941,7 @@ struct HkdfGuardCommandLineToolTests {
 
     @Test func cliForceRefusesAFileOverTheSizeCapAndLeavesItIntact() throws {
         // A wrapped key is 125 bytes; anything over 64 KiB at the key path
-        // isn't one, and --force refuses it (as the Linux tool does) --
+        // isn't one, and --force refuses it in the Linux tool's words --
         // before any Secure Enclave or keychain work, so no KEK is needed.
         let keyFilePath = Self.makeTempFilePath()
         defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
@@ -947,58 +957,159 @@ struct HkdfGuardCommandLineToolTests {
         #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)) == original, "the file is left untouched")
     }
 
+    @Test func cliForceRefusesAFileThatIsNotAWrappedKeyAndLeavesItIntact() throws {
+        // --force replaces a wrapped key and nothing else: `wrap` is run as
+        // root by deployment admins, and must not double as a way to destroy
+        // some other small file (a machine KEK, the policy, /etc/sudoers).
+        // Refused before any Secure Enclave or keychain work, so no KEK is
+        // needed.
+        var looksLikeOne = Data(repeating: 0xAB, count: 125)
+        looksLikeOne[32] = 0x7F // a wrapped key's length, but no suite this library implements
+        var zeroFingerprint = Data(repeating: 0, count: 125)
+        zeroFingerprint[32] = 0x01 // a known suite, but a fingerprint of all zeros
+        let cases: [(contents: Data, message: String)] = [
+            (Data("do not destroy me".utf8), "is not a wrapped key (it is 17 bytes"),
+            (Data(), "is not a wrapped key (it is 0 bytes"),
+            (Data(repeating: 0xAB, count: 64 * 1024), "is not a wrapped key (it is 65536 bytes"),
+            (looksLikeOne, "but not its format"),
+            (zeroFingerprint, "but not its format"),
+        ]
+        for (contents, message) in cases {
+            let keyFilePath = Self.makeTempFilePath()
+            defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
+            try contents.write(to: URL(fileURLWithPath: keyFilePath))
+
+            let result = try Self.runCLI(
+                ["wrap", "-kf", keyFilePath, "-sn", "com.hkdfguard.tests.cli.force.notakey", "--dek-stdin", "--force"],
+                stdin: Self.base64Stdin(Self.randomDEK())
+            )
+            #expect(result.exitCode == 1, "\(contents.count) bytes: \(result.stderr)")
+            #expect(result.stderr.contains(message), "stderr: \(result.stderr)")
+            #expect(result.stderr.contains("--force replaces only a wrapped key file"), "stderr: \(result.stderr)")
+            #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)) == contents, "the file is left untouched")
+        }
+    }
+
     @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
-    func cliForceOverwritesAFileUpToTheSizeCapBeforeReplacingIt() throws {
-        // --force overwrites a file of up to 64 KiB (the Linux tool's cap; a
-        // bigger one is refused, tested separately). A file of exactly
-        // 64 KiB, the largest accepted, must be overwritten in full.
+    func cliForceOverwritesTheReplacedKeyAfterPuttingTheNewOneInPlace() throws {
+        // --force renames the new key over the old one, then overwrites the
+        // old file's contents in full.
         //
         // The test holds its own descriptor on the old file before running
         // the CLI. An open descriptor is not a link (st_nlink stays 1, so
         // --force accepts the file), but it keeps the inode readable after
-        // the CLI unlinks the name -- which is how the overwritten bytes are
-        // inspected here.
-        let service = "com.hkdfguard.tests.cli.force.atcap"
+        // the name is taken from it -- which is how the overwritten bytes
+        // are inspected here.
+        let service = "com.hkdfguard.tests.cli.force.scrub"
         defer { Self.deleteKEK(service: service) }
         try Self.provision(service: service)
 
-        let keyFilePath = Self.makeTempFilePath()
-        defer { try? FileManager.default.removeItem(atPath: keyFilePath) }
-        let size = 64 * 1024 // exactly the cap: accepted
-        let original = Data(repeating: 0xAB, count: size)
-        try original.write(to: URL(fileURLWithPath: keyFilePath))
+        let folder = try Self.makeTempFolder()
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        let keyFilePath = folder + "/wrapped.key"
+        let first = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(first.exitCode == 0, "CLI failed: \(first.stderr)")
+        let original = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
+        #expect(original.count == 125)
 
         let held = open(keyFilePath, O_RDONLY)
         try #require(held >= 0)
         defer { close(held) }
 
+        let secondDek = Self.randomDEK()
         let result = try Self.runCLI(
             ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "--force"],
-            stdin: Self.base64Stdin(Self.randomDEK())
+            stdin: Self.base64Stdin(secondDek)
         )
         #expect(result.exitCode == 0, "CLI --force failed: \(result.stderr)")
 
-        // The replacement: a fresh 125-byte, 0600 file.
-        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)).count == 125)
+        // The replacement: a fresh 125-byte, 0600 file holding the new DEK,
+        // and no temporary file left beside it.
+        let replacement = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
+        #expect(replacement.count == 125)
+        #expect(Self.unwrapInApplicationCode(Array(replacement), service: service).dek == secondDek)
         let attributes = try FileManager.default.attributesOfItem(atPath: keyFilePath)
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: folder) == ["wrapped.key"], "a temporary file was left behind")
 
-        // The old inode: unlinked, same length, every byte rewritten.
+        // The old inode: no name left, same length, its contents rewritten
+        // (the last pass is a random one, so not zeros either).
         var st = stat()
         #expect(fstat(held, &st) == 0)
-        #expect(st.st_nlink == 0, "the old file must have been removed")
-        #expect(Int(st.st_size) == size, "the overwrite must not grow or truncate the old file")
+        #expect(st.st_nlink == 0, "the old file must have been replaced")
+        #expect(Int(st.st_size) == original.count, "the overwrite must not grow or truncate the old file")
         let overwritten = FileHandle(fileDescriptor: held, closeOnDealloc: false)
         try overwritten.seek(toOffset: 0)
         let after = try #require(try overwritten.readToEnd())
-        #expect(after.count == size)
-        #expect(after.firstRange(of: Data(repeating: 0xAB, count: 64)) == nil,
-                "a run of the original pattern survived the overwrite")
-        // The last pass is a random one, over the whole file: its two halves
-        // don't repeat each other, and its end isn't left zeroed.
-        let half = size / 2
-        #expect(after[0..<half] != after[half...])
-        #expect(Data(after.suffix(1024)) != Data(repeating: 0, count: 1024), "the end of the file was not overwritten")
+        #expect(after.count == original.count)
+        #expect(after.firstRange(of: original[33..<65]) == nil, "the old payload's salt survived the overwrite")
+        #expect(after.firstRange(of: original[77...]) == nil, "the old payload's ciphertext survived the overwrite")
+        #expect(after != Data(repeating: 0, count: original.count), "the last pass was not a random one")
+    }
+
+    @Test(.enabled(if: cliCanProvision, cliCanProvisionComment))
+    func cliForceLeavesTheOldKeyWhenTheNewOneCannotBeWritten() throws {
+        // Everything that can fail happens on the new file, before the old
+        // one is touched. `--group` naming a group this account is not in
+        // passes validation and fails at fchown: the old key must still be
+        // there, byte for byte, with no temporary file beside it.
+        var gids = [gid_t](repeating: 0, count: 64)
+        let count = getgroups(Int32(gids.count), &gids)
+        let memberOf = gids.prefix(max(0, Int(count)))
+        guard geteuid() != 0, let daemon = getgrnam("daemon"), !memberOf.contains(daemon.pointee.gr_gid) else {
+            return // root can give any group, and a member can give this one
+        }
+        let service = "com.hkdfguard.tests.cli.force.atomic"
+        defer { Self.deleteKEK(service: service) }
+        try Self.provision(service: service)
+
+        let folder = try Self.makeTempFolder()
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        let keyFilePath = folder + "/wrapped.key"
+        let firstDek = Self.randomDEK()
+        let first = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin"],
+            stdin: Self.base64Stdin(firstDek)
+        )
+        #expect(first.exitCode == 0, "CLI failed: \(first.stderr)")
+        let original = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
+
+        let result = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "--force", "-g", "daemon"],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(result.exitCode == 1)
+        #expect(result.stderr.contains("could not give"), "stderr: \(result.stderr)")
+
+        #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)) == original, "the old key file must be left as it was")
+        #expect(Self.unwrapInApplicationCode(Array(original), service: service).dek == firstDek)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: folder) == ["wrapped.key"], "a temporary file was left behind")
+    }
+
+    @Test func cliWrapRefusesToWriteAmongHkdfGuardsOwnFiles() throws {
+        // Refused from the path alone, before any DEK is read: no stdin is
+        // supplied. Folders are matched by identity, so another spelling of
+        // the same folder (APFS is case-insensitive by default) is refused
+        // too -- where the volume is case-insensitive; elsewhere that
+        // spelling doesn't exist, and is skipped. Needs the installed
+        // package's folder to exist.
+        let installed = "/Library/Application Support/HkdfGuard/v1"
+        guard FileManager.default.fileExists(atPath: installed) else {
+            return
+        }
+        for path in ["\(installed)/wrapped.key", "/library/application support/hkdfguard/V1/wrapped.key",
+                     "/Library/Application Support/HkdfGuard/policy.plist",
+                     "/Library/Application Support/HkdfGuard/Policy.plist"] {
+            guard FileManager.default.fileExists(atPath: (path as NSString).deletingLastPathComponent) else {
+                continue
+            }
+            let result = try Self.runCLI(["wrap", "-kf", path, "-sn", "com.hkdfguard.tests.cli.reserved", "--dek-stdin", "--force"])
+            #expect(result.exitCode == 1, "\(path): \(result.stderr)")
+            #expect(result.stderr.contains("is where hkdfguard keeps its own files"), "\(path): \(result.stderr)")
+        }
     }
 
     @Test func cliRejectsEmptyOrWhitespaceOnlyStdin() throws {
@@ -1914,10 +2025,15 @@ struct HkdfGuardCommandLineToolTests {
         #expect(!FileManager.default.fileExists(atPath: keyFilePath))
         #expect(Self.kekItemExists(service: service), "a refused wrap must not touch the KEK")
 
-        // With --force against an existing file, the mismatch is detected
-        // before the secure overwrite: the old file is left byte-for-byte.
-        let existing = Data("do not destroy me\n".utf8)
-        try existing.write(to: URL(fileURLWithPath: keyFilePath))
+        // With --force against an existing key file, the mismatch is
+        // detected before anything is written: the old file is left
+        // byte-for-byte.
+        let first = try Self.runCLI(
+            ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-fp", fingerprint],
+            stdin: Self.base64Stdin(Self.randomDEK())
+        )
+        #expect(first.exitCode == 0, "wrap failed: \(first.stderr)")
+        let existing = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
         let forced = try Self.runCLI(
             ["wrap", "-kf", keyFilePath, "-sn", service, "--dek-stdin", "-fp", wrong, "--force"],
             stdin: Self.base64Stdin(Self.randomDEK())
