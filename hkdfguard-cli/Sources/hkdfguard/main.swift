@@ -2289,7 +2289,7 @@ func runRetireMachine(service: String, confirmation: RetireConfirmation, policy:
         case HKDFGuardStatus.kekNotFound.rawValue:
             throw CLIError("no machine KEK exists for service \"\(service)\"; nothing to retire")
         case HKDFGuardStatus.kekCorrupted.rawValue:
-            throw CLIError("the machine KEK file for service \"\(service)\" is not one this library wrote, or root doesn't control it (the log says which: `log show --last 5m --predicate 'subsystem == \"com.hkdfguard\"'`); if its ownership or permissions are the cause, restore them and retire again; if its content is corrupt, retire it with --corrupt")
+            throw CLIError("the machine KEK file for service \"\(service)\" is not one this library wrote, root doesn't control it, or its group is not the RunnerGroup the policy names now (the log says which: `log show --last 5m --predicate 'subsystem == \"com.hkdfguard\"'`); if its ownership, group or permissions are the cause, restore them and retire again; if its content is corrupt, retire it with --corrupt")
         default:
             throw CLIError("cannot read the machine KEK's fingerprint for service \"\(service)\": \(describeStatus(status)); refusing to retire a KEK that cannot be confirmed")
         }

@@ -222,7 +222,7 @@ struct HkdfGuardMachineScopeTests {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.keks.\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: dir) }
-        guard case .untrusted(let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc") }) else {
+        guard case .untrusted(let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc", settings: MachineServiceSettings(runnerGroup: nil)) }) else {
             Issue.record("a user-owned key folder was trusted")
             return
         }
@@ -235,6 +235,61 @@ struct HkdfGuardMachineScopeTests {
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect(excludeFromBackup(dir.path))
         #expect(try URL(fileURLWithPath: dir.path).resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+    }
+
+    // MARK: - Runner group
+
+    @Test func aRunnerGroupIsRefusedByGidNotJustByName() {
+        // By name, whatever the case.
+        for name in ["staff", "Admin", "everyone", "wheel", "com.apple.access_ssh"] {
+            guard case .refused(let reason) = resolveRunnerGroup(name) else {
+                Issue.record("\(name) was accepted")
+                continue
+            }
+            #expect(reason.contains("too broad"))
+        }
+        guard case .refused(let missing) = resolveRunnerGroup("hkdfguard-no-such-group") else {
+            Issue.record("a group that doesn't exist was accepted")
+            return
+        }
+        #expect(missing.contains("does not name a group"))
+        // Not on the list, but root is a member: not a dedicated group.
+        #expect(lookupGroupID("daemon") == .found(1))
+        guard case .refused(let shared) = resolveRunnerGroup("daemon") else {
+            Issue.record("a group root belongs to was accepted")
+            return
+        }
+        #expect(shared.contains("root as a member"))
+        // A system group root is not in resolves to its gid.
+        #expect(resolveRunnerGroup("_www") == .gid(70))
+    }
+
+    @Test func aKeyFileMustBelongToThePolicysCurrentRunnerGroup() {
+        let groups: (String) -> GroupLookup = { name in
+            switch name {
+            case "_orders": return .found(501)
+            case "_zero": return .found(0)
+            case "_down": return .failed(EIO)
+            default: return .missing
+            }
+        }
+        func problem(_ mode: mode_t, _ gid: gid_t, _ group: String?) -> String? {
+            machineKeyFileGroupProblem(mode: mode, gid: gid, runnerGroup: group, lookup: groups)
+        }
+        #expect(problem(0o640, 501, "_orders") == nil)
+        #expect(problem(0o600, 501, "_orders") == nil)
+        // The policy moved on, or the file was re-grouped by hand.
+        #expect(problem(0o640, 502, "_orders")?.contains("not the policy's RunnerGroup _orders (gid 501)") == true)
+        #expect(problem(0o640, 0, "_orders") != nil)
+        // The group is gone, unreachable, or too broad: refused, not assumed.
+        #expect(problem(0o640, 501, "_gone")?.contains("does not name a group") == true)
+        #expect(problem(0o640, 501, "_down")?.contains("could not be looked up") == true)
+        #expect(problem(0o640, 20, "staff")?.contains("too broad") == true)
+        #expect(problem(0o640, 0, "_zero")?.contains("too broad") == true)
+        // No runner group: root only, so no group access at all.
+        #expect(problem(0o600, 0, nil) == nil)
+        #expect(problem(0o640, 501, nil)?.contains("chmod 600") == true)
+        #expect(problem(0o610, 0, nil) != nil)
     }
 
     // MARK: - System context

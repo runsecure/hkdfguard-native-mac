@@ -734,7 +734,7 @@ func retireCorruptMachineKeyFile(policy: CLIPolicy, service: String) throws {
                 throw CLIError("\(path) changed while it was being inspected; nothing was deleted -- inspect it again before retiring")
             }
         case .usable?:
-            throw CLIError("\(path) holds a usable KEK: the library refuses it because the file, or a folder above it, is not root's alone or is open to others (the log says which: `log show --last 5m --predicate 'subsystem == \"com.hkdfguard\"'`). Nothing was deleted -- restore root ownership, mode 0640 (0600 without a RunnerGroup) and no ACL, then use it, or retire it with --fingerprint")
+            throw CLIError("\(path) holds a usable KEK: the library refuses it because the file, or a folder above it, is not root's alone or is open to others, or the file's group is not the RunnerGroup the policy names now (the log says which: `log show --last 5m --predicate 'subsystem == \"com.hkdfguard\"'`). Nothing was deleted -- restore root ownership, the policy's RunnerGroup as its group, mode 0640 (0600 without a RunnerGroup) and no ACL, then use it, or retire it with --fingerprint")
         case .enclaveUnusable?:
             throw CLIError("the Secure Enclave is not usable in the system context right now (not yet unlocked since boot, or unavailable), so a healthy KEK can look corrupt; nothing was deleted -- try again after the first unlock")
         case .unsupportedHere?:

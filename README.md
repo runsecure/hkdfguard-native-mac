@@ -795,7 +795,25 @@ sudo dseditgroup -o edit -a _orders -t user _orders
 ```
 
 The library refuses a `RunnerGroup` that covers too many accounts (`staff`,
-`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …).
+`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …), whatever
+name it goes by: the check is on the group's gid. It also refuses a group
+that has root as a member, which is what a group with one of those nested
+inside it looks like. It can't tell a small group of people from a small
+group of service accounts; that part is yours.
+
+The KEK file's group is checked against the policy on every use, not just
+when the KEK is created. If you change a service's `RunnerGroup`, the
+existing file still belongs to the old group, and every call for that
+service fails with `-19` (the log names both groups) until you move it:
+
+```sh
+sudo chgrp _orders2 "/Library/Application Support/HkdfGuard/keks/com.example.orders.kek"
+```
+
+Do the same for the service's wrapped key files. Members of the old group
+could read the KEK file until then; if they should never have had it,
+retire the KEK and provision a new one instead. Removing a `RunnerGroup`
+calls for `chmod 600`.
 
 ### Provisioning, wrapping and retiring
 
@@ -860,7 +878,8 @@ machine-scoped service:
   Secure Enclave would refuse them anyway: a key created by a daemon can't
   be used from a login session.
 - **Only root and `RunnerGroup` members can read the KEK file**; anyone else
-  gets `-18`.
+  gets `-18`. A file whose group is not the policy's current `RunnerGroup`
+  is refused with `-19`, for every caller.
 - **The KEK file** is `/Library/Application Support/HkdfGuard/keks/<service>.kek`,
   `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). A P-256 KEK's
   (format 1) holds the public key and the Secure Enclave key blob; an

@@ -357,7 +357,9 @@ extern "C" {
 //   - it works logged out, at the login window, and after an unattended
 //     restart (`fdesetup authrestart`).
 //   - a file that is not root's, writable by anyone else, readable by
-//     others, or not one this library wrote is HKDFGUARD_ERR_KEK_INVALID.
+//     others, not in the RunnerGroup the policy names now (or group-
+//     accessible with none), or not one this library wrote is
+//     HKDFGUARD_ERR_KEK_INVALID.
 //
 // hkdfguard_kek_exists and hkdfguard_kek_fingerprint answer from the file
 // alone, without the Secure Enclave, so root can use them from Terminal.
