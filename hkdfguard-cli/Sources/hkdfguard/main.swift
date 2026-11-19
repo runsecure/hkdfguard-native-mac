@@ -1394,9 +1394,13 @@ func openDekFile(_ spelledPath: String) throws -> Int32 {
     }
     // Mode bits aren't the whole story on macOS: an access control list can
     // grant read to anyone regardless of a 0600 mode. Refuse any ACL at all.
-    if let acl = acl_get_fd(fd) {
-        acl_free(UnsafeMutableRawPointer(acl))
+    switch aclPresence(fd) {
+    case .none:
+        break
+    case .present:
         throw CLIError("--dek-file \(path) has an access control list, which can grant access beyond its mode bits; remove it (chmod -N \(path)) or use a file without one")
+    case .unreadable(let err):
+        throw CLIError("--dek-file \(path): could not tell whether it has an access control list, which can grant access beyond its mode bits (\(String(cString: strerror(err)))); refusing to use it")
     }
     ok = true
     return fd
@@ -1966,20 +1970,54 @@ func flushFolder(_ folder: CheckedFolder) throws {
 }
 
 
+// Whether the file open as `fd` has an access control list. Reading one
+// fails with ENOENT when there is none; any other failure leaves the
+// question open, and is reported as such so that callers refuse instead of
+// taking "couldn't read it" for "there isn't one" -- as the library's own
+// check does (aclGrantsOthersAChange).
+enum ACLPresence {
+    case none
+    case present
+    case unreadable(Int32)
+}
+
+func aclPresence(_ fd: Int32) -> ACLPresence {
+    errno = 0
+    guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+        let err = errno
+        return err == ENOENT ? .none : .unreadable(err)
+    }
+    acl_free(UnsafeMutableRawPointer(acl))
+    return .present
+}
+
 // Removes the file's access control list, if it has one, and confirms it is
 // gone. acl_set_fd with an empty ACL clears the extended ACL on APFS/HFS+;
-// the re-read is the guarantee, whatever the call did.
+// the re-read is the guarantee, whatever the call did. An ACL that can't be
+// read, before or after, is an error: the file's permissions are unknown.
 func stripACL(fd: Int32, path: String) throws {
-    if let existing = acl_get_fd(fd) {
-        acl_free(UnsafeMutableRawPointer(existing))
-        if let empty = acl_init(0) {
-            defer { acl_free(UnsafeMutableRawPointer(empty)) }
-            _ = acl_set_fd(fd, empty)
-        }
-        if let still = acl_get_fd(fd) {
-            acl_free(UnsafeMutableRawPointer(still))
-            throw CLIError("\(path) inherited an access control list from its folder that could not be removed; the file's permissions would not be what was asked for -- use a folder without an inheritable ACL (ls -lde shows it; chmod -N removes it)")
-        }
+    func unreadable(_ err: Int32) -> CLIError {
+        CLIError("could not tell whether \(path) has an access control list (\(String(cString: strerror(err)))), which can grant access beyond the permissions asked for; refusing to write the key file there")
+    }
+    switch aclPresence(fd) {
+    case .none:
+        return
+    case .unreadable(let err):
+        throw unreadable(err)
+    case .present:
+        break
+    }
+    if let empty = acl_init(0) {
+        defer { acl_free(UnsafeMutableRawPointer(empty)) }
+        _ = acl_set_fd(fd, empty)
+    }
+    switch aclPresence(fd) {
+    case .none:
+        return
+    case .unreadable(let err):
+        throw unreadable(err)
+    case .present:
+        throw CLIError("\(path) inherited an access control list from its folder that could not be removed; the file's permissions would not be what was asked for -- use a folder without an inheritable ACL (ls -lde shows it; chmod -N removes it)")
     }
 }
 
@@ -2175,6 +2213,7 @@ func runRetire(_ args: RetireArgs) throws {
         print("no payload wrapped under it unwraps now -- unless the keychain is restored from a backup or APFS snapshot taken before this retire")
     case .corrupt:
         try retireCorruptKEK(service: service)
+        auditKekRetired(service: service, fingerprint: [], scope: keychainModeName())
         print("retired corrupt KEK item for service \"\(service)\" (keychain: \(keychainModeName())); service \"\(service)\" can now be provisioned again")
     }
 }

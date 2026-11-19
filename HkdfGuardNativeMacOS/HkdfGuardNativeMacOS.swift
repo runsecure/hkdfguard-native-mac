@@ -766,8 +766,9 @@ enum HKDFGuardStatus: Int32, CaseIterable { // internal, not private: the cross-
     /// link (refused, never followed: `O_NOFOLLOW`), or the file is owned by
     /// someone other than this process's effective user or root, or is
     /// writable by group or others; or a folder above it, up to `/`, is
-    /// owned by someone else or writable by group or others without being
-    /// sticky (see `keyFileFoldersAreTrusted`) — so a party other than its
+    /// owned by someone else or writable by group or others — unless
+    /// sticky, which excuses a folder further up but never the one the file
+    /// is in (see `keyFileFoldersAreTrusted`) — so a party other than its
     /// owner could have replaced its contents or renamed another file over
     /// it. Root is accepted so an administrator or MDM can deploy key files
     /// a service account reads; root can already alter anything on the
@@ -1057,10 +1058,15 @@ enum StoredKEK: Equatable {
     /// Zeroes the enclave blobs: they are the credential.
     fileprivate mutating func zeroBlobs() {
         switch self {
+        // `self` is emptied first in each case: until then it still refers
+        // to the same bytes as the bindings, and zeroing through a shared
+        // reference wipes a private copy instead (copy-on-write).
         case .p256(var blob):
+            self = .p256(blob: Data())
             secureZero(&blob)
             self = .p256(blob: blob)
         case .mlkem1024(var blob, let encapsulated, var classicalBlob):
+            self = .p256(blob: Data())
             secureZero(&blob)
             secureZero(&classicalBlob)
             self = .mlkem1024(blob: blob, encapsulated: encapsulated, classicalBlob: classicalBlob)
@@ -3548,37 +3554,47 @@ private func unwrapDekUnderPolicy(
     guard let kek = maybeKEK else {
         return getStatus
     }
-    let (openStatus, maybePlaintext) = openPayload(
-        Data(bytes: wrappedPtr, count: hkdfguardWrappedLength), kek: kek, service: service)
-    guard var plaintext = maybePlaintext else {
+    // Decrypted straight into the caller's buffer (its capacity was checked
+    // above): the library keeps no copy of the DEK of its own to clean up.
+    let openStatus = openPayload(
+        Data(bytes: wrappedPtr, count: hkdfguardWrappedLength), kek: kek, service: service, into: outPtr)
+    guard openStatus == HKDFGuardStatus.success.rawValue else {
         return openStatus
-    }
-
-    defer { secureZero(&plaintext) }
-
-    guard plaintext.count == hkdfguardDekLength else {
-        return HKDFGuardStatus.unexpectedOutputLength.rawValue
-    }
-
-    guard Int(capacity) >= plaintext.count else {
-        outLen.pointee = Int32(plaintext.count)
-        return HKDFGuardStatus.outputBufferTooSmall.rawValue
-    }
-
-    guard copyOut(plaintext, to: outPtr, count: hkdfguardDekLength) else {
-        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
     outLen.pointee = Int32(hkdfguardDekLength)
 
     return HKDFGuardStatus.success.rawValue
 }
 
-/// Opens a `hkdfguardWrappedLength`-byte payload under `kek`. Internal so
-/// the tests can open under a KEK that isn't in a keychain. The caller
-/// zeroes the plaintext.
+/// Opens a payload under `kek` and returns the DEK as a value. For the
+/// tests, which open under KEKs that aren't in a keychain;
+/// `hkdfguard_unwrap_dek` uses the `into:` form below, so that no copy of
+/// the DEK outlives the call.
 func openPayload(_ payload: Data, kek: KEK, service: String) -> (status: Int32, plaintext: Data?) {
+    var dek = [UInt8](repeating: 0, count: hkdfguardDekLength)
+    defer { secureZero(&dek) }
+    let status = dek.withUnsafeMutableBufferPointer { buffer -> Int32 in
+        guard let out = buffer.baseAddress else {
+            return HKDFGuardStatus.unexpectedOutputLength.rawValue
+        }
+        return openPayload(payload, kek: kek, service: service, into: out)
+    }
+    return (status, status == HKDFGuardStatus.success.rawValue ? Data(dek) : nil)
+}
+
+/// Opens a `hkdfguardWrappedLength`-byte payload under `kek`, writing the
+/// `hkdfguardDekLength`-byte DEK to `out` -- which must have room for it --
+/// only on success. Internal so the tests can open under a KEK that isn't in
+/// a keychain.
+///
+/// The decrypted DEK is zeroed here, in the one variable CryptoKit's result
+/// is ever bound to. Handing that `Data` to a caller to zero does not work:
+/// a second binding shares its storage, so zeroing through either one makes
+/// a private copy (copy-on-write), wipes that, and leaves the original bytes
+/// to be freed intact.
+func openPayload(_ payload: Data, kek: KEK, service: String, into out: UnsafeMutablePointer<UInt8>) -> Int32 {
     guard payload.count == hkdfguardWrappedLength else {
-        return (HKDFGuardStatus.payloadMalformed.rawValue, nil)
+        return HKDFGuardStatus.payloadMalformed.rawValue
     }
     let bytes = [UInt8](payload)
     let header = Data(bytes[0..<hkdfguardHeaderLength])
@@ -3594,19 +3610,19 @@ func openPayload(_ payload: Data, kek: KEK, service: String) -> (status: Int32, 
     // the AEAD tag check below, which also covers this same fingerprint
     // (it is in the AAD) and would catch a tampered one anyway.
     guard kek.fingerprint == storedFingerprint else {
-        return (HKDFGuardStatus.fingerprintMismatch.rawValue, nil)
+        return HKDFGuardStatus.fingerprintMismatch.rawValue
     }
 
     // The right fingerprint with the other suite's byte: no KEK of that
     // suite has this fingerprint, so the byte was altered.
     guard bytes[hkdfguardSuiteIdOffset] == kek.suite.rawValue else {
-        return (HKDFGuardStatus.decryptionFailed.rawValue, nil)
+        return HKDFGuardStatus.decryptionFailed.rawValue
     }
 
     // The fixed-length fields always form a box; failing that is a bug.
     guard let nonce = try? AES.GCM.Nonce(data: nonceBytes),
           let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag) else {
-        return (HKDFGuardStatus.unexpectedOutputLength.rawValue, nil)
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
     }
 
     // Re-derive the payload's key -- the Secure Enclave's ECDH against
@@ -3619,17 +3635,25 @@ func openPayload(_ payload: Data, kek: KEK, service: String) -> (status: Int32, 
     let key: SymmetricKey
     do {
         guard let derived = try kek.wrappingKey(service: service, header: header) else {
-            return (HKDFGuardStatus.encryptionFailed.rawValue, nil) // the salt hashed to the point at infinity (probability about 2^-256)
+            return HKDFGuardStatus.encryptionFailed.rawValue // the salt hashed to the point at infinity (probability about 2^-256)
         }
         key = derived
     } catch {
-        return (HKDFGuardStatus.encryptionFailed.rawValue, nil)
+        return HKDFGuardStatus.encryptionFailed.rawValue
     }
+    var plaintext: Data
     do {
-        return (HKDFGuardStatus.success.rawValue, try AES.GCM.open(box, using: key, authenticating: header))
+        plaintext = try AES.GCM.open(box, using: key, authenticating: header)
     } catch {
-        return (HKDFGuardStatus.decryptionFailed.rawValue, nil)
+        return HKDFGuardStatus.decryptionFailed.rawValue
     }
+    defer { secureZero(&plaintext) } // in place: `plaintext` is the only reference to these bytes
+
+    guard plaintext.count == hkdfguardDekLength,
+          copyOut(plaintext, to: out, count: hkdfguardDekLength) else {
+        return HKDFGuardStatus.unexpectedOutputLength.rawValue
+    }
+    return HKDFGuardStatus.success.rawValue
 }
 
 // MARK: - Read a wrapped payload from a file
@@ -3656,10 +3680,16 @@ private func fileOpenStatus(errno code: Int32) -> HKDFGuardStatus {
 /// Whether the key file's folder, open as `folderFd`, and every folder above
 /// it up to `/` are ones nobody untrusted can rename, replace or
 /// delete entries in: a directory owned by root or this process's
-/// effective user, and not writable by group or others unless sticky
-/// (`/tmp`-style: the kernel then lets only an entry's owner, or the
-/// folder's, rename or remove it, and the file's own owner has just been
-/// checked). Write bits are ignored on a read-only volume.
+/// effective user, and not writable by group or others. The sticky bit
+/// (`/tmp`-style) excuses that for the folders *above* the key's own: there
+/// the kernel lets only an entry's owner, or the folder's, rename or remove
+/// it, so nobody else can swap out the subtree the key is in. It does not
+/// excuse the key's own folder, because sticky stops nobody *adding* an
+/// entry, and macOS lets any user hard-link a file they don't own: whenever
+/// the key's name is free, someone else could link an older payload -- still
+/// owned by this user or root, so passing every check on the file -- to that
+/// name. (Its link count can't tell: they can drop their other name for it
+/// afterwards.) Write bits are ignored on the sealed system volume.
 ///
 /// The folder is the one the path names the file in, opened by
 /// `readWrappedFile` before the file, which is then opened *within* it
@@ -3692,6 +3722,7 @@ func keyFileFoldersAreTrusted(folderFd: Int32, rootOnly: Bool = false) -> Bool {
     defer { close(current) }
 
     let uid = geteuid()
+    var isKeyFolder = true
     for _ in 0..<Int(MAXPATHLEN) { // a path has at most this many folders
         var info = stat()
         guard fstat(current, &info) == 0,
@@ -3703,9 +3734,10 @@ func keyFileFoldersAreTrusted(folderFd: Int32, rootOnly: Bool = false) -> Bool {
         }
         let writable = info.st_mode & (S_IWGRP | S_IWOTH) != 0
         let sticky = info.st_mode & S_ISVTX != 0
-        if writable && (rootOnly || !sticky) && !onSealedSystemVolume(current) {
+        if writable && (rootOnly || !sticky || isKeyFolder) && !onSealedSystemVolume(current) {
             return false
         }
+        isKeyFolder = false
 
         let parent = openat(current, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard parent >= 0 else {
@@ -3884,7 +3916,8 @@ private func readWrappedFile(
     // it to put an older payload where the service looks -- and that takes
     // creating an entry in the key's own folder: the folder the file was
     // just opened within, which `keyFileFoldersAreTrusted` below limits to
-    // the owner and root.
+    // the owner and root (it refuses that folder if group or others can
+    // write it, sticky or not).
     guard info.st_uid == geteuid() || info.st_uid == 0,
           info.st_mode & (S_IWGRP | S_IWOTH) == 0,
           // On a volume ignoring ownership, st_uid above is whoever asked.

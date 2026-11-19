@@ -348,7 +348,7 @@ Console.app shows the same records live.
 | 1000 | default | A KEK was created (not merely found). |
 | 1002 | default | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | default | A DEK was unwrapped. |
-| 1004 | error | A KEK was retired by the CLI's `retire` (written by the CLI, category `audit`); names its fingerprint, scope and the admin behind `sudo`. |
+| 1004 | error | A KEK was retired by the CLI's `retire` (written by the CLI, category `audit`); names its fingerprint, scope and the admin behind `sudo`. A corrupt item or file retired with `--corrupt` has no fingerprint: its record carries `kek_fingerprint=none corrupt=1`. |
 | 2000 | error | `KEK_ACCESS_DENIED`. |
 | 2002 | fault | `KEK_INVALID`. |
 | 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
@@ -356,6 +356,7 @@ Console.app shows the same records live.
 | 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
 | 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
 | 2007 | warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` / `hkdfguard_kek_fingerprint` calls (each held to at least 1000 ms; see [Concurrency](#concurrency)). Logged once per process. |
+| 2008 | error | The CLI refused `provision`, `retire` or `wrap` on a machine-scoped service because the admin behind `sudo` is not in the role's group, or can't be identified (written by the CLI, category `audit`); names the command, service, role, group and admin. macOS only. |
 
 The unified log has no "warning" level, so Linux's info / warning / error
 are `default` / `error` / `fault` here. `default` is the level the log keeps
@@ -427,15 +428,21 @@ reach `out` only on success; on any failure the whole declared capacity of
   rollback rather than a loud error. A file with more than one hard link is
   accepted, as on Linux and Windows: putting a second name for an older
   payload where the service looks means creating an entry in the key's
-  folder, which the folder checks below limit to the owner and root.
+  folder, which the folder checks below limit to the owner and root (the
+  key's own folder may not be writable by group or others, sticky or not).
   Group- or world-*readable* is allowed, since the payload is ciphertext. A
   root-owned file must still be readable by the reading account: `0644`, or
   `0640` with a group the account belongs to. Otherwise it is
   `fileAccessDenied` (-33).
 - **Folders.** The same holds for every folder above the file, up to `/`,
   as on Linux: each must be owned by root or the process's effective user,
-  and not writable by group or others unless it is sticky (`/tmp`-style,
-  where only an entry's owner can rename or remove it). Write bits are
+  and not writable by group or others. A sticky folder (`/tmp`-style,
+  where only an entry's owner can rename or remove it) is excused when it
+  is further up the path, but not when it is the folder the key file is
+  directly in: sticky stops nobody adding an entry, and macOS lets any user
+  hard-link a file they don't own, so whenever the key's name was free
+  someone else could link an older payload to it. Keep a key in a folder of
+  its own (`/tmp/myservice/ingest.key`, not `/tmp/ingest.key`). Write bits are
   ignored only on the sealed system volume, which nothing can change; any
   other read-only volume, such as a mounted disk image, is checked like the
   rest. Otherwise someone else could rename a file of their choosing over
@@ -537,7 +544,7 @@ here are defined there but never returned on macOS.
 | `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 125 bytes |
 | `-37` | `ERR_FILE_PLAINTEXT_KEY` | `fileUnprotectedKey` | the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
 | `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 125 bytes, but the fingerprint is all zeros |
-| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | a symbolic link (refused, never followed); owned by someone other than this user or root, or writable by group or others; or an ACL lets someone else change it; or it is on a volume that ignores ownership; or a folder above it is owned by someone else, writable by group or others without being sticky, or has an ACL letting someone else add or remove entries |
+| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | a symbolic link (refused, never followed); owned by someone other than this user or root, or writable by group or others; or an ACL lets someone else change it; or it is on a volume that ignores ownership; or a folder above it is owned by someone else, writable by group or others (a sticky folder is excused unless it is the one the file is directly in), or has an ACL letting someone else add or remove entries |
 | `-96` | `ERR_MAC_ACCESS_CONTROL_CREATION_FAILED` | `accessControlCreationFailed` | refines `ERR_PROVIDER_ERROR` (-4) |
 | `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
 | `-98` | `ERR_MAC_KEYCHAIN_WRITE_FAILED` | `keychainWriteFailed` | refines -4 |
@@ -1058,7 +1065,7 @@ hkdfguard retire --service-name|-sn <name> \
     key file only ciphertext. Every check is made on the opened descriptor,
     so it describes the file that is read. A file carrying an access
     control list is refused too, whatever its mode bits: an ACL can grant
-    read to anyone.
+    read to anyone. So is a file whose ACL can't be read at all.
   - *No symbolic link above a path (same as the Linux tool).* Neither
     `--key-file-path` nor `--dek-file` may be reached through a symlinked
     folder: whoever could plant one where the operator writes could redirect

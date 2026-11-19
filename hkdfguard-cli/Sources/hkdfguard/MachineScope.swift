@@ -201,16 +201,19 @@ func requireAdminRole(_ role: AdminRole, policy: CLIPolicy, service: String, com
     guard let group = role.group(in: policy) else {
         return // no group named: any admin who can sudo
     }
-    switch sessionOwner() {
+    let owner = sessionOwner()
+    switch owner {
     case .root, .system:
         return // root itself, not an admin's `sudo`: trusted
     case .user(let uid, let name):
         // Fails closed: an account or group the directory can't resolve
         // is not a member.
         guard isMember(uid: uid, ofGroup: group) else {
+            auditRoleDenied(role, group: group, owner: owner, service: service, command: command, reason: "NOT_A_MEMBER")
             throw CLIError("\(name) is not a member of \(group), the policy's \(role.setting): only its members may \(role.duty)")
         }
     case .unknown(let reason):
+        auditRoleDenied(role, group: group, owner: owner, service: service, command: command, reason: "SESSION_UNKNOWN")
         throw CLIError("can't tell which admin is behind this session -- \(reason) -- so membership of \(group), the policy's \(role.setting), can't be checked: only its members may \(role.duty)")
     }
 }
@@ -809,11 +812,30 @@ func retireCorruptMachineKeyFile(policy: CLIPolicy, service: String) throws {
 
 private let auditLog = Logger(subsystem: "com.hkdfguard", category: "audit")
 
+/// A name for a quoted field of a record, kept to characters that can't end
+/// the field or start another.
+private func auditField(_ value: String) -> String {
+    String(value.unicodeScalars.filter { (0x20..<0x7F).contains($0.value) && $0 != "\"" && $0 != "\\" })
+}
+
 /// Event 1004 (as on Linux): a KEK was retired. The library writes every
-/// other record; retiring is this tool's alone.
+/// other success record; retiring is this tool's alone. `fingerprint` is
+/// empty for a corrupt item or file (`retire --corrupt`): there is no key to
+/// take one from, and the record says so.
 func auditKekRetired(service: String, fingerprint: [UInt8], scope: String) {
-    // Kept to characters that can't end the quoted field or start another.
-    let actor = String(sessionOwner().actor.unicodeScalars.filter { (0x20..<0x7F).contains($0.value) && $0 != "\"" && $0 != "\\" })
-    let line = "event=1004 op=retire result=OK service=\"\(service)\" provider=SECURE_ENCLAVE keychain=\(scope) kek_fingerprint=\(hexString(fingerprint)) actor=\"\(actor)\" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) msg=\"KEK retired: no DEK wrapped under it unwraps unless the KEK is restored from a backup or snapshot\""
+    let actor = auditField(sessionOwner().actor)
+    let what = fingerprint.isEmpty
+        ? "kek_fingerprint=none corrupt=1 actor=\"\(actor)\" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) msg=\"corrupt KEK item retired (--corrupt): it could not be reconstructed into a key, so it has no fingerprint\""
+        : "kek_fingerprint=\(hexString(fingerprint)) actor=\"\(actor)\" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) msg=\"KEK retired: no DEK wrapped under it unwraps unless the KEK is restored from a backup or snapshot\""
+    let line = "event=1004 op=retire result=OK service=\"\(service)\" provider=SECURE_ENCLAVE keychain=\(scope) \(what)"
+    auditLog.error("\(line, privacy: .public)")
+}
+
+/// Event 2008 (this tool's alone): an admin command on a machine-scoped
+/// service was refused because the admin behind the root session is not in
+/// the role's group, or can't be identified. Without it, someone trying
+/// commands their role doesn't allow would leave no trace.
+func auditRoleDenied(_ role: AdminRole, group: String, owner: SessionOwner, service: String, command: String, reason: String) {
+    let line = "event=2008 op=\(command) result=ROLE_DENIED reason=\(reason) service=\"\(auditField(service))\" role=\(role.setting) group=\"\(auditField(group))\" actor=\"\(auditField(owner.actor))\" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) msg=\"refused: only members of the role's group may \(role.duty)\""
     auditLog.error("\(line, privacy: .public)")
 }

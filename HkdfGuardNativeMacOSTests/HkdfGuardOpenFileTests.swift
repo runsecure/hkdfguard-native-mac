@@ -418,15 +418,48 @@ struct HkdfGuardOpenFileTests {
         #expect(Self.openFile(file.path).status == 0, "a 0755 folder is trusted again")
     }
 
-    @Test func acceptsAFileInAStickyWorldWritableFolder() throws {
-        // /tmp-style: only an entry's owner (or the folder's) can rename or
-        // remove it, and the file's owner is checked.
+    @Test func refusesAFileDirectlyInAStickyWorldWritableFolder() throws {
+        // /tmp-style. Sticky stops others renaming or removing the key, but
+        // not adding an entry -- and macOS lets any user hard-link a file
+        // they don't own, so with the key's name free someone else could
+        // link an older payload of this user's there. The folder is refused
+        // for the key itself; it is fine further up (the next test).
         let dir = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
         let file = dir.appendingPathComponent("ingest.key")
         try Self.write(Self.structurallyValidPayload(), to: file)
-        try FileManager.default.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: dir.path)
         #expect(Self.openFile(file.path).status == 0)
+        for mode in [0o1777, 0o1775, 0o1757] {
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: dir.path)
+            let result = Self.openFile(file.path)
+            #expect(result.status == -39, "folder mode \(String(mode, radix: 8))")
+            #expect(result.zeroed, "folder mode \(String(mode, radix: 8))")
+        }
+    }
+
+    @Test func refusesAnOlderPayloadHardLinkedIntoAStickyFolder() throws {
+        // The rollback itself: an older payload this user owns, kept alive
+        // under another name, linked to the key's name in a sticky folder
+        // while that name is free -- with the other name then dropped, so
+        // the link count is 1 again and says nothing.
+        let base = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let stash = base.appendingPathComponent("stash", isDirectory: true)
+        let shared = base.appendingPathComponent("shared", isDirectory: true)
+        try FileManager.default.createDirectory(at: stash, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: false)
+        let older = stash.appendingPathComponent("older.key")
+        try Self.write(Self.structurallyValidPayload(), to: older)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: older.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: shared.path)
+
+        let key = shared.appendingPathComponent("ingest.key")
+        try FileManager.default.linkItem(at: older, to: key)
+        #expect(Self.openFile(key.path).status == -39, "two links")
+        try FileManager.default.removeItem(at: older)
+        var info = stat()
+        try #require(stat(key.path, &info) == 0 && info.st_nlink == 1)
+        #expect(Self.openFile(key.path).status == -39, "one link again")
     }
 
     @Test func refusesAFileBelowAWritableAncestorFolder() throws {
