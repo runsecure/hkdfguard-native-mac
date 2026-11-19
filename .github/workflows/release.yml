@@ -10,6 +10,9 @@
 #                       point at a commit on main.
 #   run by hand         the same build, uploaded only as a workflow artifact
 #                       (no tag, no Release) -- to check the signing setup.
+#                       Only from a commit on main. The package is as signed
+#                       and notarized as a release, so the artifact is named
+#                       DRY-RUN and deleted after a day.
 #
 # The signing credentials are secrets of the `release` environment, never of
 # the repository, so only a job that names that environment can read them;
@@ -76,8 +79,13 @@ jobs:
             | sed 's/DYLIB_CURRENT_VERSION = //; s/;//' | sort -u)"
           [ "$dylib_versions" = "$versions" ] \
             || { echo "::error::DYLIB_CURRENT_VERSION ($(tr '\n' ' ' <<<"$dylib_versions")) must equal MARKETING_VERSION $versions"; exit 1; }
+
+      # For a manual run as well as a tag: whatever this job signs and
+      # notarizes installs like a release, so it is only ever built from main.
+      - name: Check the commit is on main
+        run: |
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
-            || { echo "::error::tag $GITHUB_REF_NAME is not on main"; exit 1; }
+            || { echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main"; exit 1; }
 
       # A throwaway keychain, made the default and first in the search list,
       # so codesign, productbuild, xcodebuild and notarytool all find the
@@ -171,15 +179,18 @@ jobs:
           echo "path=$pkg" >> "$GITHUB_OUTPUT"
           cat "$pkg.sha256"
 
+      # A manual run's package is real -- signed, notarized, with the current
+      # version number -- but is not a release: the artifact says so in its
+      # name and is kept one day, long enough to inspect it.
       - name: Upload the package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: hkdfguard-native-macos-osx-arm64
+          name: ${{ github.ref_type == 'tag' && 'hkdfguard-native-macos-osx-arm64' || format('DRY-RUN-not-a-release-hkdfguard-native-macos-osx-arm64-{0}', github.sha) }}
           path: |
             ${{ steps.pkg.outputs.path }}
             ${{ steps.pkg.outputs.path }}.sha256
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ github.ref_type == 'tag' && 30 || 1 }}
 
       # The checksum goes in the release notes -- outside the asset, so
       # replacing the package cannot also replace the value it is checked

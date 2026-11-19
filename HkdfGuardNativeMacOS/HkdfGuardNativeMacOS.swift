@@ -1037,7 +1037,7 @@ private func loadKEKDataRepresentation(service: String, mode: KeychainMode) -> K
     let status = SecItemCopyMatching(query as CFDictionary, &item)
     switch status {
     case errSecSuccess:
-        guard let data = item as? Data else { return .failed(errSecInternalError) }
+        guard let data = takeKeychainSecret(item) else { return .failed(errSecInternalError) }
         return .found(data)
     case errSecItemNotFound:
         return .notFound
@@ -1046,6 +1046,31 @@ private func loadKEKDataRepresentation(service: String, mode: KeychainMode) -> K
     default:
         return .failed(status)
     }
+}
+
+/// Moves the bytes of a keychain result out of the object the keychain
+/// returned and into memory this library owns, or returns nil if the result
+/// is not data.
+///
+/// Casting the result to `Data` instead only wraps the keychain's object: a
+/// later `secureZero` then wipes a private copy (copy-on-write) and the
+/// object keeps the blob until it is freed, unzeroed. So the bytes are
+/// copied out, the keychain's object is zeroed in place, and the copy is
+/// zeroed when its last reference goes -- however many `Data` values came
+/// to share it on the way. Copies made inside the Security framework before
+/// it returned are out of reach.
+func takeKeychainSecret(_ item: CFTypeRef?) -> Data? {
+    guard let item, CFGetTypeID(item) == CFDataGetTypeID() else { return nil }
+    let keychainData = unsafeBitCast(item, to: CFData.self)
+    let count = CFDataGetLength(keychainData)
+    guard count > 0, let source = CFDataGetBytePtr(keychainData) else { return Data() }
+    let copy = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: MemoryLayout<UInt>.alignment)
+    copy.copyMemory(from: source, byteCount: count)
+    _ = memset_s(UnsafeMutableRawPointer(mutating: source), count, 0, count)
+    return Data(bytesNoCopy: copy, count: count, deallocator: .custom { pointer, length in
+        _ = memset_s(pointer, length, 0, length)
+        pointer.deallocate()
+    })
 }
 
 /// A KEK as stored: its Secure Enclave blob, plus, for suite 0x02, the
@@ -3024,31 +3049,68 @@ private let debuggableEntitlements = [
     "com.apple.security.cs.disable-library-validation",
 ]
 
-/// Why the host executable's code signature still lets same-user processes
-/// debug or inject into this process -- empty when it doesn't. On macOS that
+/// The kernel's code-signing status bits for a running process
+/// (<kern/cs_blobs.h>), as `kSecCodeInfoStatus` reports them.
+private let csValid: UInt32 = 0x0000_0001        // CS_VALID
+private let csGetTaskAllow: UInt32 = 0x0000_0004 // CS_GET_TASK_ALLOW
+private let csRuntime: UInt32 = 0x0001_0000      // CS_RUNTIME
+private let csDebugged: UInt32 = 0x1000_0000     // CS_DEBUGGED
+
+/// Why the host's code signature still lets same-user processes debug or
+/// inject into this process -- empty when it doesn't. On macOS that
 /// protection comes from the signature (Hardened Runtime, none of
 /// `debuggableEntitlements`), which a library can read but not change.
+///
+/// Judged on the *running process*: the status and entitlements the kernel
+/// holds for it and enforces, not the executable file's signature. The file
+/// can have been replaced since launch, or be a differently signed copy of
+/// what is running, so its signature says nothing certain about this
+/// process -- and a file that looks protected must not vouch for a process
+/// that isn't.
 /// Internal, not private, so tests can check it against a known signature.
 func codeSignatureWeaknesses() -> [String] {
     var code: SecCode?
-    var staticCode: SecStaticCode?
     var info: CFDictionary?
+    // SecCodeCopySigningInformation takes a running code object as well as
+    // a static one (its parameter is typed for the latter); with
+    // kSecCSDynamicInformation it then reports the process's live status.
     guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess, let code,
-          SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess, let staticCode,
-          SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
-          let signing = info as? [String: Any]
+          SecCodeCopySigningInformation(
+              unsafeBitCast(code, to: SecStaticCode.self),
+              SecCSFlags(rawValue: kSecCSDynamicInformation), &info) == errSecSuccess,
+          let signing = info as? [String: Any],
+          let status = (signing[kSecCodeInfoStatus as String] as? NSNumber)?.uint32Value,
+          let task = SecTaskCreateFromSelf(nil)
     else {
-        return ["its code signature could not be read"]
+        return ["its code-signing status could not be read"]
     }
 
     var weaknesses: [String] = []
-    let flags = (signing[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
-    if flags & SecCodeSignatureFlags.runtime.rawValue == 0 {
-        weaknesses.append("it is not signed with the Hardened Runtime (codesign --options runtime)")
+    if status & csValid == 0 {
+        weaknesses.append("its code signature is no longer valid in the running process")
     }
-    let entitlements = signing[kSecCodeInfoEntitlementsDict as String] as? [String: Any] ?? [:]
-    for key in debuggableEntitlements where (entitlements[key] as? Bool) == true {
-        weaknesses.append("it has the \(key) entitlement")
+    if status & csRuntime == 0 {
+        weaknesses.append("it is not running with the Hardened Runtime (codesign --options runtime)")
+    }
+    if status & csDebugged != 0 {
+        weaknesses.append("it has been run under a debugger")
+    }
+    var entitled: Set<String> = []
+    for key in debuggableEntitlements {
+        var error: Unmanaged<CFError>?
+        let value = SecTaskCopyValueForEntitlement(task, key as CFString, &error)
+        if let error {
+            error.release()
+            weaknesses.append("its \(key) entitlement could not be read")
+        } else if (value as? Bool) == true {
+            weaknesses.append("it has the \(key) entitlement")
+            entitled.insert(key)
+        }
+    }
+    // The kernel's own bit, in case it is set by something other than the
+    // entitlement just reported.
+    if status & csGetTaskAllow != 0 && !entitled.contains("com.apple.security.get-task-allow") {
+        weaknesses.append("the kernel lets other processes take its task port (CS_GET_TASK_ALLOW)")
     }
     return weaknesses
 }
@@ -3085,7 +3147,8 @@ public func hkdfguard_harden_process() -> Int32 {
 /// 2. `ptrace(PT_DENY_ATTACH)`: later ptrace attaches fail. Refused (-20)
 ///    rather than attempted if a debugger is already attached, because
 ///    then the kernel would terminate the process.
-/// 3. The host executable's code signature is checked
+/// 3. The process's code-signing status is checked, as the kernel holds
+///    it for the running process, not as the file on disk is signed
 ///    (`codeSignatureWeaknesses`). That is what stops a same-user process
 ///    from taking this process's task port to read its memory, and only
 ///    the host's signer can change it. A weakness is logged as a warning

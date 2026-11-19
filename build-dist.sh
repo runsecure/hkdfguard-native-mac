@@ -41,6 +41,12 @@
 # into place as dist/ once every build, signature, and check has passed, so
 # a failure part-way through never leaves an empty or half-populated dist/.
 #
+# Every build starts clean: the build folders this script owns
+# (build-arm64/, hkdfguard-cli/.build-arm64/) are deleted first and the app
+# is archived with its own temporary DerivedData, so nothing compiled by an
+# earlier run -- from other sources, or with other settings -- can end up in
+# what is signed here.
+#
 # Signing uses a secure timestamp (--timestamp), which contacts Apple's
 # timestamp server: this script needs network access to complete.
 set -euo pipefail
@@ -60,9 +66,16 @@ fi
 # DEVELOPER_DIR is left alone -- it is how a particular Xcode is chosen --
 # but the folder in use is printed, so a build log always shows which
 # toolchain built and signed the release.
+#
+# The same goes for what the build tools read from the environment:
+# XCODE_XCCONFIG_FILE adds build settings to every xcodebuild below (CI sets
+# it to build unsigned), SDKROOT picks the SDK, and SwiftPM takes its
+# compilers from SWIFT_EXEC, SWIFT_EXEC_MANIFEST and CC. None may be
+# inherited.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 unset TOOLCHAINS
+unset XCODE_XCCONFIG_FILE SDKROOT SWIFT_EXEC SWIFT_EXEC_MANIFEST CC
 echo "==> Developer tools: ${DEVELOPER_DIR:-$(xcode-select -p)}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -249,6 +262,23 @@ assert_entitlements() {
         || fail "$file: entitlements are [$(tr '\n' ' ' <<<"$actual")], expected [$(tr '\n' ' ' <<<"$expected")]"
 }
 
+# Asserts a Mach-O file carries no debug symbol entries and no local symbols.
+# The debug entries name every object file by its absolute path on the build
+# machine, with its modification time.
+assert_stripped() {
+    local file="$1" symbols
+    # strip itself leaves one marker entry behind ("OPT radr://5614542"),
+    # which names nothing.
+    symbols="$(nm -a "$file" | grep -v ' OPT radr://5614542$' || true)"
+    if grep -q -E '^[0-9a-f]* +- ' <<<"$symbols"; then
+        fail "$file: still carries debug symbol entries (build-machine paths)"
+    fi
+    symbols="$(nm -U "$file")"
+    if grep -q -E ' [a-z] ' <<<"$symbols"; then
+        fail "$file: still carries local symbols"
+    fi
+}
+
 # Asserts a signature verifies strictly and carries the hardened-runtime
 # flag and a secure timestamp.
 assert_signed() {
@@ -380,15 +410,26 @@ build_arch() {
     echo "==================== $rid ($arch) ===================="
     mkdir -p "$out"
 
+    # Both folders are this script's own build output (see .gitignore).
+    # Starting from nothing means no object file from an earlier run, built
+    # from other sources or with other settings, can be linked into the
+    # release.
+    echo "==> Removing earlier build output: $build_dir, $scratch"
+    rm -rf "$build_dir" "$scratch"
+
     echo "==> Building $DYLIB_NAME for $arch (Release) into $build_dir"
     # Signed manually with the identity it is re-signed with below. The
     # project's automatic signing would want an Apple Development
-    # certificate, which a release machine (CI) need not have.
+    # certificate, which a release machine (CI) need not have. SYMROOT and
+    # OBJROOT keep the intermediate files in $build_dir too: by default they
+    # go to build/, which everyday builds share and nothing here cleans.
     xcodebuild -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
         -target HkdfGuardNativeMacOSDylib \
         -configuration Release \
         ARCHS="$arch" ONLY_ACTIVE_ARCH=NO \
         BUILD_DIR="$build_dir" \
+        SYMROOT="$build_dir" \
+        OBJROOT="$build_dir/Intermediates" \
         CODE_SIGN_STYLE=Manual \
         CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
         DEVELOPMENT_TEAM="$TEAM_ID" \
@@ -426,6 +467,15 @@ build_arch() {
     cp "$HEADER" "$out/"
     cp "$cli_bin_dir/hkdfguard" "$out/"
 
+    echo "==> Stripping $rid/$DYLIB_NAME and $rid/hkdfguard"
+    # As built, both carry a debug map: the absolute path and modification
+    # time of every object file, plus all local symbol names. That tells a
+    # reader about the build machine and makes two builds of the same
+    # source differ. The dylib keeps its exported symbols (the C ABI); the
+    # CLI keeps only what dyld needs. Both are signed afterwards, below.
+    strip -S -x -no_code_signature_warning "$out/$DYLIB_NAME"
+    strip -no_code_signature_warning "$out/hkdfguard"
+
     echo "==> Making $rid/hkdfguard self-contained"
     # As linked (see Package.swift), the CLI finds the dylib via an -rpath
     # baked in as this machine's absolute build directory -- fine
@@ -460,6 +510,8 @@ build_arch() {
     echo "==> Verifying $rid"
     assert_arch "$out/$DYLIB_NAME" "$arch"
     assert_arch "$cli" "$arch"
+    assert_stripped "$out/$DYLIB_NAME"
+    assert_stripped "$cli"
     assert_signed "$out/$DYLIB_NAME"
     assert_signed "$cli"
     assert_identity "$out/$DYLIB_NAME"
@@ -550,6 +602,9 @@ build_app() {
         )
     fi
 
+    # Its own DerivedData, in the scratch folder: the default one under
+    # ~/Library is shared with Xcode and every other build of this project,
+    # and would be built on incrementally.
     echo "==> Archiving $APP_SCHEME (Release, arm64, team $TEAM_ID, signing: ${APP_PROFILE:+manual, profile $APP_PROFILE}${APP_PROFILE:-automatic})"
     xcodebuild archive \
         -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
@@ -557,6 +612,7 @@ build_app() {
         -configuration Release \
         -destination "generic/platform=macOS" \
         -archivePath "$archive" \
+        -derivedDataPath "$WORK/DerivedData" \
         ${provisioning_args[@]+"${provisioning_args[@]}"} \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
         DEVELOPMENT_TEAM="$TEAM_ID" \

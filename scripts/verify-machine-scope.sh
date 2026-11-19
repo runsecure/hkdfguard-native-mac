@@ -36,7 +36,8 @@
 # _hkdfguardverify (member: nobody), the KEK files for
 # com.hkdfguard.verify.mlkem and com.hkdfguard.verify.p256, temporary
 # LaunchDaemons, and its staging folder. Refuses to start if a policy, that
-# group, or either KEK already exists.
+# group, either KEK, the staging folder or its LaunchDaemon already exists,
+# so everything it removes on exit is something it made.
 #
 # Run with: sudo bash scripts/verify-machine-scope.sh
 set -u
@@ -68,6 +69,16 @@ MLKEM_AVAILABLE=0
 [[ -e "$MANAGED" ]] && fail_now "$MANAGED exists (an MDM policy); run this on a Mac without one"
 for s in $SERVICES; do [[ -e "$KEKS/$s.kek" ]] && fail_now "$KEKS/$s.kek already exists"; done
 dscl . -read "/Groups/$GROUP" >/dev/null 2>&1 && fail_now "group $GROUP already exists"
+# Not -e: a dangling symbolic link exists too.
+[[ -e "$STAGE" || -L "$STAGE" ]] && fail_now "$STAGE already exists (left by an interrupted run?); look at what it holds, then remove it: sudo rm -rf \"$STAGE\""
+[[ -e "$JOBPLIST" || -L "$JOBPLIST" ]] && fail_now "$JOBPLIST already exists (left by an interrupted run?); remove it: sudo launchctl bootout system/$LABEL; sudo rm \"$JOBPLIST\""
+# Root works in these folders below; nobody else may be able to put
+# anything in them.
+for d in "$HG" "$KEKS"; do
+    [[ -e "$d" || -L "$d" ]] || continue
+    [[ -d "$d" && ! -L "$d" && "$(stat -f '%u' "$d")" = 0 && -z "$(find "$d" -maxdepth 0 -perm +022)" ]] \
+        || fail_now "$d is not a folder that only root can write"
+done
 
 CREATED_HG=0; CREATED_KEKS=0
 [[ -d "$HG" ]] || { mkdir -m 0755 "$HG" && chown root:wheel "$HG" && CREATED_HG=1; }
@@ -81,10 +92,6 @@ cleanup() {
     rm -rf "$STAGE"
     [[ "$CREATED_HG" -eq 1 ]] && rmdir "$HG" 2>/dev/null
     dseditgroup -o delete -n . "$GROUP" >/dev/null 2>&1
-    # The Secure Enclave prototype's watcher, if it is still installed.
-    launchctl bootout system/com.hkdfguard.sepoc.watch 2>/dev/null
-    rm -f /Library/LaunchDaemons/com.hkdfguard.sepoc.watch.plist
-    rm -rf /private/var/tmp/hkdfguard-sepoc
 }
 trap cleanup EXIT
 
@@ -99,7 +106,12 @@ byte_at() { # byte_at <offset> <file>: that byte, as two hex digits
 }
 
 echo "== staging root-owned copies of this repo's builds in $STAGE"
-mkdir -m 0755 "$STAGE" "$STAGE/bin" "$STAGE/keys" "$STAGE/out"
+# All of it root's, 0755, and it stays that way: root creates, reads and
+# removes files by name in here, so no other account may be able to add,
+# rename or replace an entry (a symbolic link planted at one of those names
+# would have root act on whatever it points at).
+( umask 022; mkdir "$STAGE" "$STAGE/bin" "$STAGE/keys" "$STAGE/out" ) || fail_now "could not create $STAGE"
+chown -R root:wheel "$STAGE"
 install -o root -g wheel -m 0755 "$CLI_SRC" "$STAGE/bin/hkdfguard"
 install -o root -g wheel -m 0644 "$LIB_SRC" "$STAGE/bin/libhkdfguard.dylib"
 # The development CLI finds its library in the repo; the staged one must
@@ -136,7 +148,6 @@ CLI="$STAGE/bin/hkdfguard"
 echo "== a runner group holding only the service account (nobody)"
 dseditgroup -o create -n . -r "HkdfGuard verification" "$GROUP" || fail_now "could not create $GROUP"
 dseditgroup -o edit -n . -a nobody -t user "$GROUP" || fail_now "could not add nobody to $GROUP"
-chown nobody "$STAGE/out"
 
 # The suite pass in progress: its service, key file, and the policy's suite
 # settings (empty: the defaults).
@@ -159,9 +170,15 @@ PLIST
 }
 
 # Runs the consumer as a real LaunchDaemon as <user>; prints its one line.
+# The job writes its output to a file root makes for it first -- new, empty,
+# and the job's account's own -- in the root-owned out folder: the account
+# gets one file to write, not a folder to put things in.
 consumer_daemon() { # consumer_daemon <user> <tag>
     local out="$STAGE/out/$2.txt"
     rm -f "$out"
+    # noclobber: created here or not at all, never an existing file or a link.
+    ( set -o noclobber; umask 077; : > "$out" ) 2>/dev/null || { echo "(could not create $out)"; return; }
+    chown -h "$1" "$out" || { echo "(could not give $out to $1)"; return; }
     launchctl bootout system/$LABEL 2>/dev/null
     cat > "$JOBPLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -177,12 +194,21 @@ consumer_daemon() { # consumer_daemon <user> <tag>
 </dict></plist>
 PLIST
     chown root:wheel "$JOBPLIST"; chmod 0644 "$JOBPLIST"
-    [[ "$1" = nobody ]] || touch "$out"
-    chown "$1" "$out" 2>/dev/null
     launchctl bootstrap system "$JOBPLIST"
     for _ in $(seq 1 40); do [[ -s "$out" ]] && break; sleep 0.25; done
     launchctl bootout system/$LABEL 2>/dev/null; rm -f "$JOBPLIST"
     cat "$out" 2>/dev/null || echo "(no output)"
+}
+
+# When the runner-group daemon can't even open the key file (-33), show what
+# decides that: the file, the folders above it, and the account's groups.
+explain_open_denied() { # explain_open_denied <consumer output>
+    grep -q 'open=-33' <<<"$1" || return 0
+    echo "        the daemon was denied the key file itself; what decides that:"
+    ls -lde@O "$KEYFILE" "$STAGE/keys" "$STAGE" "$HG" 2>&1 | sed 's/^/          /'
+    echo "          nobody's groups: $(id -Gn nobody 2>&1)"
+    echo "          $(dsmemberutil checkmembership -U nobody -G "$GROUP" 2>&1)"
+    echo "          read as nobody from this shell: $(sudo -u nobody head -c 1 "$KEYFILE" >/dev/null 2>&1 && echo allowed || echo denied)"
 }
 
 # One full pass for a suite.
@@ -236,6 +262,7 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     OUT=$(consumer_daemon nobody "$tag-nobody-1")
     echo "        nobody daemon: $OUT"
     expect "a LaunchDaemon in the runner group unwraps the DEK" "unwrap=0 dek=$DEK_HEX" "$OUT"
+    explain_open_denied "$OUT"
     OUT=$("$STAGE/bin/consumer" "$KEYFILE" $SERVICE)
     echo "        root via sudo (this Terminal): $OUT"
     expect "root in a login session is refused (-18)" "unwrap=-18" "$OUT"

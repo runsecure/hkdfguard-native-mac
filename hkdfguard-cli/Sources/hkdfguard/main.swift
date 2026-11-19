@@ -1035,6 +1035,25 @@ struct KEKItem {
     }
 }
 
+// Moves a keychain result's bytes out of the object the keychain returned
+// and into memory of our own. Casting to `Data` instead only wraps that
+// object: scrub() would then wipe a private copy (copy-on-write) and the
+// keychain's object would keep the blob. The object is zeroed in place here,
+// and the copy is zeroed when its last reference goes. The library does the
+// same (`takeKeychainSecret` there).
+func takeKeychainSecret(_ value: Any?) -> Data? {
+    guard let keychainData = value as? NSData else { return nil }
+    let count = keychainData.length
+    guard count > 0 else { return Data() }
+    let copy = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: MemoryLayout<UInt>.alignment)
+    copy.copyMemory(from: keychainData.bytes, byteCount: count)
+    _ = memset_s(UnsafeMutableRawPointer(mutating: keychainData.bytes), count, 0, count)
+    return Data(bytesNoCopy: copy, count: count, deallocator: .custom { pointer, length in
+        _ = memset_s(pointer, length, 0, length)
+        pointer.deallocate()
+    })
+}
+
 // Finds `service`'s KEK item in this process's keychain mode and refuses
 // unless there is exactly one. A query-based SecItemDelete removes *every*
 // match: in legacy mode the search list spans more than one keychain (login
@@ -1083,7 +1102,7 @@ func locateSingleKEKItem(service: String) throws -> KEKItem {
     let fetchStatus = SecItemCopyMatching(fetchQuery as CFDictionary, &fetchResult)
     guard fetchStatus == errSecSuccess,
           let attributes = fetchResult as? [String: Any],
-          let blob = attributes[kSecValueData as String] as? Data else {
+          let blob = takeKeychainSecret(attributes[kSecValueData as String]) else {
         throw CLIError("re-reading the KEK item for service \"\(service)\" failed: \(describeOSStatus(fetchStatus)); nothing was deleted")
     }
     for key in [kSecAttrService, kSecAttrAccount, kSecAttrAccessGroup] as [CFString] {

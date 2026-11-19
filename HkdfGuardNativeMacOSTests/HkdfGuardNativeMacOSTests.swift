@@ -2106,6 +2106,26 @@ struct HkdfGuardMLKEMKEKTests {
         dek.withUnsafeBytes { sealDek($0, kek: kek, service: service) }
     }
 
+    @Test func takingAKeychainResultZeroesTheKeychainsOwnBuffer() throws {
+        // What SecItemCopyMatching hands back: an immutable CFData holding
+        // the blob. Zeroing a `Data` cast from it wipes a private copy, so
+        // the library moves the bytes out and zeroes the original in place.
+        let secret = [UInt8](repeating: 0xAB, count: 300)
+        let keychainData = try #require(CFDataCreate(nil, secret, secret.count))
+        let source = try #require(CFDataGetBytePtr(keychainData))
+
+        let taken = try #require(takeKeychainSecret(keychainData))
+        #expect([UInt8](taken) == secret)
+        #expect(UnsafeBufferPointer(start: source, count: secret.count).allSatisfy { $0 == 0 },
+                "the keychain's object still holds the blob")
+        // The copy does not live in the keychain's object.
+        taken.withUnsafeBytes { #expect($0.baseAddress != UnsafeRawPointer(source)) }
+
+        #expect(takeKeychainSecret(nil) == nil)
+        #expect(takeKeychainSecret("not data" as CFString) == nil)
+        #expect(takeKeychainSecret(CFDataCreate(nil, nil, 0)) == Data())
+    }
+
     @Test func theKeychainItemFormatKeepsP256BareAndBoxesMLKEM() throws {
         // P-256 items stay exactly what they always were, so existing KEKs
         // keep loading; ML-KEM items carry their ciphertext, and the

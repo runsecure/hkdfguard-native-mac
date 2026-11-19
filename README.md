@@ -301,8 +301,10 @@ process), so it is opt-in: call it once, early in startup.
    *host executable's* signature: the Hardened Runtime (`codesign --options
    runtime`) without `com.apple.security.get-task-allow` (which Xcode adds
    to Debug builds), `cs.allow-dyld-environment-variables`, or
-   `cs.disable-library-validation`. A library can check that but not change
-   it, so by default a weak signature is only **logged** (os_log, subsystem
+   `cs.disable-library-validation`. The check reads the status and
+   entitlements the kernel holds for the *running process*, not the
+   signature of the file on disk, which can have changed since launch. A
+   library can check that but not change it, so by default a weak signature is only **logged** (os_log, subsystem
    `com.hkdfguard`, category `hardening`) and the call still succeeds. That
    keeps the library usable from python, dotnet, Go, and Xcode Debug builds
    during development.
@@ -1256,6 +1258,16 @@ timestamp**, then verifies: strict signature check, runtime flag, timestamp,
 test. Everything is assembled in a staging
 directory and only moved into `dist/` once every check passes.
 
+Every run is a clean build. The script deletes its own build folders
+(`build-arm64/`, `hkdfguard-cli/.build-arm64/`) first and archives the app
+with a temporary DerivedData, so nothing compiled by an earlier run is
+reused. It ignores `XCODE_XCCONFIG_FILE`, `SDKROOT`, `TOOLCHAINS`,
+`SWIFT_EXEC`, `SWIFT_EXEC_MANIFEST` and `CC` from the caller's environment
+and pins `PATH`; only `DEVELOPER_DIR` chooses the toolchain. The dylib and
+the bare CLI are stripped before signing: no debug entries (which record
+build-machine paths and file times) and no local symbols, only the dylib's
+exported C ABI. The script fails if either remains.
+
 ```sh
 ./build-dist.sh        # local testing only: "Apple Development", not notarized
 
@@ -1495,7 +1507,10 @@ profile, runs `build-release.sh` with
 key and profile whether or not the build succeeded. Run it by hand from `main`
 first: that run does everything except publish, and uploads the `.pkg` as a
 workflow artifact, so you can test the signing setup without making a
-release.
+release. The workflow refuses a manual run from a commit that is not on
+`main`. The package it builds is signed and notarized like a release, so
+its artifact is named `DRY-RUN-not-a-release-...` and deleted after one
+day; don't install it anywhere a release belongs.
 
 ## Publishing a release
 
