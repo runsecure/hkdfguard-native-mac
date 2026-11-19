@@ -31,10 +31,11 @@
 #                 HKDFGUARD_SIGN_IDENTITY is a Developer ID identity.
 #   debugging     development signing for testing only: the bundle launches
 #                 only on Macs registered to the developer account. The
-#                 default otherwise. A development-signed bundle can have a
-#                 debugger attached (get-task-allow), so it is given the
-#                 test-only com.hkdfguard.tests.keys access group instead:
-#                 it never sees the KEKs a Developer ID build uses.
+#                 default otherwise. A development-signed bundle may be
+#                 one a debugger can attach to (get-task-allow, depending
+#                 on the Xcode), so it is given the test-only
+#                 com.hkdfguard.tests.keys access group instead: it never
+#                 sees the KEKs a Developer ID build uses.
 #
 # Everything is assembled in a temporary staging directory and only moved
 # into place as dist/ once every build, signature, and check has passed, so
@@ -501,9 +502,9 @@ build_app() {
     local export_dir="$WORK/export"
     local options="$WORK/ExportOptions.plist"
 
-    # A debugging export is development-signed, which makes it debuggable
-    # (get-task-allow): any process of the same user can attach to it and act
-    # as it. So it gets the test-only access group, like the Debug builds --
+    # A debugging export is development-signed, and some Xcodes make that
+    # debuggable (get-task-allow): any process of the same user can then
+    # attach to it and act as it. So it gets the test-only access group, like the Debug builds --
     # with the production group, every production KEK on this Mac would be
     # usable through it. HKDFGUARD_APP_ENTITLEMENTS is the app target's own
     # build setting (the file its Release configuration signs with); no other
@@ -611,12 +612,15 @@ build_app() {
     grep -q "^TeamIdentifier=$TEAM_ID\$" <<<"$info" || fail "$embedded_dylib: not signed by team $TEAM_ID"
 
     # The app's own keychain identity and nothing more. A development
-    # export is debuggable by design (get-task-allow), holds only the
-    # test-only access group (checked below) and is never packaged:
+    # export may also be debuggable (get-task-allow: older Xcodes add it
+    # to a "debugging" export, Xcode 27 does not); either way it holds only
+    # the test-only access group (checked below) and is never packaged:
     # build-pkg.sh accepts only the developer-id set.
     local app_entitlements=(com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups)
-    if [ "$APP_EXPORT" != "developer-id" ]; then
+    if [ "$APP_EXPORT" != "developer-id" ] \
+        && codesign -d --entitlements - "$exe" 2>/dev/null | grep -q 'com\.apple\.security\.get-task-allow'; then
         app_entitlements+=(com.apple.security.get-task-allow)
+        echo "    note: this export is debuggable (get-task-allow)"
     fi
     assert_entitlements "$exe" "${app_entitlements[@]}"
     assert_entitlements "$embedded_dylib"
@@ -644,7 +648,7 @@ build_app() {
             fail "$app: carries the test-only com.hkdfguard.tests.keys access group"
         fi
     else
-        echo "    note: debuggable build; uses the test-only $TEST_ACCESS_GROUP_SUFFIX access group, not production KEKs"
+        echo "    note: development build; uses the test-only $TEST_ACCESS_GROUP_SUFFIX access group, not production KEKs"
     fi
     if grep -q 'get-task-allow' "$entitlements" && grep -q "$TEAM_ID\.com\.hkdfguard\.keys" "$entitlements"; then
         fail "$app: is debuggable (get-task-allow) and carries the production $ACCESS_GROUP_SUFFIX access group"

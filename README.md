@@ -1327,9 +1327,10 @@ anything reaches `dist/`, the script verifies:
 | `developer-id` | Developer ID, secure timestamp; default when `HKDFGUARD_SIGN_IDENTITY` is a Developer ID identity | any Mac, once notarized |
 | `debugging` | development; the default otherwise | only Macs registered to your developer account |
 
-A `debugging` export is development-signed, so it carries
-`get-task-allow`: any process running as the same user can attach a
-debugger to it and use whatever keys it can. It is therefore built with the
+A `debugging` export is development-signed, and depending on the Xcode
+version it carries `get-task-allow`: any process running as the same user
+can then attach a debugger to it and use whatever keys it can. It is
+therefore always built with the
 test-only `com.hkdfguard.tests.keys` access group, like the Debug builds,
 and never sees the KEKs a `developer-id` build stores under
 `com.hkdfguard.keys`. KEKs it provisions are test KEKs: a `developer-id`
