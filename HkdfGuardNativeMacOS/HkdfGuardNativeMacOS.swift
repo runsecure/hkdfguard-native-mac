@@ -1589,6 +1589,13 @@ private let machineLog = Logger(subsystem: "com.hkdfguard", category: "machine")
 let managedPolicyFilePath = "/Library/Managed Preferences/com.hkdfguard.plist"
 /// The policy on a Mac without MDM. Ignored when a managed one exists.
 let localPolicyFilePath = "/Library/Application Support/HkdfGuard/policy.plist"
+/// Written by the library the first time a root process sees a valid
+/// policy, and never removed by it: the record that this Mac has been in
+/// production mode. See `applyProductionMarker`. Beside the local policy
+/// and the machine KEKs, not in `/Library/Managed Preferences`: macOS owns
+/// that folder and empties it of a domain when its profile is removed --
+/// the very event the marker has to outlive.
+let productionMarkerFilePath = "/Library/Application Support/HkdfGuard/production-mode"
 /// One file per machine-scoped service: `<service>.kek`.
 let machineKeyFolderPath = "/Library/Application Support/HkdfGuard/keks"
 private let machinePolicyMaxSize = 64 * 1024
@@ -1841,10 +1848,107 @@ func currentMachinePolicy() -> PolicyLoad {
     if let forced = MachineScopeTestOverrides.policy {
         return forced
     }
-    if let managed = loadPolicyFile(atPath: managedPolicyFilePath) {
-        return managed
+    let load = loadPolicyFile(atPath: managedPolicyFilePath) ?? loadPolicyFile(atPath: localPolicyFilePath) ?? .none
+    return applyProductionMarker(load, markerPath: productionMarkerFilePath, asRoot: geteuid() == 0)
+}
+
+/// Keeps a Mac that has been in production mode from sliding back to
+/// development mode because its policy went away -- a removed profile, a
+/// deleted `policy.plist`. Without this, "no policy" would mean what it
+/// means on a developer's Mac: `RequirePostQuantum` off, and a service that
+/// was machine-scoped provisioned again as a user-scoped KEK, by anyone.
+///
+/// - A valid policy, read by root: the marker is written if it isn't there
+///   (root's own tools and daemons arm it; nobody else can).
+/// - No policy, and the marker exists: the policy is reported invalid, so
+///   every call fails closed (`POLICY_INVALID`) until the policy is back or
+///   root deletes the marker to return to development mode on purpose.
+///
+/// A tripwire for a lost policy, not a defence against root: whoever can
+/// delete a root-owned policy file can delete the marker with it. Nor does
+/// it notice a policy replaced by a weaker one.
+func applyProductionMarker(_ load: PolicyLoad, markerPath: String, asRoot: Bool,
+                           requireTrustedFolder: Bool = true) -> PolicyLoad {
+    switch load {
+    case .invalid:
+        return load
+    case .loaded:
+        if asRoot {
+            recordProductionMode(markerPath: markerPath, requireTrustedFolder: requireTrustedFolder)
+        }
+        return load
+    case .none:
+        guard productionMarkerExists(markerPath) else {
+            return .none
+        }
+        return .invalid("this Mac has been in production mode (\(markerPath)) but no policy is installed now: "
+            + "restore the com.hkdfguard profile or \(localPolicyFilePath). "
+            + "To return to development mode on purpose, delete the marker as root")
     }
-    return loadPolicyFile(atPath: localPolicyFilePath) ?? .none
+}
+
+/// Anything at all at `path` counts, whatever its type or owner; only "no
+/// such file" (or no such folder) means the marker is absent, so an error
+/// reading it fails closed.
+private func productionMarkerExists(_ path: String) -> Bool {
+    var info = stat()
+    if lstat(path, &info) == 0 {
+        return true
+    }
+    return errno != ENOENT && errno != ENOTDIR
+}
+
+private let productionMarkerFailureLogged = OSAllocatedUnfairLock(initialState: false)
+
+/// Creates the marker if it is missing. Best effort: a failure is logged
+/// (once per process) and changes nothing else -- the policy just read is
+/// still in effect.
+private func recordProductionMode(markerPath: String, requireTrustedFolder: Bool) {
+    guard !productionMarkerExists(markerPath) else {
+        return
+    }
+    func failed(_ what: String, _ code: Int32) {
+        let first = productionMarkerFailureLogged.withLock { logged -> Bool in
+            defer { logged = true }
+            return !logged
+        }
+        if first {
+            machineLog.error("could not record production mode in \(markerPath, privacy: .public): \(what, privacy: .public) (\(String(cString: strerror(code)), privacy: .public)); a removed policy would return this Mac to development mode")
+        }
+    }
+    let url = URL(fileURLWithPath: markerPath)
+    let folder = url.deletingLastPathComponent().path
+    // The policy may be MDM's alone, on a Mac where nothing has made
+    // hkdfguard's own folder yet.
+    if mkdir(folder, 0o755) != 0, errno != EEXIST {
+        return failed("its folder can't be created", errno)
+    }
+    let folderFd = open(folder, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard folderFd >= 0 else {
+        return failed("its folder can't be opened", errno)
+    }
+    defer { close(folderFd) }
+    guard !requireTrustedFolder || keyFileFoldersAreTrusted(folderFd: folderFd, rootOnly: true) else {
+        return failed("its folder, or one above it, is not root's or others can write it", EPERM)
+    }
+    let fd = openat(folderFd, url.lastPathComponent, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)
+    guard fd >= 0 else {
+        // Another process got there first: the marker exists, which is all
+        // that was wanted.
+        return errno == EEXIST ? () : failed("it can't be created", errno)
+    }
+    defer { close(fd) }
+    let text = Array("""
+        hkdfguard: this Mac has been in production mode (a com.hkdfguard policy was in effect).
+        While this file exists, a missing policy makes every hkdfguard call fail with
+        POLICY_INVALID (-9) instead of falling back to development mode.
+        To return to development mode on purpose, delete this file as root.
+
+        """.utf8)
+    _ = text.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+    _ = fchmod(fd, 0o644)
+    _ = fsync(fd)
+    machineLog.notice("production mode recorded in \(markerPath, privacy: .public): from now on a missing policy fails closed instead of returning this Mac to development mode")
 }
 
 private enum PolicySnapshot {

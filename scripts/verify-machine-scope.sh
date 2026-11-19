@@ -57,6 +57,10 @@ HG="/Library/Application Support/HkdfGuard"
 POLICY="$HG/policy.plist"
 MANAGED="/Library/Managed Preferences/com.hkdfguard.plist"
 KEKS="$HG/keks"
+# The library writes this the first time root sees a valid policy, and from
+# then on a missing policy fails closed. This script's policy is temporary,
+# so the marker it causes is removed with it (see cleanup).
+MARKER="$HG/production-mode"
 STAGE="$HG/verify"
 SERVICES="com.hkdfguard.verify.mlkem com.hkdfguard.verify.p256"
 GROUP=_hkdfguardverify
@@ -67,6 +71,7 @@ MLKEM_AVAILABLE=0
 
 [[ -e "$POLICY" ]] && fail_now "$POLICY already exists; not touching a real policy"
 [[ -e "$MANAGED" ]] && fail_now "$MANAGED exists (an MDM policy); run this on a Mac without one"
+[[ -e "$MARKER" || -L "$MARKER" ]] && fail_now "$MARKER exists: this Mac has been in production mode; not touching it"
 for s in $SERVICES; do [[ -e "$KEKS/$s.kek" ]] && fail_now "$KEKS/$s.kek already exists"; done
 dscl . -read "/Groups/$GROUP" >/dev/null 2>&1 && fail_now "group $GROUP already exists"
 # Not -e: a dangling symbolic link exists too.
@@ -87,6 +92,9 @@ CREATED_HG=0; CREATED_KEKS=0
 cleanup() {
     launchctl bootout system/$LABEL 2>/dev/null; rm -f "$JOBPLIST"
     rm -f "$POLICY"
+    # Checked absent above, so this one is ours: left behind, it would make
+    # every hkdfguard call on this Mac fail with POLICY_INVALID.
+    rm -f "$MARKER"
     for s in $SERVICES; do rm -f "$KEKS/$s.kek"; done
     [[ "$CREATED_KEKS" -eq 1 ]] && rmdir "$KEKS" 2>/dev/null
     rm -rf "$STAGE"
@@ -331,6 +339,25 @@ else
     [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "and creates no KEK of another suite" || fail "a KEK file was created"
 fi
 verify_suite p256 P-256 01 01 "<key>KekSuite</key><string>P-256</string>"
+
+echo "== the production-mode marker"
+# Everything above ran as root under a valid policy, which records
+# production mode. From then on a missing policy must fail closed, not
+# return this Mac to development mode -- until root deletes the marker.
+if [[ -f "$MARKER" && ! -L "$MARKER" && "$(stat -f '%u %Lp' "$MARKER")" = "0 644" ]]; then
+    pass "root's use of a valid policy recorded production mode"
+else
+    fail "no root-owned 0644 marker at $MARKER"
+fi
+SERVICE=com.hkdfguard.verify.p256
+rm -f "$POLICY"
+OUT=$("$CLI" status -sn $SERVICE 2>&1)
+expect "with the policy removed, the CLI fails closed" "has been in production mode" "$OUT"
+OUT=$("$CLI" provision -sn $SERVICE 2>&1)
+expect "and provisions nothing" "policy is invalid" "$OUT"
+rm -f "$MARKER"
+OUT=$("$CLI" status -sn $SERVICE 2>&1)
+expect "with the marker deleted too, this Mac is back in development mode" "^scope: user$" "$OUT"
 
 echo
 echo "== $PASS passed, $FAILS failed"

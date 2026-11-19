@@ -762,6 +762,47 @@ why. Services the policy doesn't list stay user-scoped. Leaving out
 `SecurityAdminGroup` or `DeploymentAdminGroup` lets any admin who can
 `sudo` act in that role.
 
+### When the policy goes away
+
+A Mac that has been in production mode does not go back to development
+mode because its policy disappeared: a removed profile, an unenrolled Mac,
+a deleted `policy.plist`. Otherwise "no policy" would quietly drop
+`RequirePostQuantum`, and let anyone provision a user-scoped KEK for a
+service that was machine-scoped.
+
+The first time a **root** process reads a valid policy (`sudo hkdfguard
+…`, or a LaunchDaemon running as root), the library writes a marker:
+
+```
+/Library/Application Support/HkdfGuard/production-mode    (root:wheel 0644)
+```
+
+While the marker exists, no policy at all counts as an invalid policy:
+every call fails with `-9` (`POLICY_INVALID`), and `hkdfguard status` says
+this Mac has been in production mode. Restore the profile or `policy.plist`
+to fix it. To return the Mac to development mode on purpose, delete the
+marker as root:
+
+```sh
+sudo rm "/Library/Application Support/HkdfGuard/production-mode"
+```
+
+- **Arming it.** Provisioning or wrapping for a machine-scoped service runs
+  as root, so those Macs are armed by their first use. A policy that holds
+  only suite settings is never read by root in normal use; run
+  `sudo hkdfguard status --service-name <any service>` once to arm such a
+  Mac. A root process that can't write the marker logs why (`log show
+  --predicate 'subsystem == "com.hkdfguard"'`) and carries on.
+- **Why there.** It sits beside the local policy and the machine KEKs, not
+  in `/Library/Managed Preferences`: macOS owns that folder and clears a
+  domain's file when its profile is removed, which is the event the marker
+  has to outlive.
+- **What it is not.** A tripwire for a lost policy, not a defence against
+  root: whoever can delete a root-owned `policy.plist` can delete the
+  marker too. It does not notice a policy replaced by a weaker one. And
+  while MDM replaces a profile, calls can briefly fail with `-9`.
+- The uninstaller leaves the marker in place, like the KEKs and the policy.
+
 ### KEK suites in the policy
 
 Two more settings choose the [KEK suite](#kek-suites). They apply to every
@@ -1708,8 +1749,9 @@ sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
 Removes `v1/`, the `PATH` symlink (only if it still points at this CLI), and
 the package receipt. **KEKs are not touched**: user-scoped ones live in each
 user's keychain, and machine-scoped ones in
-`/Library/Application Support/HkdfGuard/keks`, outside `v1/`, as does a local
-`policy.plist`. Retire any that should go *before*
+`/Library/Application Support/HkdfGuard/keks`, outside `v1/`, as do a local
+`policy.plist` and the [production-mode marker](#when-the-policy-goes-away).
+Retire any that should go *before*
 uninstalling, while the CLI still exists (see `retire` above).
 
 ### Why this location
