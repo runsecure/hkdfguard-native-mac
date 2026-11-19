@@ -31,7 +31,10 @@
 #                 HKDFGUARD_SIGN_IDENTITY is a Developer ID identity.
 #   debugging     development signing for testing only: the bundle launches
 #                 only on Macs registered to the developer account. The
-#                 default otherwise.
+#                 default otherwise. A development-signed bundle can have a
+#                 debugger attached (get-task-allow), so it is given the
+#                 test-only com.hkdfguard.tests.keys access group instead:
+#                 it never sees the KEKs a Developer ID build uses.
 #
 # Everything is assembled in a temporary staging directory and only moved
 # into place as dist/ once every build, signature, and check has passed, so
@@ -105,6 +108,7 @@ APP_NAME="hkdfguard.app"
 APP_EXECUTABLE="hkdfguard"
 APP_BUNDLE_ID="com.hkdfguard.cli"
 ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
+TEST_ACCESS_GROUP_SUFFIX="com.hkdfguard.tests.keys"
 
 # Credentials. None are stored in this script or the repository; each input
 # below only *names* a credential kept elsewhere:
@@ -497,7 +501,20 @@ build_app() {
     local export_dir="$WORK/export"
     local options="$WORK/ExportOptions.plist"
 
+    # A debugging export is development-signed, which makes it debuggable
+    # (get-task-allow): any process of the same user can attach to it and act
+    # as it. So it gets the test-only access group, like the Debug builds --
+    # with the production group, every production KEK on this Mac would be
+    # usable through it. HKDFGUARD_APP_ENTITLEMENTS is the app target's own
+    # build setting (the file its Release configuration signs with); no other
+    # target reads it.
     local expected_group="$TEAM_ID.$ACCESS_GROUP_SUFFIX"
+    local entitlements_file="hkdfguard.entitlements"
+    if [ "$APP_EXPORT" != "developer-id" ]; then
+        expected_group="$TEAM_ID.$TEST_ACCESS_GROUP_SUFFIX"
+        entitlements_file="hkdfguard.tests.entitlements"
+    fi
+    [ -f "$CLI_PKG/$entitlements_file" ] || fail "missing $CLI_PKG/$entitlements_file"
 
     echo
     echo "==================== osx-arm64-app ($APP_NAME, export: $APP_EXPORT) ===================="
@@ -542,6 +559,7 @@ build_app() {
         ${provisioning_args[@]+"${provisioning_args[@]}"} \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
         DEVELOPMENT_TEAM="$TEAM_ID" \
+        "HKDFGUARD_APP_ENTITLEMENTS=$entitlements_file" \
         ${manual_signing[@]+"${manual_signing[@]}"} \
         ${strict_conditions[@]+"${strict_conditions[@]}"}
 
@@ -593,7 +611,8 @@ build_app() {
     grep -q "^TeamIdentifier=$TEAM_ID\$" <<<"$info" || fail "$embedded_dylib: not signed by team $TEAM_ID"
 
     # The app's own keychain identity and nothing more. A development
-    # export is debuggable by design (get-task-allow) and never packaged:
+    # export is debuggable by design (get-task-allow), holds only the
+    # test-only access group (checked below) and is never packaged:
     # build-pkg.sh accepts only the developer-id set.
     local app_entitlements=(com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups)
     if [ "$APP_EXPORT" != "developer-id" ]; then
@@ -613,10 +632,22 @@ build_app() {
     first_group="$(plist_value "$entitlements" keychain-access-groups.0)"
     [ "$first_group" = "$expected_group" ] \
         || fail "$app: first keychain-access-groups entry is '$first_group', expected '$expected_group'"
-    # The test-only group belongs to the unhardened test host and the Debug
-    # builds; a shipped bundle carrying it would share KEKs with them.
-    if grep -q 'com\.hkdfguard\.tests\.keys' "$entitlements"; then
-        fail "$app: carries the test-only com.hkdfguard.tests.keys access group"
+    # Exactly that one group: a second entry would be readable too.
+    [ -z "$(plist_value "$entitlements" keychain-access-groups.1)" ] \
+        || fail "$app: carries more than one keychain access group"
+    # The test-only group belongs to the unhardened test host, the Debug
+    # builds and a debugging export; a shipped bundle carrying it would
+    # share KEKs with them. And the reverse: nothing debuggable may hold the
+    # production group.
+    if [ "$APP_EXPORT" = "developer-id" ]; then
+        if grep -q 'com\.hkdfguard\.tests\.keys' "$entitlements"; then
+            fail "$app: carries the test-only com.hkdfguard.tests.keys access group"
+        fi
+    else
+        echo "    note: debuggable build; uses the test-only $TEST_ACCESS_GROUP_SUFFIX access group, not production KEKs"
+    fi
+    if grep -q 'get-task-allow' "$entitlements" && grep -q "$TEAM_ID\.com\.hkdfguard\.keys" "$entitlements"; then
+        fail "$app: is debuggable (get-task-allow) and carries the production $ACCESS_GROUP_SUFFIX access group"
     fi
 
     local profile="$app/Contents/embedded.provisionprofile"

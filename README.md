@@ -1312,7 +1312,9 @@ anything reaches `dist/`, the script verifies:
 - that the executable and the embedded dylib are arm64;
 - that the first `keychain-access-groups` entry is `<TeamID>.com.hkdfguard.keys`
   (the library stores KEKs under the first), and that the test-only
-  `com.hkdfguard.tests.keys` group is absent;
+  `com.hkdfguard.tests.keys` group is absent -- or, for a `debugging`
+  export, the reverse: that it carries the test-only group and not the
+  production one (see below);
 - the embedded profile: issued for that Team, granting that group, and of
   the expected type;
 - a read-only smoke test on this Mac: `--help` launches, and `status`
@@ -1324,6 +1326,14 @@ anything reaches `dist/`, the script verifies:
 |---|---|---|
 | `developer-id` | Developer ID, secure timestamp; default when `HKDFGUARD_SIGN_IDENTITY` is a Developer ID identity | any Mac, once notarized |
 | `debugging` | development; the default otherwise | only Macs registered to your developer account |
+
+A `debugging` export is development-signed, so it carries
+`get-task-allow`: any process running as the same user can attach a
+debugger to it and use whatever keys it can. It is therefore built with the
+test-only `com.hkdfguard.tests.keys` access group, like the Debug builds,
+and never sees the KEKs a `developer-id` build stores under
+`com.hkdfguard.keys`. KEKs it provisions are test KEKs: a `developer-id`
+build can't use them, and the reverse.
 
 **Credentials are never stored in the script or the repository.** Each
 input only names something kept in your keychain or Xcode:
@@ -2004,8 +2014,8 @@ carried by the install folder `HkdfGuard/v1/` here and by the
   arbitrary host processes.
 - The **bundled CLI** has two entitlement files: the Release build (what
   `build-dist.sh` ships) carries the production `com.hkdfguard.keys` group;
-  Debug and DebugHosted carry the test-only `com.hkdfguard.tests.keys`
-  group. The **test host** carries only the test group, and has no hardened
+  Debug and DebugHosted, and `build-dist.sh`'s debuggable `debugging`
+  export, carry the test-only `com.hkdfguard.tests.keys` group. The **test host** carries only the test group, and has no hardened
   runtime (see Tests).
 - **Data-protection mode** requires the *consuming process* to be a
   Team-signed app bundle with an embedded provisioning profile carrying

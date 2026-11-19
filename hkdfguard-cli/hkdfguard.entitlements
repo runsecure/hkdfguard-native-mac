@@ -11,8 +11,10 @@
 	 of the same main.swift has no entitlements and runs in legacy mode.
 
 	 The group must be the same, and listed first, in every bundle that is
-	 meant to share KEKs. This file is the Release configuration's only:
-	 Debug and DebugHosted use hkdfguard.tests.entitlements and
+	 meant to share KEKs. This file is the Release configuration's only,
+	 and only when it is signed for distribution: Debug, DebugHosted and
+	 build-dist.sh's debuggable "debugging" export use
+	 hkdfguard.tests.entitlements and
 	 the test-only com.hkdfguard.tests.keys group, so the test host -- which
 	 runs without the hardened runtime -- never shares production KEKs.
 	-->
