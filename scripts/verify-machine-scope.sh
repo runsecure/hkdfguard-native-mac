@@ -294,7 +294,7 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
 }
 
 if [[ "$MLKEM_AVAILABLE" -eq 1 ]]; then
-    verify_suite mlkem ML-KEM-1024 02 02 ""
+    verify_suite mlkem ML-KEM-1024 02 03 ""
 else
     echo "== ML-KEM-1024: this macOS is before 26, so provisioning must refuse"
     SERVICE=com.hkdfguard.verify.mlkem; KEYFILE="$STAGE/keys/verify-mlkem.key"; SUITE_KEYS=""

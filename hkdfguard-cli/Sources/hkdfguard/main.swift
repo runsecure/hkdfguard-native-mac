@@ -786,10 +786,11 @@ let kekKeychainAccount = "kek-v1"
 
 // What a KEK item's own data reconstructs into, read in the library's item
 // format (`decodeKeychainKEK` in HkdfGuardNativeMacOS.swift): a bare P-256
-// Secure Enclave blob, or, for ML-KEM, "HKGQ" || format 0x02 || suite 0x02
-// || fingerprint (32) || blob length (big-endian u16) || blob || 1568-byte
-// ciphertext. An ML-KEM item whose key is not the one its fingerprint
-// records is unreconstructable, as it is to the library.
+// Secure Enclave blob, or, for suite 0x02 (ML-KEM-1024 with a P-256 key),
+// "HKGQ" || format 0x03 || suite 0x02 || fingerprint (32) || blob length
+// (big-endian u16) || ML-KEM blob || 1568-byte ciphertext || blob length ||
+// P-256 blob. A suite 0x02 item whose keys are not the ones its
+// fingerprint records is unreconstructable, as it is to the library.
 enum StoredKEKCheck {
     case key(fingerprint: [UInt8])
     case unreconstructable
@@ -799,11 +800,11 @@ enum StoredKEKCheck {
 }
 
 // What a Secure Enclave key blob reconstructs into, in this session -- a
-// keychain item's blob, or a machine KEK file's. `encapsulated` is an
-// ML-KEM KEK's stored ciphertext (nil: a P-256 KEK); its fingerprint
-// covers it.
-func enclaveBlobCheck(blob: Data, encapsulated: Data?) -> StoredKEKCheck {
-    guard let encapsulated else {
+// keychain item's blob, or a machine KEK file's. `hybrid` is a suite 0x02
+// KEK's stored ciphertext and P-256 blob (nil: a P-256 KEK); its
+// fingerprint covers the ciphertext and both public keys.
+func enclaveBlobCheck(blob: Data, hybrid: (encapsulated: Data, classicalBlob: Data)?) -> StoredKEKCheck {
+    guard let hybrid else {
         guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) else {
             return .unreconstructable
         }
@@ -812,39 +813,53 @@ func enclaveBlobCheck(blob: Data, encapsulated: Data?) -> StoredKEKCheck {
     guard #available(macOS 26.0, *) else {
         return .unsupportedHere
     }
-    guard let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob) else {
+    guard let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob),
+          let classical = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: hybrid.classicalBlob) else {
         return .unreconstructable
     }
-    // The library's KEMKEK.fingerprint: SHA-256 of public key || ciphertext.
+    // The library's KEMKEK.fingerprint: SHA-256 of the ML-KEM public key ||
+    // ciphertext || the P-256 public key (0x04 || x || y).
     var hash = SHA256()
     hash.update(data: key.publicKey.rawRepresentation)
-    hash.update(data: encapsulated)
+    hash.update(data: hybrid.encapsulated)
+    hash.update(data: classical.publicKey.x963Representation)
     return .key(fingerprint: Array(hash.finalize()))
 }
 
 func storedKEKCheck(_ data: Data) -> StoredKEKCheck {
     let magic = Data("HKGQ".utf8)
     guard data.starts(with: magic) else {
-        return enclaveBlobCheck(blob: data, encapsulated: nil)
+        return enclaveBlobCheck(blob: data, hybrid: nil)
     }
     let start = data.startIndex
     let header = 4 + 1 + 1 + fingerprintLength + 2
-    guard data.count > header, data[start + 4] == 0x02, data[start + 5] == 0x02 else {
+    guard data.count > header, data[start + 4] == 0x03, data[start + 5] == 0x02 else {
         return .unreconstructable
     }
     let recorded = Array(data[(start + 6)..<(start + 6 + fingerprintLength)])
     let length = Int(data[start + header - 2]) << 8 | Int(data[start + header - 1])
-    guard length > 0, data.count == header + length + 1568 else {
+    let classicalStart = header + length + 1568 + 2
+    guard length > 0, data.count > classicalStart else {
+        return .unreconstructable
+    }
+    let classicalLength = Int(data[start + classicalStart - 2]) << 8 | Int(data[start + classicalStart - 1])
+    guard classicalLength > 0, data.count == classicalStart + classicalLength else {
         return .unreconstructable
     }
     var blob = data.subdata(in: (start + header)..<(start + header + length))
-    defer {
-        blob.withUnsafeMutableBytes { raw in
+    var classicalBlob = data.subdata(in: (start + classicalStart)..<data.endIndex)
+    func zero(_ bytes: inout Data) {
+        bytes.withUnsafeMutableBytes { raw in
             guard let base = raw.baseAddress, raw.count > 0 else { return }
             _ = memset_s(base, raw.count, 0, raw.count)
         }
     }
-    let check = enclaveBlobCheck(blob: blob, encapsulated: data.subdata(in: (start + header + length)..<data.endIndex))
+    defer {
+        zero(&blob)
+        zero(&classicalBlob)
+    }
+    let check = enclaveBlobCheck(blob: blob, hybrid: (
+        data.subdata(in: (start + header + length)..<(start + classicalStart - 2)), classicalBlob))
     if case .key(let fingerprint) = check, fingerprint != recorded {
         return .unreconstructable
     }

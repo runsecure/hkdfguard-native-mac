@@ -601,14 +601,16 @@ private let machineKeyFileMaxSize = 8192
 struct MachineKeyFileParts {
     var fingerprint: [UInt8]
     var blob: Data
-    /// An ML-KEM KEK's stored ciphertext; nil for P-256.
-    var encapsulated: Data?
+    /// A suite 0x02 KEK's stored ciphertext and P-256 blob; nil for P-256.
+    var hybrid: (encapsulated: Data, classicalBlob: Data)?
 }
 
 /// "HKGK" || format, then format 1: public key (65) || blob length
-/// (big-endian u16) || blob; format 2: suite || fingerprint (32) || blob
-/// length || blob || ciphertext length || ciphertext (1568 bytes for
-/// ML-KEM-1024, none for P-256). nil for anything else.
+/// (big-endian u16) || blob; format 3: suite || fingerprint (32) || blob
+/// length || blob || ciphertext length || ciphertext (1568 bytes for suite
+/// 0x02, none for P-256) || P-256 blob length || P-256 blob (suite 0x02
+/// only). nil for anything else, format 2 (an ML-KEM-only KEK from before
+/// suite 0x02 became a hybrid) included.
 func decodeMachineKeyFileParts(_ bytes: [UInt8]) -> MachineKeyFileParts? {
     guard bytes.count > 5, bytes.count <= machineKeyFileMaxSize, bytes[0..<4].elementsEqual("HKGK".utf8) else {
         return nil
@@ -631,8 +633,8 @@ func decodeMachineKeyFileParts(_ bytes: [UInt8]) -> MachineKeyFileParts? {
               (try? P256.KeyAgreement.PublicKey(x963Representation: publicKey)) != nil else {
             return nil
         }
-        return MachineKeyFileParts(fingerprint: Array(SHA256.hash(data: publicKey)), blob: Data(bytes[blob]), encapsulated: nil)
-    case 2:
+        return MachineKeyFileParts(fingerprint: Array(SHA256.hash(data: publicKey)), blob: Data(bytes[blob]), hybrid: nil)
+    case 3:
         guard bytes.count > 38, bytes[5] == 0x01 || bytes[5] == 0x02 else {
             return nil
         }
@@ -642,10 +644,13 @@ func decodeMachineKeyFileParts(_ bytes: [UInt8]) -> MachineKeyFileParts? {
               let blob = lengthPrefixed(at: 38), !blob.isEmpty,
               let encapsulated = lengthPrefixed(at: blob.upperBound),
               encapsulated.count == (mlkem ? 1568 : 0),
-              encapsulated.upperBound == bytes.count else {
+              let classical = lengthPrefixed(at: encapsulated.upperBound),
+              classical.isEmpty != mlkem,
+              classical.upperBound == bytes.count else {
             return nil
         }
-        return MachineKeyFileParts(fingerprint: fingerprint, blob: Data(bytes[blob]), encapsulated: mlkem ? Data(bytes[encapsulated]) : nil)
+        return MachineKeyFileParts(fingerprint: fingerprint, blob: Data(bytes[blob]),
+                                   hybrid: mlkem ? (Data(bytes[encapsulated]), Data(bytes[classical])) : nil)
     default:
         return nil
     }
@@ -674,7 +679,7 @@ func machineKekVerdict(_ content: [UInt8]) -> MachineKekVerdict {
     guard let parts = decodeMachineKeyFileParts(content) else {
         return .notAKeyFile
     }
-    switch enclaveBlobCheck(blob: parts.blob, encapsulated: parts.encapsulated) {
+    switch enclaveBlobCheck(blob: parts.blob, hybrid: parts.hybrid) {
     case .key(let fingerprint):
         return fingerprint == parts.fingerprint ? .usable : .corrupt
     case .unsupportedHere:

@@ -20,10 +20,10 @@ for pipelines.
 ## What it does
 
 Each calling application identifies itself with a **service name** (see
-below). A service's KEK is a key generated inside the Secure Enclave: an
-ML-KEM-1024 key by default, or a P-256 key-agreement key where the policy
-opts in to one (see [KEK suites](#kek-suites)). Its private half never
-leaves the enclave and can only be *used*, never extracted. What the
+below). A service's KEK is generated inside the Secure Enclave: an
+ML-KEM-1024 key paired with a P-256 key-agreement key by default, or a
+P-256 key-agreement key alone where the policy opts in to one (see
+[KEK suites](#kek-suites)). Its private half never leaves the enclave and can only be *used*, never extracted. What the
 library persists, in the keychain or a machine KEK file, is the enclave's
 opaque, device-bound reference to that key.
 
@@ -38,9 +38,12 @@ primitive. The KEK's suite decides where the secret comes from:
 
 1. A fresh random 32-byte **salt** and 12-byte **nonce** are drawn.
 2. The **Secure Enclave** computes the secret:
-   - **ML-KEM-1024** (suite `0x02`): it decapsulates the ciphertext stored
-     with the KEK, which was encapsulated to it once, at provisioning, and
-     gets back the 32-byte secret `K`.
+   - **ML-KEM-1024** (suite `0x02`), a hybrid of two enclave keys. With
+     the KEK's ML-KEM key it decapsulates the ciphertext stored with the
+     KEK, which was encapsulated to it once, at provisioning, and gets back
+     the 32-byte secret `K`. With the KEK's P-256 key it computes
+     `Z = ECDH(KEK_priv, H)` as the P-256 suite below does, with `CS02` in
+     the DST in place of `CS01`.
    - **P-256** (suite `0x01`), the Linux and Windows libraries'
      construction: the salt is hashed to a P-256 point `H` with RFC 9380
      hash-to-curve, suite `P256_XMD:SHA-256_SSWU_RO_`, under the DST
@@ -51,7 +54,10 @@ primitive. The KEK's suite decides where the secret comes from:
    as HKDF's salt and an `info` of `"hkdfguard-wrap-v1:"` ‖ the service
    name's length (u16, little-endian) ‖ the service name ‖ the payload
    header. The header holds the suite byte, so the two suites never derive
-   the same key.
+   the same key. Suite `0x02` runs it twice: first over `Z`, to 64 bytes,
+   then over `K` with those 64 bytes as the salt (same `info`). HKDF's
+   first step is HMAC keyed by the salt, so the AES key is secret as long
+   as either `Z` or `K` is, the way TLS 1.3 chains its secrets.
 4. **AES-256-GCM** seals the DEK under the nonce, with the payload header
    as additional authenticated data.
 
@@ -65,9 +71,9 @@ for one service can never be opened under another.
 | | ML-KEM-1024 (`0x02`) | P-256 (`0x01`) |
 |---|---|---|
 | Provisioned | by default, on macOS 26 and later | only with `KekSuite` `P-256` in the [policy](#the-policy) |
-| The secret | `K`: one per KEK | `Z`: one per payload |
-| A quantum computer that sees the public key | learns nothing that gives `K` | recovers the private key, and with it every payload |
-| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key ‖ the 1568-byte stored ciphertext | SHA-256 of `0x04 ‖ x ‖ y` |
+| The secret | `K`, one per KEK, and `Z`, one per payload; the key needs both | `Z`: one per payload |
+| A quantum computer that sees the public keys | recovers the P-256 private key, but learns nothing that gives `K` | recovers the private key, and with it every payload |
+| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key ‖ the 1568-byte stored ciphertext ‖ the P-256 public key (`0x04 ‖ x ‖ y`) | SHA-256 of `0x04 ‖ x ‖ y` |
 | Same construction on Linux and Windows | not yet | yes |
 
 Both keep the payload at 125 bytes, and with both only this Mac can create
@@ -95,11 +101,12 @@ provisioning and then dropped; from then on only decapsulating the stored
 ciphertext gives it back, and that takes the enclave. The public key lets
 anyone encapsulate a secret of their own, not recover `K`, so it can't be
 used to forge a payload either. Neither the public key nor the stored
-ciphertext needs to stay secret.
+ciphertext needs to stay secret. The suite's P-256 half is the paragraph
+above again: every payload also needs a `Z` only the enclave can compute.
 
-The stored ciphertext is part of the KEK: the same enclave key with another
-ciphertext gives another `K`, and ML-KEM decapsulation never fails on a
-wrong one. So the fingerprint covers the public key and the ciphertext. A
+The stored ciphertext is part of the KEK: the same enclave keys with another
+ciphertext give another `K`, and ML-KEM decapsulation never fails on a
+wrong one. So the fingerprint covers both public keys and the ciphertext. A
 ciphertext swapped or damaged in storage makes the KEK a different KEK:
 a payload wrapped under the original is refused by it with `-16`
 (`KEK_FINGERPRINT_MISMATCH`). The KEK's own store records the fingerprint
@@ -124,13 +131,23 @@ No payload or fingerprint carries the public key, but a P-256 machine KEK
 file does, in the clear, and so does every copy of that file a backup or
 snapshot keeps.
 
-**ML-KEM-1024** has one secret per KEK, not one per payload. `K` passes
-through the process on every wrap and unwrap, as `Z` does; captured once,
-it opens every payload under that KEK, and lets its holder create new ones,
-until the KEK is retired. That is the price of keeping the payload at 125
-bytes. The alternative, a fresh encapsulation per payload with an ML-DSA
-signature to keep payloads unforgeable, has P-256's one-secret-per-payload
-property but makes every payload about 4.5 KB.
+**ML-KEM-1024** has one `K` per KEK, not one per payload: that is what
+keeps the payload at 125 bytes. `K` passes through the process on every
+wrap and unwrap. On its own, captured once, it would open every payload
+under the KEK and let its holder create new ones, offline, until the KEK
+was retired. The suite's P-256 half is there so that it doesn't: each
+payload's key also needs that payload's `Z`, which takes this Mac's Secure
+Enclave every time. So a captured `K` is worth nothing without the enclave,
+and a captured `Z` opens one payload, as with P-256.
+
+What the hybrid gives up is that against a quantum computer the P-256 half
+adds nothing, so there `K` is all that stands: an attacker who has both
+captured `K` from this Mac's memory and can break P-256 opens every payload
+under the KEK. Either alone opens none. The alternative that removes the
+shared `K` altogether, a fresh encapsulation per payload with an ML-DSA
+signature to keep payloads unforgeable, makes every payload about 4.5 KB.
+A suite `0x02` KEK also costs two enclave operations per wrap and unwrap
+where P-256 costs one.
 
 ## Wrapped payload format
 
@@ -155,7 +172,8 @@ does; Windows hashes the raw `x || y`, without the `0x04` prefix, so the same
 key would fingerprint differently there. That is harmless, since a payload
 is only ever opened on the machine that wrapped it, but a fingerprint is
 only meaningful on the platform that produced it. For an ML-KEM-1024 KEK it
-hashes the raw 1568-byte public key. On unwrap it is compared to the current
+hashes the raw 1568-byte ML-KEM public key, the stored ciphertext and the
+P-256 public key. On unwrap it is compared to the current
 KEK's **before** any key agreement, decapsulation or decryption is
 attempted, so "wrong or rotated KEK" is reported as `fingerprintMismatch`
 (-16) rather than as a generic decryption failure. That includes a payload
@@ -883,8 +901,10 @@ machine-scoped service:
 - **The KEK file** is `/Library/Application Support/HkdfGuard/keks/<service>.kek`,
   `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). A P-256 KEK's
   (format 1) holds the public key and the Secure Enclave key blob; an
-  ML-KEM-1024 KEK's (format 2) holds the suite, the 32-byte fingerprint,
-  the blob and the stored ciphertext, and no public key. Either way
+  ML-KEM-1024 KEK's (format 3) holds the suite, the 32-byte fingerprint,
+  the ML-KEM blob, the stored ciphertext and the P-256 blob, and no public
+  key. A format 2 file, from a build before the suite became a hybrid, is
+  not read: it reports `-19`, and `retire --corrupt` removes it. Either way
   `status` and `retire` read the fingerprint from the file, without the
   Secure Enclave. The blob is usable only by this
   Mac's Secure Enclave, in the system context, after the first unlock since

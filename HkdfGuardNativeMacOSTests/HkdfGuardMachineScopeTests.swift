@@ -182,28 +182,30 @@ struct HkdfGuardMachineScopeTests {
         #expect(encodeMachineKeyFile(.v1(publicKey: publicKey, blob: Data())) == nil)
     }
 
-    @Test func formatTwoRoundTripsForBothSuitesAndRejectsAnythingElse() throws {
+    @Test func formatThreeRoundTripsForBothSuitesAndRejectsAnythingElse() throws {
         let fingerprint = Data((0..<32).map { UInt8($0 + 1) })
         let blob = Data((0..<1833).map { UInt8($0 & 0xFF) })
         let ciphertext = Data((0..<1568).map { UInt8(($0 * 7) & 0xFF) })
-        for stored in [StoredKEK.p256(blob: blob), .mlkem1024(blob: blob, encapsulated: ciphertext)] {
-            let file = MachineKeyFile.v2(stored, fingerprint: fingerprint)
+        let classical = Data((0..<300).map { UInt8(($0 * 3) & 0xFF) })
+        for stored in [StoredKEK.p256(blob: blob), .mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: classical)] {
+            let file = MachineKeyFile.v3(stored, fingerprint: fingerprint)
             #expect(file.publicKey == nil)
             #expect(file.stored == stored)
             let encoded = try #require(encodeMachineKeyFile(file))
-            #expect(encoded[4] == 2)
+            #expect(encoded[4] == 3)
             #expect(decodeMachineKeyFile(encoded) == file)
             #expect(decodeMachineKeyFile(encoded.dropLast()) == nil, "truncated")
             #expect(decodeMachineKeyFile(encoded + Data([0])) == nil, "trailing bytes")
         }
 
-        let encoded = try #require(encodeMachineKeyFile(.v2(.mlkem1024(blob: blob, encapsulated: ciphertext), fingerprint: fingerprint)))
+        let encoded = try #require(encodeMachineKeyFile(.v3(.mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: classical), fingerprint: fingerprint)))
         func set(_ index: Int, _ value: UInt8) -> Data {
             var bytes = [UInt8](encoded)
             bytes[index] = value
             return Data(bytes)
         }
-        #expect(decodeMachineKeyFile(set(4, 3)) == nil, "format version")
+        #expect(decodeMachineKeyFile(set(4, 2)) == nil, "format 2 is no longer read")
+        #expect(decodeMachineKeyFile(set(4, 4)) == nil, "format version")
         #expect(decodeMachineKeyFile(set(5, 0x03)) == nil, "unknown suite")
         #expect(decodeMachineKeyFile(set(5, 0x01)) == nil, "P-256 with a ciphertext")
         #expect(decodeMachineKeyFile(set(38, 0xFF)) == nil, "blob length")
@@ -212,10 +214,11 @@ struct HkdfGuardMachineScopeTests {
         #expect(decodeMachineKeyFile(Data(zeroFingerprint)) == nil, "an all-zero fingerprint")
 
         // The encoder refuses what the decoder would.
-        #expect(encodeMachineKeyFile(.v2(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast()), fingerprint: fingerprint)) == nil)
-        #expect(encodeMachineKeyFile(.v2(.p256(blob: Data()), fingerprint: fingerprint)) == nil)
-        #expect(encodeMachineKeyFile(.v2(.p256(blob: blob), fingerprint: fingerprint.dropLast())) == nil)
-        #expect(encodeMachineKeyFile(.v2(.p256(blob: Data(count: 9000)), fingerprint: fingerprint)) == nil, "over the size limit")
+        #expect(encodeMachineKeyFile(.v3(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast(), classicalBlob: classical), fingerprint: fingerprint)) == nil)
+        #expect(encodeMachineKeyFile(.v3(.mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: Data()), fingerprint: fingerprint)) == nil, "suite 0x02 needs its P-256 key")
+        #expect(encodeMachineKeyFile(.v3(.p256(blob: Data()), fingerprint: fingerprint)) == nil)
+        #expect(encodeMachineKeyFile(.v3(.p256(blob: blob), fingerprint: fingerprint.dropLast())) == nil)
+        #expect(encodeMachineKeyFile(.v3(.p256(blob: Data(count: 9000)), fingerprint: fingerprint)) == nil, "over the size limit")
     }
 
     @Test func refusesAKeyFolderNotOwnedByRoot() throws {
@@ -235,6 +238,32 @@ struct HkdfGuardMachineScopeTests {
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect(excludeFromBackup(dir.path))
         #expect(try URL(fileURLWithPath: dir.path).resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+    }
+
+    // MARK: - One policy read per call
+
+    @Test func aCallSeesOnePolicyHoweverOftenItAsks() {
+        let service = "com.hkdfguard.tests.machine.snapshot"
+        var strict = MachinePolicy(source: "before", securityAdminGroup: nil, deploymentAdminGroup: nil,
+                                   machineServices: [service: MachineServiceSettings(runnerGroup: "_orders")])
+        strict.suites.requirePostQuantum = true
+        Self.with(.loaded(strict)) {
+            withPolicySnapshot {
+                // The policy is replaced while the call is running.
+                Self.with(.none) {
+                    #expect(kekScope(service: service) == .machine(MachineServiceSettings(runnerGroup: "_orders")))
+                    #expect(currentSuitePolicy() == strict.suites)
+                    withPolicySnapshot {
+                        #expect(currentMachinePolicy() == .loaded(strict), "a nested snapshot keeps the outer read")
+                    }
+                }
+            }
+            // The next call reads it afresh.
+            Self.with(.none) {
+                #expect(kekScope(service: service) == .user)
+                #expect(withPolicySnapshot { currentMachinePolicy() } == PolicyLoad.none)
+            }
+        }
     }
 
     // MARK: - Runner group
