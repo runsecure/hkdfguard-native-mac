@@ -205,7 +205,10 @@ extern "C" {
 // no Linux or Windows counterpart, so a cross-platform caller must not rely
 // on them: hkdfguard_keychain_mode and hkdfguard_machine_policy. Two
 // Linux functions have no macOS counterpart and are not declared here:
-// hkdfguard_security_model and hkdfguard_key_file_principal_trusted. Not
+// hkdfguard_security_model and hkdfguard_key_file_principal_trusted. Three
+// more are not implemented on macOS yet, and are not declared here either:
+// Linux's secret-wrapping functions, hkdfguard_wrap_secret,
+// hkdfguard_unwrap_secret and hkdfguard_open_secret_file. Not
 // shared either: the payload layout, which is per-platform (Linux's carries a
 // version byte, a provider tag and a key id, 132..276 bytes). The
 // construction is the same on all three -- ECDH against a hashed

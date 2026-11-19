@@ -217,24 +217,74 @@ func requireAdminRole(_ role: AdminRole, policy: CLIPolicy, service: String, com
 
 // MARK: - Root's own code only
 
-/// Whether `path` and every folder above it are root's and writable by
-/// root alone. Checked without following a symbolic link at any step.
-func rootControls(_ path: String) -> Bool {
-    var current = path
-    while true {
-        var info = stat()
-        guard lstat(current, &info) == 0, info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0,
-              info.st_mode & S_IFMT != S_IFLNK else {
-            return false
-        }
-        if current == "/" {
+/// Whether an access control list on `fd` could grant anyone anything: any
+/// allow entry at all, or an ACL that can't be read. Deny entries only take
+/// rights away.
+private func aclAllowsAnything(_ fd: Int32) -> Bool {
+    guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+        return errno != ENOENT // no ACL at all; any other failure fails closed
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+    var entry: acl_entry_t?
+    var which = ACL_FIRST_ENTRY.rawValue
+    while acl_get_entry(acl, Int32(which), &entry) == 0, let current = entry {
+        which = ACL_NEXT_ENTRY.rawValue
+        var tag = ACL_UNDEFINED_TAG
+        guard acl_get_tag_type(current, &tag) == 0, tag == ACL_EXTENDED_DENY else {
             return true
         }
-        current = (current as NSString).deletingLastPathComponent
-        if current.isEmpty {
+    }
+    return false
+}
+
+/// Whether `path` (absolute, with no `.` or `..`) and every folder above
+/// it are root's and writable by root alone, by mode and by ACL. Walked
+/// down from "/", each step opened from the one before without following a
+/// symbolic link and judged through its descriptor, so what is checked is
+/// what is there: nothing can be swapped between a check and the next
+/// step. `privateFolder`: `path` must also be a folder nobody but root can
+/// even list (mode 0700).
+func rootControls(_ path: String, privateFolder: Bool = false) -> Bool {
+    guard path.hasPrefix("/") else {
+        return false
+    }
+    let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    guard !parts.contains("."), !parts.contains("..") else {
+        return false
+    }
+    func rootsAlone(_ fd: Int32, folder: Bool) -> Bool {
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0 else {
+            return false
+        }
+        let type = info.st_mode & S_IFMT
+        return (folder ? type == S_IFDIR : type == S_IFDIR || type == S_IFREG) && !aclAllowsAnything(fd)
+    }
+    var fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard fd >= 0 else {
+        return false
+    }
+    defer { close(fd) }
+    guard rootsAlone(fd, folder: true) else {
+        return false
+    }
+    for (index, part) in parts.enumerated() {
+        let last = index == parts.count - 1
+        let next = openat(fd, part, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | (last ? 0 : O_DIRECTORY))
+        guard next >= 0 else {
+            return false
+        }
+        close(fd)
+        fd = next
+        guard rootsAlone(fd, folder: !last) else {
             return false
         }
     }
+    guard privateFolder else {
+        return true
+    }
+    var info = stat()
+    return fstat(fd, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR && info.st_mode & 0o077 == 0
 }
 
 /// This executable, if it and the libhkdfguard it loaded are root's: the
@@ -309,7 +359,7 @@ private func prepareSystemJobsFolder() throws {
     if mkdir(systemJobsFolder, 0o700) != 0 && errno != EEXIST {
         throw CLIError("can't create \(systemJobsFolder): \(String(cString: strerror(errno)))")
     }
-    guard rootControls(systemJobsFolder), isRootOnlyFolder(systemJobsFolder) else {
+    guard rootControls(systemJobsFolder, privateFolder: true) else {
         throw CLIError("\(systemJobsFolder), and every folder above it, must be owned by root and writable by root alone (the folder itself mode 0700); refusing to run a system job there")
     }
     let now = Date()
@@ -441,7 +491,7 @@ func runSystemJobSide(folder: String) throws {
     // Only a folder the CLI made in the jobs folder: root's alone, as is
     // every folder above it.
     guard (folder as NSString).deletingLastPathComponent == systemJobsFolder,
-          isRootOnlyFolder(folder), rootControls(folder) else {
+          rootControls(folder, privateFolder: true) else {
         throw CLIError("__system-job: \(folder) is not a root-only folder in \(systemJobsFolder)")
     }
     guard let data = FileManager.default.contents(atPath: "\(folder)/request.plist"),

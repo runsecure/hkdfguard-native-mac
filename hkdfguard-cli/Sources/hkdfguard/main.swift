@@ -2311,7 +2311,14 @@ func runRetireMachine(service: String, confirmation: RetireConfirmation, policy:
         guard current == expected else {
             throw CLIError("fingerprint mismatch for service \"\(service)\": the current machine KEK is \(hexString(current)), not \(hexString(expected)); nothing was deleted")
         }
-        try deleteMachineKeyFile(policy: policy, service: service)
+        // The file that is deleted is the one opened here, so it is the one
+        // whose fingerprint is confirmed: a file put in its place since the
+        // library read it is refused, not deleted on the old one's word.
+        try deleteMachineKeyFile(policy: policy, service: service) { content in
+            guard let parts = decodeMachineKeyFileParts(content), parts.fingerprint == expected else {
+                throw CLIError("the machine KEK file for service \"\(service)\" changed after its fingerprint was confirmed; nothing was deleted -- check `\(programName) status` and retire again")
+            }
+        }
         auditKekRetired(service: service, fingerprint: expected, scope: "machine")
         print("retired machine KEK for service \"\(service)\" (fingerprint \(hexString(expected)))")
         print("no payload wrapped under it unwraps now -- unless the KEK file is restored from an APFS snapshot or a backup taken before this retire")

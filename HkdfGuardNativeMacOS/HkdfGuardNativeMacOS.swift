@@ -1006,9 +1006,28 @@ private enum KEKLookup {
     case failed(OSStatus)
 }
 
+private let keychainLog = Logger(subsystem: "com.hkdfguard", category: "keychain")
+
 /// Looks up the persisted Secure Enclave key's opaque data representation
 /// in the keychain, under the caller-supplied service identifier.
 private func loadKEKDataRepresentation(service: String, mode: KeychainMode) -> KEKLookup {
+    // In legacy mode the search list spans more than one keychain (login
+    // and System, plus any the user added), so the same service can have a
+    // KEK item in each, and a first-match lookup would quietly take
+    // whichever comes first. More than one is refused instead: nothing
+    // says which is the service's KEK. (The data-protection keychain holds
+    // at most one item per service and account.)
+    if case .legacy = mode {
+        var count = keychainItemAttributes(service: service, mode: mode)
+        count[kSecMatchLimit as String] = kSecMatchLimitAll
+        count[kSecReturnPersistentRef as String] = true
+        var found: CFTypeRef?
+        if SecItemCopyMatching(count as CFDictionary, &found) == errSecSuccess,
+           let refs = found as? [Data], refs.count > 1 {
+            keychainLog.error("\(service, privacy: .public): \(refs.count) keychains in the search list hold a KEK item for this service; refusing to choose one. Remove the stray ones (`security find-generic-password -s \(service, privacy: .public) -a \(hkdfguardKeychainAccount, privacy: .public)` shows each)")
+            return .failed(errSecDuplicateItem)
+        }
+    }
     var query = keychainItemAttributes(service: service, mode: mode)
     query[kSecReturnData as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
