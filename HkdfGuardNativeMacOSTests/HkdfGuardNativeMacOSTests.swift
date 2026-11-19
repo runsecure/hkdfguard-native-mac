@@ -1624,9 +1624,13 @@ struct HkdfGuardCrossPlatformABITests {
     /// The functions only this platform exports, as its header documents.
     static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_machine_policy", "hkdfguard_kek_suite"]
     /// The Linux functions this platform doesn't export, as its header documents.
-    /// The last three are Linux's secret wrapping, not implemented here yet.
     static let linuxOnlyFunctions: Set<String> = [
         "hkdfguard_security_model", "hkdfguard_key_file_principal_trusted",
+    ]
+    /// Linux's secret wrapping, not implemented here yet. It is on a Linux feature branch
+    /// and not yet on its main, so the Linux header may or may not declare it; when it
+    /// does, these are the only other functions allowed to be Linux-only.
+    static let linuxOnlyIfPresentFunctions: Set<String> = [
         "hkdfguard_wrap_secret", "hkdfguard_unwrap_secret", "hkdfguard_open_secret_file",
     ]
 
@@ -1717,8 +1721,8 @@ struct HkdfGuardCrossPlatformABITests {
         let mac = Self.functions(in: try Self.read(Self.macHeader))
         #expect(linux.count >= 8, "parsed too few functions from the Linux header: \(linux.sorted())")
 
-        let missing = linux.subtracting(mac)
-        #expect(missing == Self.linuxOnlyFunctions, "Linux-only functions are \(missing.sorted()); the headers document \(Self.linuxOnlyFunctions.sorted())")
+        let missing = linux.subtracting(mac).subtracting(Self.linuxOnlyIfPresentFunctions)
+        #expect(missing == Self.linuxOnlyFunctions, "Linux-only functions are \(missing.sorted()); the headers document \(Self.linuxOnlyFunctions.sorted()), plus optionally \(Self.linuxOnlyIfPresentFunctions.sorted())")
         let extra = mac.subtracting(linux)
         #expect(extra == Self.macOnlyFunctions, "macOS-only functions are \(extra.sorted()); the headers document \(Self.macOnlyFunctions.sorted())")
     }
