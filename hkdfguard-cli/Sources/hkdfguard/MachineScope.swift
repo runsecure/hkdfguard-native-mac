@@ -12,8 +12,9 @@
 //
 // Both admin roles act as root (`sudo`); the role is checked against the
 // admin behind the session -- the audit user, which `sudo` doesn't change
-// -- so `sudo` alone is not enough. Root itself (a root login) passes:
-// machine scope trusts root, as every secret store on macOS does.
+// -- so `sudo` alone is not enough. Root itself (a root login, a
+// LaunchDaemon, an MDM script) passes: machine scope trusts root, as every
+// secret store on macOS does. An admin who can't be identified does not.
 //
 // A machine KEK must be created, and used to wrap, in the system context:
 // the Secure Enclave binds a key to the context it was made in, and keys
@@ -24,6 +25,7 @@
 // must not run code anyone else can replace. The DEK reaches the job
 // through a FIFO in a root-only folder -- kernel memory, never disk.
 
+import CryptoKit // retire --corrupt only: judging a machine KEK file's own content
 import Darwin
 import Foundation
 import os
@@ -123,18 +125,55 @@ enum AdminRole {
     }
 }
 
-/// The account that logged in to start this session -- the admin behind
-/// `sudo`, which `sudo` does not change. nil when unknown or root.
-func sessionUser() -> (uid: uid_t, name: String)? {
+/// Who is behind this root process.
+enum SessionOwner {
+    /// A root login: the audit user is root.
+    case root
+    /// No audit user and no `sudo`: root's own context -- a LaunchDaemon,
+    /// an MDM agent's script.
+    case system
+    /// The admin behind `sudo`. `name` is the account's, or "uid N" when
+    /// the directory can't name it (membership is still checked by uid).
+    case user(uid: uid_t, name: String)
+    /// It can't be determined; no role is granted.
+    case unknown(String)
+
+    /// For the audit record.
+    var actor: String {
+        switch self {
+        case .root, .system: return "root"
+        case .user(_, let name): return name
+        case .unknown: return "unknown"
+        }
+    }
+}
+
+/// The account that logged in to start this session -- the audit user,
+/// which `sudo` does not change. Where none is recorded (cron, for one,
+/// starts jobs without one), the account `sudo` says it was run by: `sudo`
+/// sets SUDO_UID itself, so its caller can't remove or forge it.
+func sessionOwner() -> SessionOwner {
+    func user(_ uid: uid_t) -> SessionOwner {
+        .user(uid: uid, name: getpwuid(uid).map { String(cString: $0.pointee.pw_name) } ?? "uid \(uid)")
+    }
     var info = auditinfo_addr_t()
     guard getaudit_addr(&info, Int32(MemoryLayout<auditinfo_addr_t>.size)) == 0 else {
-        return nil
+        return .unknown("the audit session can't be read (\(String(cString: strerror(errno))))")
     }
-    let uid = info.ai_auid
-    guard uid != 0, uid != uid_t.max /* AU_DEFAUDITID: none recorded */, let entry = getpwuid(uid) else {
-        return nil
+    switch info.ai_auid {
+    case 0:
+        return .root
+    case uid_t.max: // AU_DEFAUDITID: none recorded
+        guard let raw = getenv("SUDO_UID") else {
+            return .system
+        }
+        guard let uid = uid_t(String(cString: raw)) else {
+            return .unknown("SUDO_UID is not a user ID")
+        }
+        return uid == 0 ? .system : user(uid)
+    case let uid:
+        return user(uid)
     }
-    return (uid, String(cString: entry.pointee.pw_name))
 }
 
 func isMember(uid: uid_t, ofGroup name: String) -> Bool {
@@ -162,34 +201,90 @@ func requireAdminRole(_ role: AdminRole, policy: CLIPolicy, service: String, com
     guard let group = role.group(in: policy) else {
         return // no group named: any admin who can sudo
     }
-    guard let user = sessionUser() else {
-        return // a root login: trusted
-    }
-    guard isMember(uid: user.uid, ofGroup: group) else {
-        throw CLIError("\(user.name) is not a member of \(group), the policy's \(role.setting): only its members may \(role.duty)")
+    switch sessionOwner() {
+    case .root, .system:
+        return // root itself, not an admin's `sudo`: trusted
+    case .user(let uid, let name):
+        // Fails closed: an account or group the directory can't resolve
+        // is not a member.
+        guard isMember(uid: uid, ofGroup: group) else {
+            throw CLIError("\(name) is not a member of \(group), the policy's \(role.setting): only its members may \(role.duty)")
+        }
+    case .unknown(let reason):
+        throw CLIError("can't tell which admin is behind this session -- \(reason) -- so membership of \(group), the policy's \(role.setting), can't be checked: only its members may \(role.duty)")
     }
 }
 
 // MARK: - Root's own code only
 
-/// Whether `path` and every folder above it are root's and writable by
-/// root alone. Checked without following a symbolic link at any step.
-func rootControls(_ path: String) -> Bool {
-    var current = path
-    while true {
-        var info = stat()
-        guard lstat(current, &info) == 0, info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0,
-              info.st_mode & S_IFMT != S_IFLNK else {
-            return false
-        }
-        if current == "/" {
+/// Whether an access control list on `fd` could grant anyone anything: any
+/// allow entry at all, or an ACL that can't be read. Deny entries only take
+/// rights away.
+private func aclAllowsAnything(_ fd: Int32) -> Bool {
+    guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+        return errno != ENOENT // no ACL at all; any other failure fails closed
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+    var entry: acl_entry_t?
+    var which = ACL_FIRST_ENTRY.rawValue
+    while acl_get_entry(acl, Int32(which), &entry) == 0, let current = entry {
+        which = ACL_NEXT_ENTRY.rawValue
+        var tag = ACL_UNDEFINED_TAG
+        guard acl_get_tag_type(current, &tag) == 0, tag == ACL_EXTENDED_DENY else {
             return true
         }
-        current = (current as NSString).deletingLastPathComponent
-        if current.isEmpty {
+    }
+    return false
+}
+
+/// Whether `path` (absolute, with no `.` or `..`) and every folder above
+/// it are root's and writable by root alone, by mode and by ACL. Walked
+/// down from "/", each step opened from the one before without following a
+/// symbolic link and judged through its descriptor, so what is checked is
+/// what is there: nothing can be swapped between a check and the next
+/// step. `privateFolder`: `path` must also be a folder nobody but root can
+/// even list (mode 0700).
+func rootControls(_ path: String, privateFolder: Bool = false) -> Bool {
+    guard path.hasPrefix("/") else {
+        return false
+    }
+    let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    guard !parts.contains("."), !parts.contains("..") else {
+        return false
+    }
+    func rootsAlone(_ fd: Int32, folder: Bool) -> Bool {
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0 else {
+            return false
+        }
+        let type = info.st_mode & S_IFMT
+        return (folder ? type == S_IFDIR : type == S_IFDIR || type == S_IFREG) && !aclAllowsAnything(fd)
+    }
+    var fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard fd >= 0 else {
+        return false
+    }
+    defer { close(fd) }
+    guard rootsAlone(fd, folder: true) else {
+        return false
+    }
+    for (index, part) in parts.enumerated() {
+        let last = index == parts.count - 1
+        let next = openat(fd, part, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | (last ? 0 : O_DIRECTORY))
+        guard next >= 0 else {
+            return false
+        }
+        close(fd)
+        fd = next
+        guard rootsAlone(fd, folder: !last) else {
             return false
         }
     }
+    guard privateFolder else {
+        return true
+    }
+    var info = stat()
+    return fstat(fd, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR && info.st_mode & 0o077 == 0
 }
 
 /// This executable, if it and the libhkdfguard it loaded are root's: the
@@ -222,11 +317,16 @@ func rootOwnedSelf() throws -> String {
 enum SystemJobOperation: String {
     case provision
     case wrap
+    /// `retire --corrupt`: judges the machine KEK file's content where its
+    /// key can be loaded. Changes nothing.
+    case inspectKek
 }
 
 struct SystemJobResult {
     var status: Int32
     var payload: [UInt8]
+    /// `inspectKek` only: a `MachineKekVerdict`.
+    var verdict: String? = nil
 }
 
 private let systemJobTimeout: TimeInterval = 30
@@ -259,7 +359,7 @@ private func prepareSystemJobsFolder() throws {
     if mkdir(systemJobsFolder, 0o700) != 0 && errno != EEXIST {
         throw CLIError("can't create \(systemJobsFolder): \(String(cString: strerror(errno)))")
     }
-    guard rootControls(systemJobsFolder), isRootOnlyFolder(systemJobsFolder) else {
+    guard rootControls(systemJobsFolder, privateFolder: true) else {
         throw CLIError("\(systemJobsFolder), and every folder above it, must be owned by root and writable by root alone (the folder itself mode 0700); refusing to run a system job there")
     }
     let now = Date()
@@ -374,7 +474,7 @@ func runSystemJob(_ operation: SystemJobOperation, service: String, dek: UnsafeR
           let status = result["status"] as? Int else {
         throw CLIError("the system job did not answer within \(Int(systemJobTimeout)) s\(jobDiagnostics(folder))")
     }
-    return SystemJobResult(status: Int32(status), payload: [UInt8](result["payload"] as? Data ?? Data()))
+    return SystemJobResult(status: Int32(status), payload: [UInt8](result["payload"] as? Data ?? Data()), verdict: result["verdict"] as? String)
 }
 
 private func jobDiagnostics(_ folder: String) -> String {
@@ -391,7 +491,7 @@ func runSystemJobSide(folder: String) throws {
     // Only a folder the CLI made in the jobs folder: root's alone, as is
     // every folder above it.
     guard (folder as NSString).deletingLastPathComponent == systemJobsFolder,
-          isRootOnlyFolder(folder), rootControls(folder) else {
+          rootControls(folder, privateFolder: true) else {
         throw CLIError("__system-job: \(folder) is not a root-only folder in \(systemJobsFolder)")
     }
     guard let data = FileManager.default.contents(atPath: "\(folder)/request.plist"),
@@ -423,6 +523,14 @@ func runSystemJobSide(folder: String) throws {
                 return ["status": Int(status)]
             }
             return ["status": 0, "payload": Data(out.prefix(Int(length)))]
+        }
+    case .inspectKek:
+        // The verdict, and the digest of the bytes it is about: the CLI
+        // deletes only a file that still holds exactly those.
+        if let content = try? machineKeyFileContent(policy: loadPolicy(), service: service) {
+            result = ["status": 0, "verdict": machineKekVerdict(content).rawValue, "payload": Data(SHA256.hash(data: content))]
+        } else {
+            result = ["status": 0, "verdict": MachineKekVerdict.unreadable.rawValue]
         }
     }
     let out = try PropertyListSerialization.data(fromPropertyList: result, format: .xml, options: 0)
@@ -486,8 +594,30 @@ func withDekFromFifo<T>(_ path: String, timeout: TimeInterval, abandon: () -> Vo
 
 /// Deletes the machine KEK file for `service`, through a folder chain
 /// opened without following links, and only the regular, root-owned file
-/// that was checked.
-func deleteMachineKeyFile(policy: CLIPolicy, service: String) throws {
+/// that was checked. `confirm` sees that file's content first, and throws
+/// to leave it alone.
+func deleteMachineKeyFile(policy: CLIPolicy, service: String, confirm: (([UInt8]) throws -> Void)? = nil) throws {
+    let path = policy.keyFilePath(service)
+    try withMachineKeyFile(policy: policy, service: service) { folder, fd in
+        if let confirm {
+            guard let content = readMachineKeyFileBytes(fd: fd) else {
+                throw CLIError("can't read \(path): \(String(cString: strerror(errno))); nothing was deleted")
+            }
+            try confirm(content)
+        }
+        guard unlinkIfStillSame(folder, fd: fd) else {
+            throw CLIError("\(path) changed while it was being retired; nothing was deleted")
+        }
+        try flushFolder(folder)
+        guard !keyFileNameIsTaken(folder) else {
+            throw CLIError("\(path) is still present after deletion")
+        }
+    }
+}
+
+/// Opens the machine KEK file for `service` -- the folder chain without
+/// following links, the file only if it is regular and root's -- for `body`.
+private func withMachineKeyFile<T>(policy: CLIPolicy, service: String, _ body: (CheckedFolder, Int32) throws -> T) throws -> T {
     let path = policy.keyFilePath(service)
     let folder = try openRealFolder(path, what: "the machine KEK file")
     defer { folder.close() }
@@ -500,12 +630,178 @@ func deleteMachineKeyFile(policy: CLIPolicy, service: String) throws {
     guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0 else {
         throw CLIError("\(path) is not a root-owned regular file; nothing was deleted")
     }
-    guard unlinkIfStillSame(folder, fd: fd) else {
-        throw CLIError("\(path) changed while it was being retired; nothing was deleted")
+    return try body(folder, fd)
+}
+
+// MARK: - Retiring a corrupt machine KEK
+//
+// The library reports -19 for a machine KEK file whose content is bad, and
+// equally for a sound one it refuses to trust: a stray `chmod`, an added
+// ACL, a folder someone else can write. Only the first may be deleted; the
+// second is a healthy KEK with a permissions problem that can be fixed. So
+// `retire --corrupt` judges the file's own content, which the C ABI does
+// not expose -- the format is read here as the library's
+// `decodeMachineKeyFile` reads it, as `storedKEKCheck` does for a keychain
+// item.
+
+/// Must equal `machineKeyMaxSize` in HkdfGuardNativeMacOS.swift.
+private let machineKeyFileMaxSize = 8192
+
+/// The parts of a well-formed machine KEK file.
+struct MachineKeyFileParts {
+    var fingerprint: [UInt8]
+    var blob: Data
+    /// A suite 0x02 KEK's stored ciphertext and P-256 blob; nil for P-256.
+    var hybrid: (encapsulated: Data, classicalBlob: Data)?
+}
+
+/// "HKGK" || format, then format 1: public key (65) || blob length
+/// (big-endian u16) || blob; format 3: suite || fingerprint (32) || blob
+/// length || blob || ciphertext length || ciphertext (1568 bytes for suite
+/// 0x02, none for P-256) || P-256 blob length || P-256 blob (suite 0x02
+/// only). nil for anything else, format 2 (an ML-KEM-only KEK from before
+/// suite 0x02 became a hybrid) included.
+func decodeMachineKeyFileParts(_ bytes: [UInt8]) -> MachineKeyFileParts? {
+    guard bytes.count > 5, bytes.count <= machineKeyFileMaxSize, bytes[0..<4].elementsEqual("HKGK".utf8) else {
+        return nil
     }
-    try flushFolder(folder)
-    guard !keyFileNameIsTaken(folder) else {
-        throw CLIError("\(path) is still present after deletion")
+    func lengthPrefixed(at offset: Int) -> Range<Int>? {
+        guard bytes.count >= offset + 2 else {
+            return nil
+        }
+        let start = offset + 2
+        let end = start + (Int(bytes[offset]) << 8 | Int(bytes[offset + 1]))
+        return end <= bytes.count ? start..<end : nil
+    }
+    switch bytes[4] {
+    case 1:
+        guard bytes.count > 72 else {
+            return nil
+        }
+        let publicKey = Data(bytes[5..<70])
+        guard let blob = lengthPrefixed(at: 70), !blob.isEmpty, blob.upperBound == bytes.count,
+              (try? P256.KeyAgreement.PublicKey(x963Representation: publicKey)) != nil else {
+            return nil
+        }
+        return MachineKeyFileParts(fingerprint: Array(SHA256.hash(data: publicKey)), blob: Data(bytes[blob]), hybrid: nil)
+    case 3:
+        guard bytes.count > 38, bytes[5] == 0x01 || bytes[5] == 0x02 else {
+            return nil
+        }
+        let mlkem = bytes[5] == 0x02
+        let fingerprint = Array(bytes[6..<38])
+        guard fingerprint.contains(where: { $0 != 0 }),
+              let blob = lengthPrefixed(at: 38), !blob.isEmpty,
+              let encapsulated = lengthPrefixed(at: blob.upperBound),
+              encapsulated.count == (mlkem ? 1568 : 0),
+              let classical = lengthPrefixed(at: encapsulated.upperBound),
+              classical.isEmpty != mlkem,
+              classical.upperBound == bytes.count else {
+            return nil
+        }
+        return MachineKeyFileParts(fingerprint: fingerprint, blob: Data(bytes[blob]),
+                                   hybrid: mlkem ? (Data(bytes[encapsulated]), Data(bytes[classical])) : nil)
+    default:
+        return nil
+    }
+}
+
+/// What a machine KEK file's content is, judged in the system context --
+/// the only place its key loads.
+enum MachineKekVerdict: String {
+    /// Not a file the library wrote.
+    case notAKeyFile
+    /// Loads, and is the key the file records: a healthy KEK.
+    case usable
+    /// Well-formed, but its blob is not a key this Mac's Secure Enclave
+    /// holds while the enclave demonstrably works, or not the key the file
+    /// records.
+    case corrupt
+    /// Nothing loads in the enclave right now, so the blob can't be judged.
+    case enclaveUnusable
+    /// An ML-KEM KEK on a macOS without ML-KEM in its Secure Enclave.
+    case unsupportedHere
+    /// The system job could not read the file.
+    case unreadable
+}
+
+func machineKekVerdict(_ content: [UInt8]) -> MachineKekVerdict {
+    guard let parts = decodeMachineKeyFileParts(content) else {
+        return .notAKeyFile
+    }
+    switch enclaveBlobCheck(blob: parts.blob, hybrid: parts.hybrid) {
+    case .key(let fingerprint):
+        return fingerprint == parts.fingerprint ? .usable : .corrupt
+    case .unsupportedHere:
+        return .unsupportedHere
+    case .unreconstructable:
+        return secureEnclaveIsUsableNow(accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly) ? .corrupt : .enclaveUnusable
+    }
+}
+
+/// Everything in the file open as `fd`, or one byte more than a KEK file
+/// can hold (which no reader takes for one). nil if it can't be read.
+private func readMachineKeyFileBytes(fd: Int32) -> [UInt8]? {
+    var bytes = [UInt8](repeating: 0, count: machineKeyFileMaxSize + 1)
+    var filled = 0
+    while filled < bytes.count {
+        let count = bytes.withUnsafeMutableBytes { raw in
+            pread(fd, raw.baseAddress.map { $0 + filled }, raw.count - filled, off_t(filled))
+        }
+        if count < 0 && errno == EINTR { continue }
+        if count < 0 { return nil }
+        if count == 0 { break }
+        filled += count
+    }
+    return Array(bytes.prefix(filled))
+}
+
+/// The machine KEK file's content, read from the regular, root-owned file
+/// at its path.
+func machineKeyFileContent(policy: CLIPolicy, service: String) throws -> [UInt8] {
+    let path = policy.keyFilePath(service)
+    return try withMachineKeyFile(policy: policy, service: service) { _, fd in
+        guard let content = readMachineKeyFileBytes(fd: fd) else {
+            throw CLIError("can't read \(path): \(String(cString: strerror(errno)))")
+        }
+        return content
+    }
+}
+
+/// Deletes the machine KEK file for `service` only if its content is bad:
+/// not a KEK file at all, or a well-formed one whose key the system job
+/// found the Secure Enclave can't rebuild. The caller has seen the library
+/// report -19; that alone also covers a healthy KEK the library refuses
+/// for its ownership or permissions, which is never deleted here.
+func retireCorruptMachineKeyFile(policy: CLIPolicy, service: String) throws {
+    let path = policy.keyFilePath(service)
+    let content = try machineKeyFileContent(policy: policy, service: service)
+    if decodeMachineKeyFileParts(content) != nil {
+        // Well-formed, so only the enclave can say whether its key is
+        // gone -- and only in the system context.
+        let result = try runSystemJob(.inspectKek, service: service)
+        guard result.status == HKDFGuardStatus.success.rawValue else {
+            throw CLIError("the system job could not inspect the machine KEK for service \"\(service)\": \(describeStatus(result.status)); nothing was deleted")
+        }
+        switch result.verdict.flatMap(MachineKekVerdict.init(rawValue:)) {
+        case .corrupt?:
+            guard result.payload == Array(SHA256.hash(data: content)) else {
+                throw CLIError("\(path) changed while it was being inspected; nothing was deleted -- inspect it again before retiring")
+            }
+        case .usable?:
+            throw CLIError("\(path) holds a usable KEK: the library refuses it because the file, or a folder above it, is not root's alone or is open to others, or the file's group is not the RunnerGroup the policy names now (the log says which: `log show --last 5m --predicate 'subsystem == \"com.hkdfguard\"'`). Nothing was deleted -- restore root ownership, the policy's RunnerGroup as its group, mode 0640 (0600 without a RunnerGroup) and no ACL, then use it, or retire it with --fingerprint")
+        case .enclaveUnusable?:
+            throw CLIError("the Secure Enclave is not usable in the system context right now (not yet unlocked since boot, or unavailable), so a healthy KEK can look corrupt; nothing was deleted -- try again after the first unlock")
+        case .unsupportedHere?:
+            throw CLIError("\(path) holds an ML-KEM-1024 KEK, which this macOS can't load (it needs macOS 26); it is very likely fine, and nothing was deleted")
+        case .notAKeyFile?, .unreadable?, nil:
+            throw CLIError("the system job could not judge \(path); nothing was deleted -- inspect it again before retiring")
+        }
+    }
+    try deleteMachineKeyFile(policy: policy, service: service) { now in
+        guard now == content else {
+            throw CLIError("\(path) changed while it was being retired; nothing was deleted -- inspect it again before retiring")
+        }
     }
 }
 
@@ -516,7 +812,8 @@ private let auditLog = Logger(subsystem: "com.hkdfguard", category: "audit")
 /// Event 1004 (as on Linux): a KEK was retired. The library writes every
 /// other record; retiring is this tool's alone.
 func auditKekRetired(service: String, fingerprint: [UInt8], scope: String) {
-    let actor = sessionUser()?.name ?? "root"
+    // Kept to characters that can't end the quoted field or start another.
+    let actor = String(sessionOwner().actor.unicodeScalars.filter { (0x20..<0x7F).contains($0.value) && $0 != "\"" && $0 != "\\" })
     let line = "event=1004 op=retire result=OK service=\"\(service)\" provider=SECURE_ENCLAVE keychain=\(scope) kek_fingerprint=\(hexString(fingerprint)) actor=\"\(actor)\" uid=\(getuid()) euid=\(geteuid()) pid=\(getpid()) msg=\"KEK retired: no DEK wrapped under it unwraps unless the KEK is restored from a backup or snapshot\""
     auditLog.error("\(line, privacy: .public)")
 }

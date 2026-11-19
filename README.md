@@ -20,10 +20,10 @@ for pipelines.
 ## What it does
 
 Each calling application identifies itself with a **service name** (see
-below). A service's KEK is a key generated inside the Secure Enclave: an
-ML-KEM-1024 key by default, or a P-256 key-agreement key where the policy
-opts in to one (see [KEK suites](#kek-suites)). Its private half never
-leaves the enclave and can only be *used*, never extracted. What the
+below). A service's KEK is generated inside the Secure Enclave: an
+ML-KEM-1024 key paired with a P-256 key-agreement key by default, or a
+P-256 key-agreement key alone where the policy opts in to one (see
+[KEK suites](#kek-suites)). Its private half never leaves the enclave and can only be *used*, never extracted. What the
 library persists, in the keychain or a machine KEK file, is the enclave's
 opaque, device-bound reference to that key.
 
@@ -38,9 +38,12 @@ primitive. The KEK's suite decides where the secret comes from:
 
 1. A fresh random 32-byte **salt** and 12-byte **nonce** are drawn.
 2. The **Secure Enclave** computes the secret:
-   - **ML-KEM-1024** (suite `0x02`): it decapsulates the ciphertext stored
-     with the KEK, which was encapsulated to it once, at provisioning, and
-     gets back the 32-byte secret `K`.
+   - **ML-KEM-1024** (suite `0x02`), a hybrid of two enclave keys. With
+     the KEK's ML-KEM key it decapsulates the ciphertext stored with the
+     KEK, which was encapsulated to it once, at provisioning, and gets back
+     the 32-byte secret `K`. With the KEK's P-256 key it computes
+     `Z = ECDH(KEK_priv, H)` as the P-256 suite below does, with `CS02` in
+     the DST in place of `CS01`.
    - **P-256** (suite `0x01`), the Linux and Windows libraries'
      construction: the salt is hashed to a P-256 point `H` with RFC 9380
      hash-to-curve, suite `P256_XMD:SHA-256_SSWU_RO_`, under the DST
@@ -51,7 +54,10 @@ primitive. The KEK's suite decides where the secret comes from:
    as HKDF's salt and an `info` of `"hkdfguard-wrap-v1:"` ‖ the service
    name's length (u16, little-endian) ‖ the service name ‖ the payload
    header. The header holds the suite byte, so the two suites never derive
-   the same key.
+   the same key. Suite `0x02` runs it twice: first over `Z`, to 64 bytes,
+   then over `K` with those 64 bytes as the salt (same `info`). HKDF's
+   first step is HMAC keyed by the salt, so the AES key is secret as long
+   as either `Z` or `K` is, the way TLS 1.3 chains its secrets.
 4. **AES-256-GCM** seals the DEK under the nonce, with the payload header
    as additional authenticated data.
 
@@ -65,9 +71,9 @@ for one service can never be opened under another.
 | | ML-KEM-1024 (`0x02`) | P-256 (`0x01`) |
 |---|---|---|
 | Provisioned | by default, on macOS 26 and later | only with `KekSuite` `P-256` in the [policy](#the-policy) |
-| The secret | `K`: one per KEK | `Z`: one per payload |
-| A quantum computer that sees the public key | learns nothing that gives `K` | recovers the private key, and with it every payload |
-| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key | SHA-256 of `0x04 ‖ x ‖ y` |
+| The secret | `K`, one per KEK, and `Z`, one per payload; the key needs both | `Z`: one per payload |
+| A quantum computer that sees the public keys | recovers the P-256 private key, but learns nothing that gives `K` | recovers the private key, and with it every payload |
+| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key ‖ the 1568-byte stored ciphertext ‖ the P-256 public key (`0x04 ‖ x ‖ y`) | SHA-256 of `0x04 ‖ x ‖ y` |
 | Same construction on Linux and Windows | not yet | yes |
 
 Both keep the payload at 125 bytes, and with both only this Mac can create
@@ -95,7 +101,23 @@ provisioning and then dropped; from then on only decapsulating the stored
 ciphertext gives it back, and that takes the enclave. The public key lets
 anyone encapsulate a secret of their own, not recover `K`, so it can't be
 used to forge a payload either. Neither the public key nor the stored
-ciphertext needs to stay secret.
+ciphertext needs to stay secret. The suite's P-256 half is the paragraph
+above again: every payload also needs a `Z` only the enclave can compute.
+
+The stored ciphertext is part of the KEK: the same enclave keys with another
+ciphertext give another `K`, and ML-KEM decapsulation never fails on a
+wrong one. So the fingerprint covers both public keys and the ciphertext. A
+ciphertext swapped or damaged in storage makes the KEK a different KEK:
+a payload wrapped under the original is refused by it with `-16`
+(`KEK_FINGERPRINT_MISMATCH`). The KEK's own store records the fingerprint
+beside the ciphertext, in the keychain item and in the machine KEK file
+alike, so damage there is caught at the source: the KEK is `-19`
+(`KEK_INVALID`), never loaded as a different one. That record guards
+against damage, not against someone able to rewrite the store, who can
+record a fingerprint to match; the fingerprint in each payload, and the one
+you recorded at provisioning, are what catch a substituted KEK. The
+fingerprint is in the payload header, so the ciphertext is bound into every
+payload's key and tag as well.
 
 ### What each suite gives up
 
@@ -109,20 +131,30 @@ No payload or fingerprint carries the public key, but a P-256 machine KEK
 file does, in the clear, and so does every copy of that file a backup or
 snapshot keeps.
 
-**ML-KEM-1024** has one secret per KEK, not one per payload. `K` passes
-through the process on every wrap and unwrap, as `Z` does; captured once,
-it opens every payload under that KEK, and lets its holder create new ones,
-until the KEK is retired. That is the price of keeping the payload at 125
-bytes. The alternative, a fresh encapsulation per payload with an ML-DSA
-signature to keep payloads unforgeable, has P-256's one-secret-per-payload
-property but makes every payload about 4.5 KB.
+**ML-KEM-1024** has one `K` per KEK, not one per payload: that is what
+keeps the payload at 125 bytes. `K` passes through the process on every
+wrap and unwrap. On its own, captured once, it would open every payload
+under the KEK and let its holder create new ones, offline, until the KEK
+was retired. The suite's P-256 half is there so that it doesn't: each
+payload's key also needs that payload's `Z`, which takes this Mac's Secure
+Enclave every time. So a captured `K` is worth nothing without the enclave,
+and a captured `Z` opens one payload, as with P-256.
+
+What the hybrid gives up is that against a quantum computer the P-256 half
+adds nothing, so there `K` is all that stands: an attacker who has both
+captured `K` from this Mac's memory and can break P-256 opens every payload
+under the KEK. Either alone opens none. The alternative that removes the
+shared `K` altogether, a fresh encapsulation per payload with an ML-DSA
+signature to keep payloads unforgeable, makes every payload about 4.5 KB.
+A suite `0x02` KEK also costs two enclave operations per wrap and unwrap
+where P-256 costs one.
 
 ## Wrapped payload format
 
 Always exactly **125 bytes**:
 
 ```
-[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key                 ]
+[ 32-byte KEK fingerprint — see the Fingerprint row under "KEK suites"      ]
 [  1-byte suite id — 0x01 (P-256) or 0x02 (ML-KEM-1024), the KEK's suite    ]
 [ 32-byte random salt                                                       ]
 [ 12-byte random AES-GCM nonce                                              ]
@@ -140,7 +172,8 @@ does; Windows hashes the raw `x || y`, without the `0x04` prefix, so the same
 key would fingerprint differently there. That is harmless, since a payload
 is only ever opened on the machine that wrapped it, but a fingerprint is
 only meaningful on the platform that produced it. For an ML-KEM-1024 KEK it
-hashes the raw 1568-byte public key. On unwrap it is compared to the current
+hashes the raw 1568-byte ML-KEM public key, the stored ciphertext and the
+P-256 public key. On unwrap it is compared to the current
 KEK's **before** any key agreement, decapsulation or decryption is
 attempted, so "wrong or rotated KEK" is reported as `fingerprintMismatch`
 (-16) rather than as a generic decryption failure. That includes a payload
@@ -509,7 +542,7 @@ here are defined there but never returned on macOS.
 | `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
 | `-98` | `ERR_MAC_KEYCHAIN_WRITE_FAILED` | `keychainWriteFailed` | refines -4 |
 | `-99` | `ERR_MAC_KEK_VERIFICATION_FAILED` | `kekVerificationFailed` | stored, but couldn't be reloaded immediately after; refines -4 |
-| `-100` | `ERR_MAC_KEYCHAIN_READ_FAILED` | `keychainReadFailed` | refines -4 |
+| `-100` | `ERR_MAC_KEYCHAIN_READ_FAILED` | `keychainReadFailed` | refines -4; also, in legacy keychain mode, more than one keychain in the search list holds a KEK item for the service (the log says so): remove the stray ones |
 
 ## Keychain modes (hybrid)
 
@@ -780,7 +813,25 @@ sudo dseditgroup -o edit -a _orders -t user _orders
 ```
 
 The library refuses a `RunnerGroup` that covers too many accounts (`staff`,
-`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …).
+`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …), whatever
+name it goes by: the check is on the group's gid. It also refuses a group
+that has root as a member, which is what a group with one of those nested
+inside it looks like. It can't tell a small group of people from a small
+group of service accounts; that part is yours.
+
+The KEK file's group is checked against the policy on every use, not just
+when the KEK is created. If you change a service's `RunnerGroup`, the
+existing file still belongs to the old group, and every call for that
+service fails with `-19` (the log names both groups) until you move it:
+
+```sh
+sudo chgrp _orders2 "/Library/Application Support/HkdfGuard/keks/com.example.orders.kek"
+```
+
+Do the same for the service's wrapped key files. Members of the old group
+could read the KEK file until then; if they should never have had it,
+retire the KEK and provision a new one instead. Removing a `RunnerGroup`
+calls for `chmod 600`.
 
 ### Provisioning, wrapping and retiring
 
@@ -799,7 +850,19 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
 
 - **The role is checked against the admin behind `sudo`**: the account that
   logged in to the session, which `sudo` doesn't change. `sudo` alone isn't
-  enough. A root login is trusted.
+  enough. Root itself is trusted: a root login, or a process with no login
+  behind it and no `sudo` (a LaunchDaemon, an MDM script). Where the
+  session records no login but `sudo` was used (a cron job, say), the
+  account `sudo` ran for is checked instead. An admin who can't be
+  identified, or whose membership can't be looked up, is refused.
+- **The roles bind only admins whose `sudo` is limited to `hkdfguard`.**
+  They are enforced by this tool, not by the library or the system: an
+  admin with unrestricted `sudo` is root, and root can do either role's
+  work without it. To separate the roles, give each group a sudoers rule
+  for its own commands only. Pin the deployment admins' `wrap` rule to the
+  key file paths they may write: `wrap` runs as root, so it writes its
+  output wherever `--key-file-path` says, and with `--force` replaces a
+  small file already there.
 - **The Secure Enclave work runs in a one-off LaunchDaemon job.** The
   Secure Enclave binds a key to the context it was created in, so a key
   made from Terminal, `sudo` included, would be unusable by the service's
@@ -833,12 +896,15 @@ machine-scoped service:
   Secure Enclave would refuse them anyway: a key created by a daemon can't
   be used from a login session.
 - **Only root and `RunnerGroup` members can read the KEK file**; anyone else
-  gets `-18`.
+  gets `-18`. A file whose group is not the policy's current `RunnerGroup`
+  is refused with `-19`, for every caller.
 - **The KEK file** is `/Library/Application Support/HkdfGuard/keks/<service>.kek`,
   `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). A P-256 KEK's
   (format 1) holds the public key and the Secure Enclave key blob; an
-  ML-KEM-1024 KEK's (format 2) holds the suite, the 32-byte fingerprint,
-  the blob and the stored ciphertext, and no public key. Either way
+  ML-KEM-1024 KEK's (format 3) holds the suite, the 32-byte fingerprint,
+  the ML-KEM blob, the stored ciphertext and the P-256 blob, and no public
+  key. A format 2 file, from a build before the suite became a hybrid, is
+  not read: it reports `-19`, and `retire --corrupt` removes it. Either way
   `status` and `retire` read the fingerprint from the file, without the
   Secure Enclave. The blob is usable only by this
   Mac's Secure Enclave, in the system context, after the first unlock since
@@ -846,7 +912,9 @@ machine-scoped service:
   excludes the `keks` folder from Time Machine; local APFS snapshots still
   hold it. A file that
   isn't root's, that anyone else can write, that others can read, or that
-  this library didn't write is `-19` (`KEK_INVALID`).
+  this library didn't write is `-19` (`KEK_INVALID`). Of those, `retire
+  --corrupt` deletes only a file whose content is bad; wrong ownership or
+  permissions on a sound file are to be fixed, not retired.
 - **Root is trusted.** Root can read the file and install a LaunchDaemon, so
   an admin who can `sudo` can ultimately use the key, as with every secret
   store on macOS. If admins reaching a Mac over SSH is a concern, turn off
@@ -904,7 +972,7 @@ hkdfguard retire --service-name|-sn <name> \
   run reports "already provisioned …; verified" and exits 0. Prints the
   keychain mode it used, the KEK's suite (`ML-KEM-1024`, or `P-256` where
   the policy's `KekSuite` opts in; see [KEK suites in the policy](#kek-suites-in-the-policy)),
-  and its **fingerprint** (SHA-256 of its public key) — record it. On "already provisioned", compare it with the
+  and its **fingerprint** (see [KEK suites](#kek-suites)) — record it. On "already provisioned", compare it with the
   recorded value: a mismatch means the KEK under that name is not the one
   you provisioned.
 - **`status`** reports the keychain mode, the suite the policy provisions,
@@ -949,7 +1017,16 @@ hkdfguard retire --service-name|-sn <name> \
   acts on exactly one item, by persistent reference, after confirming that
   item's own blob is the unreconstructable one. Afterwards the service can
   be provisioned again. `--fingerprint` and `--corrupt` are mutually
-  exclusive.
+  exclusive. For a **machine-scoped** service `-19` is not enough, because
+  the library also reports it for a sound KEK file it refuses to trust (a
+  stray `chmod`, an added ACL, a folder someone else can write). The file is
+  deleted only if its own content is bad: it is not a KEK file, or it is a
+  well-formed one whose key the Secure Enclave can't rebuild, or that isn't
+  the key it records. That is judged by a one-off system job, the only
+  place a machine KEK loads, with the enclave proven usable there, and the
+  file deleted must still hold exactly the bytes that were judged. A file
+  whose key loads is never deleted: restore its ownership and permissions,
+  then use it or retire it with `--fingerprint`.
 - **`wrap`** wraps the pipeline's existing 32-byte DEK — base64, read from
   **stdin** (`--dek-stdin`) or a **file** (`--dek-file`), exactly one of the
   two — under the already-provisioned KEK and writes the 125-byte payload to
@@ -1402,8 +1479,8 @@ version, run the full suite on real hardware (see
 [Continuous integration](#continuous-integration)), then push a signed tag:
 
 ```sh
-git tag -s v0.9.1 -m v0.9.1   # must equal v<MARKETING_VERSION>
-git push origin v0.9.1
+git tag -s v0.9.2 -m v0.9.2   # must equal v<MARKETING_VERSION>
+git push origin v0.9.2
 ```
 
 The workflow checks that the tag matches `MARKETING_VERSION` and is on
@@ -1414,7 +1491,7 @@ To build and publish one by hand instead (the workflow runs the same
 steps):
 
 ```sh
-VERSION=v0.9.1   # must equal MARKETING_VERSION in the Xcode project
+VERSION=v0.9.2   # must equal MARKETING_VERSION in the Xcode project
 
 HKDFGUARD_RELEASE=1 \
 HKDFGUARD_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
@@ -1524,7 +1601,7 @@ package first, and install only if every check passes:
 
 ```sh
 set -e
-VERSION=v0.9.1
+VERSION=v0.9.2
 TEAM_ID=MFW3T8R8J3                        # the Team that signs this project's releases
 EXPECTED=<the SHA-256 from the release notes>
 PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"

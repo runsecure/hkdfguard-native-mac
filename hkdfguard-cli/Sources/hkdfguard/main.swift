@@ -401,8 +401,10 @@ func printUsage() {
                       With --corrupt instead, deletes the item only if the library
                       reports it as corrupt (-19) and the Secure Enclave is proven
                       usable in this session, so a healthy KEK that merely could not
-                      be loaded right now is never mistaken for a corrupt one.
-          status      report the KEK's scope (and keychain mode), whether it exists,
+                      be loaded right now is never mistaken for a corrupt one. A
+                      machine KEK file is deleted only if its own content is bad;
+                      one the library refuses for its ownership or permissions is not.
+          status     report the KEK's scope (and keychain mode), whether it exists,
                       and its fingerprint. Read-only: never creates or deletes anything.
 
         Production mode: when a com.hkdfguard policy (an MDM profile, or
@@ -784,8 +786,11 @@ let kekKeychainAccount = "kek-v1"
 
 // What a KEK item's own data reconstructs into, read in the library's item
 // format (`decodeKeychainKEK` in HkdfGuardNativeMacOS.swift): a bare P-256
-// Secure Enclave blob, or, for ML-KEM, "HKGQ" || format 0x01 || suite 0x02
-// || blob length (big-endian u16) || blob || 1568-byte ciphertext.
+// Secure Enclave blob, or, for suite 0x02 (ML-KEM-1024 with a P-256 key),
+// "HKGQ" || format 0x03 || suite 0x02 || fingerprint (32) || blob length
+// (big-endian u16) || ML-KEM blob || 1568-byte ciphertext || blob length ||
+// P-256 blob. A suite 0x02 item whose keys are not the ones its
+// fingerprint records is unreconstructable, as it is to the library.
 enum StoredKEKCheck {
     case key(fingerprint: [UInt8])
     case unreconstructable
@@ -794,36 +799,71 @@ enum StoredKEKCheck {
     case unsupportedHere
 }
 
-func storedKEKCheck(_ data: Data) -> StoredKEKCheck {
-    let magic = Data("HKGQ".utf8)
-    guard data.starts(with: magic) else {
-        guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data) else {
+// What a Secure Enclave key blob reconstructs into, in this session -- a
+// keychain item's blob, or a machine KEK file's. `hybrid` is a suite 0x02
+// KEK's stored ciphertext and P-256 blob (nil: a P-256 KEK); its
+// fingerprint covers the ciphertext and both public keys.
+func enclaveBlobCheck(blob: Data, hybrid: (encapsulated: Data, classicalBlob: Data)?) -> StoredKEKCheck {
+    guard let hybrid else {
+        guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) else {
             return .unreconstructable
         }
         return .key(fingerprint: Array(SHA256.hash(data: key.publicKey.x963Representation))) // the library's kekFingerprint: SHA-256 of 0x04 || x || y
     }
-    let start = data.startIndex
-    guard data.count > 8, data[start + 4] == 0x01, data[start + 5] == 0x02 else {
-        return .unreconstructable
-    }
-    let length = Int(data[start + 6]) << 8 | Int(data[start + 7])
-    guard length > 0, data.count == 8 + length + 1568 else {
-        return .unreconstructable
-    }
     guard #available(macOS 26.0, *) else {
         return .unsupportedHere
     }
-    var blob = data.subdata(in: (start + 8)..<(start + 8 + length))
-    defer {
-        blob.withUnsafeMutableBytes { raw in
+    guard let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob),
+          let classical = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: hybrid.classicalBlob) else {
+        return .unreconstructable
+    }
+    // The library's KEMKEK.fingerprint: SHA-256 of the ML-KEM public key ||
+    // ciphertext || the P-256 public key (0x04 || x || y).
+    var hash = SHA256()
+    hash.update(data: key.publicKey.rawRepresentation)
+    hash.update(data: hybrid.encapsulated)
+    hash.update(data: classical.publicKey.x963Representation)
+    return .key(fingerprint: Array(hash.finalize()))
+}
+
+func storedKEKCheck(_ data: Data) -> StoredKEKCheck {
+    let magic = Data("HKGQ".utf8)
+    guard data.starts(with: magic) else {
+        return enclaveBlobCheck(blob: data, hybrid: nil)
+    }
+    let start = data.startIndex
+    let header = 4 + 1 + 1 + fingerprintLength + 2
+    guard data.count > header, data[start + 4] == 0x03, data[start + 5] == 0x02 else {
+        return .unreconstructable
+    }
+    let recorded = Array(data[(start + 6)..<(start + 6 + fingerprintLength)])
+    let length = Int(data[start + header - 2]) << 8 | Int(data[start + header - 1])
+    let classicalStart = header + length + 1568 + 2
+    guard length > 0, data.count > classicalStart else {
+        return .unreconstructable
+    }
+    let classicalLength = Int(data[start + classicalStart - 2]) << 8 | Int(data[start + classicalStart - 1])
+    guard classicalLength > 0, data.count == classicalStart + classicalLength else {
+        return .unreconstructable
+    }
+    var blob = data.subdata(in: (start + header)..<(start + header + length))
+    var classicalBlob = data.subdata(in: (start + classicalStart)..<data.endIndex)
+    func zero(_ bytes: inout Data) {
+        bytes.withUnsafeMutableBytes { raw in
             guard let base = raw.baseAddress, raw.count > 0 else { return }
             _ = memset_s(base, raw.count, 0, raw.count)
         }
     }
-    guard let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob) else {
+    defer {
+        zero(&blob)
+        zero(&classicalBlob)
+    }
+    let check = enclaveBlobCheck(blob: blob, hybrid: (
+        data.subdata(in: (start + header + length)..<(start + classicalStart - 2)), classicalBlob))
+    if case .key(let fingerprint) = check, fingerprint != recorded {
         return .unreconstructable
     }
-    return .key(fingerprint: Array(SHA256.hash(data: key.publicKey.rawRepresentation))) // the library's KEK.fingerprint for ML-KEM
+    return check
 }
 
 // The first non-empty `keychain-access-groups` entry this executable is
@@ -921,11 +961,13 @@ func kekExistsStatus(service: String) -> (status: Int32, exists: Bool) {
 // library reconstructs a stored KEK, and using it once. Nothing is stored.
 // Without this, a healthy KEK that merely failed to load right now (locked
 // session, SSH with no GUI login, enclave unavailable) would be
-// indistinguishable from a corrupt item and could be deleted.
-func secureEnclaveIsUsableNow() -> Bool {
+// indistinguishable from a corrupt item and could be deleted. `accessible`
+// is the KEK's own policy: the user-scoped KEKs' by default, the machine
+// KEKs' (after first unlock) when the system job asks.
+func secureEnclaveIsUsableNow(accessible: CFString = kSecAttrAccessibleWhenUnlockedThisDeviceOnly) -> Bool {
     guard SecureEnclave.isAvailable,
           let access = SecAccessControlCreateWithFlags(
-              nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], nil
+              nil, accessible, [.privateKeyUsage], nil
           ),
           let probe = try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access),
           let reloaded = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: probe.dataRepresentation)
@@ -2100,7 +2142,7 @@ func runStatus(serviceName: String) throws {
     case HKDFGuardStatus.success.rawValue:
         print("kek: absent")
     case HKDFGuardStatus.kekCorrupted.rawValue:
-        print("kek: corrupt (present but not reconstructable, or a machine KEK file root doesn't control; see retire --corrupt)")
+        print("kek: corrupt (present but not reconstructable: see retire --corrupt; or a machine KEK file root doesn't control: restore its ownership and permissions)")
     default:
         throw CLIError("could not determine the KEK state for service \"\(service)\": \(describeStatus(status))")
     }
@@ -2262,14 +2304,21 @@ func runRetireMachine(service: String, confirmation: RetireConfirmation, policy:
         case HKDFGuardStatus.kekNotFound.rawValue:
             throw CLIError("no machine KEK exists for service \"\(service)\"; nothing to retire")
         case HKDFGuardStatus.kekCorrupted.rawValue:
-            throw CLIError("the machine KEK file for service \"\(service)\" is not one this library wrote, or root doesn't control it; if it is genuinely corrupt, retire it with --corrupt")
+            throw CLIError("the machine KEK file for service \"\(service)\" is not one this library wrote, root doesn't control it, or its group is not the RunnerGroup the policy names now (the log says which: `log show --last 5m --predicate 'subsystem == \"com.hkdfguard\"'`); if its ownership, group or permissions are the cause, restore them and retire again; if its content is corrupt, retire it with --corrupt")
         default:
             throw CLIError("cannot read the machine KEK's fingerprint for service \"\(service)\": \(describeStatus(status)); refusing to retire a KEK that cannot be confirmed")
         }
         guard current == expected else {
             throw CLIError("fingerprint mismatch for service \"\(service)\": the current machine KEK is \(hexString(current)), not \(hexString(expected)); nothing was deleted")
         }
-        try deleteMachineKeyFile(policy: policy, service: service)
+        // The file that is deleted is the one opened here, so it is the one
+        // whose fingerprint is confirmed: a file put in its place since the
+        // library read it is refused, not deleted on the old one's word.
+        try deleteMachineKeyFile(policy: policy, service: service) { content in
+            guard let parts = decodeMachineKeyFileParts(content), parts.fingerprint == expected else {
+                throw CLIError("the machine KEK file for service \"\(service)\" changed after its fingerprint was confirmed; nothing was deleted -- check `\(programName) status` and retire again")
+            }
+        }
         auditKekRetired(service: service, fingerprint: expected, scope: "machine")
         print("retired machine KEK for service \"\(service)\" (fingerprint \(hexString(expected)))")
         print("no payload wrapped under it unwraps now -- unless the KEK file is restored from an APFS snapshot or a backup taken before this retire")
@@ -2280,7 +2329,7 @@ func runRetireMachine(service: String, confirmation: RetireConfirmation, policy:
                 ? "the machine KEK for service \"\(service)\" is not corrupt (or absent); nothing was deleted -- retire a valid KEK with --fingerprint"
                 : "cannot inspect the machine KEK for service \"\(service)\": \(describeStatus(status)); nothing was deleted")
         }
-        try deleteMachineKeyFile(policy: policy, service: service)
+        try retireCorruptMachineKeyFile(policy: policy, service: service)
         auditKekRetired(service: service, fingerprint: [], scope: "machine")
         print("retired corrupt machine KEK file for service \"\(service)\"; it can now be provisioned again")
     }

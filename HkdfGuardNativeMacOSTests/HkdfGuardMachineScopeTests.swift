@@ -182,28 +182,30 @@ struct HkdfGuardMachineScopeTests {
         #expect(encodeMachineKeyFile(.v1(publicKey: publicKey, blob: Data())) == nil)
     }
 
-    @Test func formatTwoRoundTripsForBothSuitesAndRejectsAnythingElse() throws {
+    @Test func formatThreeRoundTripsForBothSuitesAndRejectsAnythingElse() throws {
         let fingerprint = Data((0..<32).map { UInt8($0 + 1) })
         let blob = Data((0..<1833).map { UInt8($0 & 0xFF) })
         let ciphertext = Data((0..<1568).map { UInt8(($0 * 7) & 0xFF) })
-        for stored in [StoredKEK.p256(blob: blob), .mlkem1024(blob: blob, encapsulated: ciphertext)] {
-            let file = MachineKeyFile.v2(stored, fingerprint: fingerprint)
+        let classical = Data((0..<300).map { UInt8(($0 * 3) & 0xFF) })
+        for stored in [StoredKEK.p256(blob: blob), .mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: classical)] {
+            let file = MachineKeyFile.v3(stored, fingerprint: fingerprint)
             #expect(file.publicKey == nil)
             #expect(file.stored == stored)
             let encoded = try #require(encodeMachineKeyFile(file))
-            #expect(encoded[4] == 2)
+            #expect(encoded[4] == 3)
             #expect(decodeMachineKeyFile(encoded) == file)
             #expect(decodeMachineKeyFile(encoded.dropLast()) == nil, "truncated")
             #expect(decodeMachineKeyFile(encoded + Data([0])) == nil, "trailing bytes")
         }
 
-        let encoded = try #require(encodeMachineKeyFile(.v2(.mlkem1024(blob: blob, encapsulated: ciphertext), fingerprint: fingerprint)))
+        let encoded = try #require(encodeMachineKeyFile(.v3(.mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: classical), fingerprint: fingerprint)))
         func set(_ index: Int, _ value: UInt8) -> Data {
             var bytes = [UInt8](encoded)
             bytes[index] = value
             return Data(bytes)
         }
-        #expect(decodeMachineKeyFile(set(4, 3)) == nil, "format version")
+        #expect(decodeMachineKeyFile(set(4, 2)) == nil, "format 2 is no longer read")
+        #expect(decodeMachineKeyFile(set(4, 4)) == nil, "format version")
         #expect(decodeMachineKeyFile(set(5, 0x03)) == nil, "unknown suite")
         #expect(decodeMachineKeyFile(set(5, 0x01)) == nil, "P-256 with a ciphertext")
         #expect(decodeMachineKeyFile(set(38, 0xFF)) == nil, "blob length")
@@ -212,17 +214,18 @@ struct HkdfGuardMachineScopeTests {
         #expect(decodeMachineKeyFile(Data(zeroFingerprint)) == nil, "an all-zero fingerprint")
 
         // The encoder refuses what the decoder would.
-        #expect(encodeMachineKeyFile(.v2(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast()), fingerprint: fingerprint)) == nil)
-        #expect(encodeMachineKeyFile(.v2(.p256(blob: Data()), fingerprint: fingerprint)) == nil)
-        #expect(encodeMachineKeyFile(.v2(.p256(blob: blob), fingerprint: fingerprint.dropLast())) == nil)
-        #expect(encodeMachineKeyFile(.v2(.p256(blob: Data(count: 9000)), fingerprint: fingerprint)) == nil, "over the size limit")
+        #expect(encodeMachineKeyFile(.v3(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast(), classicalBlob: classical), fingerprint: fingerprint)) == nil)
+        #expect(encodeMachineKeyFile(.v3(.mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: Data()), fingerprint: fingerprint)) == nil, "suite 0x02 needs its P-256 key")
+        #expect(encodeMachineKeyFile(.v3(.p256(blob: Data()), fingerprint: fingerprint)) == nil)
+        #expect(encodeMachineKeyFile(.v3(.p256(blob: blob), fingerprint: fingerprint.dropLast())) == nil)
+        #expect(encodeMachineKeyFile(.v3(.p256(blob: Data(count: 9000)), fingerprint: fingerprint)) == nil, "over the size limit")
     }
 
     @Test func refusesAKeyFolderNotOwnedByRoot() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.keks.\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: dir) }
-        guard case .untrusted(let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc") }) else {
+        guard case .untrusted(let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc", settings: MachineServiceSettings(runnerGroup: nil)) }) else {
             Issue.record("a user-owned key folder was trusted")
             return
         }
@@ -235,6 +238,87 @@ struct HkdfGuardMachineScopeTests {
         defer { try? FileManager.default.removeItem(at: dir) }
         #expect(excludeFromBackup(dir.path))
         #expect(try URL(fileURLWithPath: dir.path).resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true)
+    }
+
+    // MARK: - One policy read per call
+
+    @Test func aCallSeesOnePolicyHoweverOftenItAsks() {
+        let service = "com.hkdfguard.tests.machine.snapshot"
+        var strict = MachinePolicy(source: "before", securityAdminGroup: nil, deploymentAdminGroup: nil,
+                                   machineServices: [service: MachineServiceSettings(runnerGroup: "_orders")])
+        strict.suites.requirePostQuantum = true
+        Self.with(.loaded(strict)) {
+            withPolicySnapshot {
+                // The policy is replaced while the call is running.
+                Self.with(.none) {
+                    #expect(kekScope(service: service) == .machine(MachineServiceSettings(runnerGroup: "_orders")))
+                    #expect(currentSuitePolicy() == strict.suites)
+                    withPolicySnapshot {
+                        #expect(currentMachinePolicy() == .loaded(strict), "a nested snapshot keeps the outer read")
+                    }
+                }
+            }
+            // The next call reads it afresh.
+            Self.with(.none) {
+                #expect(kekScope(service: service) == .user)
+                #expect(withPolicySnapshot { currentMachinePolicy() } == PolicyLoad.none)
+            }
+        }
+    }
+
+    // MARK: - Runner group
+
+    @Test func aRunnerGroupIsRefusedByGidNotJustByName() {
+        // By name, whatever the case.
+        for name in ["staff", "Admin", "everyone", "wheel", "com.apple.access_ssh"] {
+            guard case .refused(let reason) = resolveRunnerGroup(name) else {
+                Issue.record("\(name) was accepted")
+                continue
+            }
+            #expect(reason.contains("too broad"))
+        }
+        guard case .refused(let missing) = resolveRunnerGroup("hkdfguard-no-such-group") else {
+            Issue.record("a group that doesn't exist was accepted")
+            return
+        }
+        #expect(missing.contains("does not name a group"))
+        // Not on the list, but root is a member: not a dedicated group.
+        #expect(lookupGroupID("daemon") == .found(1))
+        guard case .refused(let shared) = resolveRunnerGroup("daemon") else {
+            Issue.record("a group root belongs to was accepted")
+            return
+        }
+        #expect(shared.contains("root as a member"))
+        // A system group root is not in resolves to its gid.
+        #expect(resolveRunnerGroup("_www") == .gid(70))
+    }
+
+    @Test func aKeyFileMustBelongToThePolicysCurrentRunnerGroup() {
+        let groups: (String) -> GroupLookup = { name in
+            switch name {
+            case "_orders": return .found(501)
+            case "_zero": return .found(0)
+            case "_down": return .failed(EIO)
+            default: return .missing
+            }
+        }
+        func problem(_ mode: mode_t, _ gid: gid_t, _ group: String?) -> String? {
+            machineKeyFileGroupProblem(mode: mode, gid: gid, runnerGroup: group, lookup: groups)
+        }
+        #expect(problem(0o640, 501, "_orders") == nil)
+        #expect(problem(0o600, 501, "_orders") == nil)
+        // The policy moved on, or the file was re-grouped by hand.
+        #expect(problem(0o640, 502, "_orders")?.contains("not the policy's RunnerGroup _orders (gid 501)") == true)
+        #expect(problem(0o640, 0, "_orders") != nil)
+        // The group is gone, unreachable, or too broad: refused, not assumed.
+        #expect(problem(0o640, 501, "_gone")?.contains("does not name a group") == true)
+        #expect(problem(0o640, 501, "_down")?.contains("could not be looked up") == true)
+        #expect(problem(0o640, 20, "staff")?.contains("too broad") == true)
+        #expect(problem(0o640, 0, "_zero")?.contains("too broad") == true)
+        // No runner group: root only, so no group access at all.
+        #expect(problem(0o600, 0, nil) == nil)
+        #expect(problem(0o640, 501, nil)?.contains("chmod 600") == true)
+        #expect(problem(0o610, 0, nil) != nil)
     }
 
     // MARK: - System context

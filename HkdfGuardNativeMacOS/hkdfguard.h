@@ -205,7 +205,10 @@ extern "C" {
 // no Linux or Windows counterpart, so a cross-platform caller must not rely
 // on them: hkdfguard_keychain_mode and hkdfguard_machine_policy. Two
 // Linux functions have no macOS counterpart and are not declared here:
-// hkdfguard_security_model and hkdfguard_key_file_principal_trusted. Not
+// hkdfguard_security_model and hkdfguard_key_file_principal_trusted. Three
+// more are not implemented on macOS yet, and are not declared here either:
+// Linux's secret-wrapping functions, hkdfguard_wrap_secret,
+// hkdfguard_unwrap_secret and hkdfguard_open_secret_file. Not
 // shared either: the payload layout, which is per-platform (Linux's carries a
 // version byte, a provider tag and a key id, 132..276 bytes). The
 // construction is the same on all three -- ECDH against a hashed
@@ -224,7 +227,7 @@ extern "C" {
 // must describe real, readable/writable memory of exactly that size. A
 // wrapped payload is always exactly 125 bytes:
 //
-//   [ 32-byte KEK fingerprint (SHA-256 of the KEK's public key, 0x04||x||y) ]
+//   [ 32-byte KEK fingerprint (P-256: SHA-256 of the public key, 0x04||x||y)]
 //   [  1-byte suite id: HKDFGUARD_KEK_SUITE_*, the KEK's                    ]
 //   [ 32-byte random salt                                                   ]
 //   [ 12-byte random AES-GCM nonce                                          ]
@@ -232,10 +235,17 @@ extern "C" {
 //
 // The suite id names the construction, which is the KEK's: a KEK has one.
 // 0x01 (P-256): the Secure Enclave computes ECDH(KEK, H(salt)), where H
-// hashes the salt to a P-256 point. 0x02 (ML-KEM-1024): the Secure Enclave
-// decapsulates the ciphertext stored with the KEK at provisioning; the
-// fingerprint is then SHA-256 of the ML-KEM-1024 public key. Either way
-// HKDF-SHA512 (salt = the salt) derives the AES-256 key from that secret.
+// hashes the salt to a P-256 point. 0x02 (ML-KEM-1024), a hybrid of two
+// Secure Enclave keys: the enclave decapsulates the ciphertext stored with
+// the KEK at provisioning, and also computes ECDH(the KEK's P-256 key,
+// H(salt)) as suite 0x01 does. The key needs both, so the decapsulated
+// secret -- one per KEK -- opens nothing without the enclave. The
+// fingerprint is then SHA-256 of the ML-KEM-1024 public key, that
+// ciphertext and the P-256 public key, so a KEK whose stored ciphertext
+// was swapped or damaged is a different KEK to every payload and recorded
+// fingerprint. Either way HKDF-SHA512 (salt = the salt) derives the
+// AES-256 key (suite 0x02: over the ECDH secret, whose output then salts
+// HKDF-SHA512 over the decapsulated one).
 // Any other suite id is HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED. The header -- every
 // byte before the ciphertext -- is bound into both the derived key (HKDF
 // `info`, with the service name) and the tag (AES-GCM additional data), so a
@@ -355,7 +365,9 @@ extern "C" {
 //   - it works logged out, at the login window, and after an unattended
 //     restart (`fdesetup authrestart`).
 //   - a file that is not root's, writable by anyone else, readable by
-//     others, or not one this library wrote is HKDFGUARD_ERR_KEK_INVALID.
+//     others, not in the RunnerGroup the policy names now (or group-
+//     accessible with none), or not one this library wrote is
+//     HKDFGUARD_ERR_KEK_INVALID.
 //
 // hkdfguard_kek_exists and hkdfguard_kek_fingerprint answer from the file
 // alone, without the Secure Enclave, so root can use them from Terminal.
@@ -459,7 +471,8 @@ int hkdfguard_kek_exists(
     const char* HKDFGUARD_NONNULL service,
     int* HKDFGUARD_NONNULL out_exists);
 
-// Writes the 32-byte fingerprint (SHA-256 of the KEK's public key, uncompressed 0x04 || x || y) of
+// Writes the 32-byte fingerprint (P-256: SHA-256 of the KEK's public key, uncompressed 0x04 || x || y;
+// ML-KEM-1024: SHA-256 of the ML-KEM public key, the stored ciphertext and the P-256 public key) of
 // the KEK for `service` to `out` -- the same value embedded at the front of
 // every payload wrapped under it. Public-key material, not a secret. Lets an
 // operator record which KEK a service uses after provisioning, and confirm
@@ -476,7 +489,7 @@ int hkdfguard_kek_fingerprint(
     int* HKDFGUARD_NONNULL out_len);
 
 #define HKDFGUARD_KEK_SUITE_P256 1        /* ECDH against a hashed point */
-#define HKDFGUARD_KEK_SUITE_MLKEM1024 2   /* ML-KEM-1024, stored ciphertext */
+#define HKDFGUARD_KEK_SUITE_MLKEM1024 2   /* ML-KEM-1024, stored ciphertext, with ECDH against a hashed point */
 
 // macOS-only. Writes the suite of the KEK for `service` to `*out_suite` --
 // HKDFGUARD_KEK_SUITE_P256 or HKDFGUARD_KEK_SUITE_MLKEM1024, the suite id

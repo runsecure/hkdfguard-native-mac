@@ -240,7 +240,7 @@ jobs:
           tar -C "$PWD" -xzf "$RUNNER_TEMP/release-binaries.tgz"
           python3 -I -c 'import ctypes, sys; lib = ctypes.CDLL(sys.argv[1]); print("dlopen ok:", lib.hkdfguard_kek_suite)' \
             "$PWD/build-ci/Release/libhkdfguard.dylib"
-          for args in "--help" "status --service com.hkdfguard.ci.macos15"; do
+          for args in "--help" "status --service-name com.hkdfguard.ci.macos15"; do
             set +e
             ./hkdfguard $args
             code=$?

@@ -653,24 +653,24 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
     // MARK: - A stored ML-KEM KEK
 
     /// Stores an ML-KEM-1024 KEK for `service` in the keychain item format
-    /// provisioning will use, and returns its public key.
+    /// provisioning will use, and returns its fingerprint.
     @available(macOS 26.0, *)
     private static func plantMLKEMKEK(service: String) throws -> Data {
         let access = try #require(SecAccessControlCreateWithFlags(
             nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], nil))
-        let (kem, blob) = try #require(newMLKEM1024KEK(accessControl: access))
+        let (kem, stored) = try #require(newMLKEM1024KEK(accessControl: access))
         var attributes = keychainQuery(service: service)
-        let item = try #require(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: kem.encapsulated)))
+        let item = try #require(encodeKeychainKEK(stored, fingerprint: kem.fingerprint))
         attributes[kSecValueData as String] = item
         try #require(SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess)
-        return kem.publicKey
+        return kem.fingerprint
     }
 
     @available(macOS 26.0, *)
     @Test func aStoredMLKEMKEKWrapsAndUnwrapsInSuite2() throws {
         let service = "com.hkdfguard.tests.mlkem.stored"
         defer { Self.deleteKEK(service: service) }
-        let publicKey = try Self.plantMLKEMKEK(service: service)
+        let fingerprint = try Self.plantMLKEMKEK(service: service)
 
         #expect(Self.kekExists(service: service) == (0, true))
         #expect(Self.createKEK(service: service) == 0, "an existing ML-KEM KEK is verified, never replaced")
@@ -678,7 +678,7 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         let wrapped = Self.wrap(dek, service: service)
         #expect(wrapped.status == 0)
         #expect(wrapped.wrapped.count == Self.wrappedLength)
-        #expect(Data(wrapped.wrapped.prefix(32)) == Data(SHA256.hash(data: publicKey)))
+        #expect(Data(wrapped.wrapped.prefix(32)) == fingerprint)
         #expect(wrapped.wrapped[32] == 0x02)
         let unwrapped = Self.unwrap(wrapped.wrapped, service: service)
         #expect(unwrapped.status == 0)
@@ -697,7 +697,8 @@ struct HkdfGuardNativeMacOSWrapUnwrapTests {
         defer { Self.deleteKEK(service: service) }
         let item = try #require(encodeKeychainKEK(.mlkem1024(
             blob: Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) }),
-            encapsulated: Data(repeating: 0x5A, count: 1568))))
+            encapsulated: Data(repeating: 0x5A, count: 1568),
+            classicalBlob: Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) })), fingerprint: Data(repeating: 0x11, count: 32)))
         var attributes = Self.keychainQuery(service: service)
         attributes[kSecValueData as String] = item
         #expect(SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess)
@@ -1623,7 +1624,15 @@ struct HkdfGuardCrossPlatformABITests {
     /// The functions only this platform exports, as its header documents.
     static let macOnlyFunctions: Set<String> = ["hkdfguard_keychain_mode", "hkdfguard_machine_policy", "hkdfguard_kek_suite"]
     /// The Linux functions this platform doesn't export, as its header documents.
-    static let linuxOnlyFunctions: Set<String> = ["hkdfguard_security_model", "hkdfguard_key_file_principal_trusted"]
+    static let linuxOnlyFunctions: Set<String> = [
+        "hkdfguard_security_model", "hkdfguard_key_file_principal_trusted",
+    ]
+    /// Linux's secret wrapping, not implemented here yet. It is on a Linux feature branch
+    /// and not yet on its main, so the Linux header may or may not declare it; when it
+    /// does, these are the only other functions allowed to be Linux-only.
+    static let linuxOnlyIfPresentFunctions: Set<String> = [
+        "hkdfguard_wrap_secret", "hkdfguard_unwrap_secret", "hkdfguard_open_secret_file",
+    ]
 
     static func read(_ url: URL) throws -> String {
         try String(contentsOf: url, encoding: .utf8)
@@ -1712,8 +1721,8 @@ struct HkdfGuardCrossPlatformABITests {
         let mac = Self.functions(in: try Self.read(Self.macHeader))
         #expect(linux.count >= 8, "parsed too few functions from the Linux header: \(linux.sorted())")
 
-        let missing = linux.subtracting(mac)
-        #expect(missing == Self.linuxOnlyFunctions, "Linux-only functions are \(missing.sorted()); the headers document \(Self.linuxOnlyFunctions.sorted())")
+        let missing = linux.subtracting(mac).subtracting(Self.linuxOnlyIfPresentFunctions)
+        #expect(missing == Self.linuxOnlyFunctions, "Linux-only functions are \(missing.sorted()); the headers document \(Self.linuxOnlyFunctions.sorted()), plus optionally \(Self.linuxOnlyIfPresentFunctions.sorted())")
         let extra = mac.subtracting(linux)
         #expect(extra == Self.macOnlyFunctions, "macOS-only functions are \(extra.sorted()); the headers document \(Self.macOnlyFunctions.sorted())")
     }
@@ -2089,7 +2098,8 @@ struct HkdfGuardMLKEMKEKTests {
     private static func softwareKEK() throws -> (kek: KEMKEK, key: MLKEM1024.PrivateKey) {
         let key = try MLKEM1024.PrivateKey()
         let encapsulation = try key.publicKey.encapsulate()
-        return (KEMKEK(key: key, publicKey: key.publicKey.rawRepresentation, encapsulated: encapsulation.encapsulated), key)
+        return (KEMKEK(key: key, publicKey: key.publicKey.rawRepresentation, encapsulated: encapsulation.encapsulated,
+                       classical: P256.KeyAgreement.PrivateKey()), key)
     }
 
     private static func seal(_ dek: [UInt8], _ kek: KEK) -> (status: Int32, payload: Data?) {
@@ -2098,32 +2108,83 @@ struct HkdfGuardMLKEMKEKTests {
 
     @Test func theKeychainItemFormatKeepsP256BareAndBoxesMLKEM() throws {
         // P-256 items stay exactly what they always were, so existing KEKs
-        // keep loading; ML-KEM items carry their ciphertext in a container.
+        // keep loading; ML-KEM items carry their ciphertext, and the
+        // fingerprint that covers it, in a container.
         let blob = Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) })
         let ciphertext = Data(repeating: 0x5A, count: 1568)
+        let fingerprint = Data((0..<32).map { UInt8($0 + 1) })
         #expect(encodeKeychainKEK(.p256(blob: blob)) == blob)
-        #expect(decodeKeychainKEK(blob) == .p256(blob: blob))
+        #expect(decodeKeychainKEK(blob) == KeychainKEK(stored: .p256(blob: blob), fingerprint: nil))
 
-        let boxed = try #require(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: ciphertext)))
-        #expect(boxed.prefix(6) == Data("HKGQ".utf8) + [0x01, 0x02])
-        #expect(boxed.count == 8 + blob.count + 1568)
-        #expect(decodeKeychainKEK(boxed) == .mlkem1024(blob: blob, encapsulated: ciphertext))
+        let classical = Data([0x04, 0x82] + (0..<150).map { UInt8(($0 * 3) & 0xFF) })
+        let hybrid = StoredKEK.mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: classical)
+        let boxed = try #require(encodeKeychainKEK(hybrid, fingerprint: fingerprint))
+        #expect(boxed.prefix(6) == Data("HKGQ".utf8) + [0x03, 0x02])
+        #expect(boxed.dropFirst(6).prefix(32) == fingerprint)
+        #expect(boxed.count == 40 + blob.count + 1568 + 2 + classical.count)
+        #expect(decodeKeychainKEK(boxed) == KeychainKEK(stored: hybrid, fingerprint: fingerprint))
 
         func set(_ index: Int, _ value: UInt8) -> Data {
             var bytes = [UInt8](boxed)
             bytes[index] = value
             return Data(bytes)
         }
-        #expect(decodeKeychainKEK(set(4, 0x02)) == nil, "format version")
+        #expect(decodeKeychainKEK(set(4, 0x02)) == nil, "format 2, an ML-KEM-only KEK, is no longer read")
+        #expect(decodeKeychainKEK(set(40 + blob.count + 1568 + 1, 0x00)) == nil, "P-256 blob length")
         #expect(decodeKeychainKEK(set(5, 0x01)) == nil, "suite")
-        #expect(decodeKeychainKEK(set(7, 0x00)) == nil, "blob length")
+        #expect(decodeKeychainKEK(set(39, 0x00)) == nil, "blob length")
         #expect(decodeKeychainKEK(boxed.dropLast()) == nil, "truncated")
         #expect(decodeKeychainKEK(boxed + Data([0])) == nil, "trailing bytes")
         #expect(decodeKeychainKEK(Data("HKGQ".utf8)) == nil, "magic alone")
 
         #expect(encodeKeychainKEK(.p256(blob: Data("HKGQ".utf8) + blob)) == nil, "a P-256 blob that would read as a container")
-        #expect(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast())) == nil)
-        #expect(encodeKeychainKEK(.mlkem1024(blob: Data(), encapsulated: ciphertext)) == nil)
+        #expect(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: ciphertext.dropLast(), classicalBlob: classical), fingerprint: fingerprint) == nil)
+        #expect(encodeKeychainKEK(.mlkem1024(blob: Data(), encapsulated: ciphertext, classicalBlob: classical), fingerprint: fingerprint) == nil)
+        #expect(encodeKeychainKEK(.mlkem1024(blob: blob, encapsulated: ciphertext, classicalBlob: Data()), fingerprint: fingerprint) == nil, "suite 0x02 needs its P-256 key")
+        #expect(encodeKeychainKEK(hybrid) == nil, "an ML-KEM item records its fingerprint")
+        #expect(encodeKeychainKEK(hybrid, fingerprint: fingerprint.dropLast()) == nil)
+    }
+
+    @available(macOS 26.0, *)
+    @Test(.enabled(if: SecureEnclave.isAvailable, "needs a Secure Enclave"))
+    func anItemWhoseCiphertextIsNotTheOneItsFingerprintCoversIsCorrupt() throws {
+        // Decapsulating a damaged ciphertext succeeds, with another secret;
+        // the recorded fingerprint is what shows the KEK is no longer itself.
+        let access = try #require(SecAccessControlCreateWithFlags(
+            nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], nil))
+        let (kem, stored) = try #require(newMLKEM1024KEK(accessControl: access))
+        guard case .mlkem1024(let blob, _, let classicalBlob) = stored else {
+            Issue.record("a suite 0x02 KEK is stored as one"); return
+        }
+        let sound = try #require(encodeKeychainKEK(stored, fingerprint: kem.fingerprint))
+        guard case .key(let kek) = reconstructKEK(sound, enclaveIsUsable: { true }) else {
+            Issue.record("a sound item loads"); return
+        }
+        #expect(kek.fingerprint == kem.fingerprint)
+
+        var damaged = sound
+        damaged[40 + blob.count + 1567] ^= 0x01 // the ciphertext's last byte
+        var probed = false
+        guard case .corrupt = reconstructKEK(damaged, enclaveIsUsable: { probed = true; return false }) else {
+            Issue.record("a damaged ciphertext makes the item corrupt"); return
+        }
+        #expect(!probed, "the key loaded, so no keybag state explains the mismatch")
+
+        var misrecorded = sound
+        misrecorded[6] ^= 0x01 // the recorded fingerprint's first byte
+        guard case .corrupt = reconstructKEK(misrecorded, enclaveIsUsable: { true }) else {
+            Issue.record("a damaged fingerprint makes the item corrupt"); return
+        }
+
+        // Another P-256 key in the item: both keys load, but the KEK is not
+        // the one recorded.
+        let stranger = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access).dataRepresentation
+        let swapped = try #require(encodeKeychainKEK(
+            .mlkem1024(blob: blob, encapsulated: kem.encapsulated, classicalBlob: stranger), fingerprint: kem.fingerprint))
+        #expect(classicalBlob != stranger)
+        guard case .corrupt = reconstructKEK(swapped, enclaveIsUsable: { true }) else {
+            Issue.record("a swapped P-256 key makes the item corrupt"); return
+        }
     }
 
     @Test func aMalformedContainerIsCorruptWithoutProbingTheEnclave() {
@@ -2142,7 +2203,8 @@ struct HkdfGuardMLKEMKEKTests {
     @Test func anMLKEMKEKIsRefusedNeverCorruptWithoutMLKEM() throws {
         let item = try #require(encodeKeychainKEK(.mlkem1024(
             blob: Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) }),
-            encapsulated: Data(repeating: 0x5A, count: mlkem1024CiphertextLength))))
+            encapsulated: Data(repeating: 0x5A, count: mlkem1024CiphertextLength),
+            classicalBlob: Data([0x04, 0x82] + (0..<200).map { UInt8($0 & 0xFF) })), fingerprint: Data(repeating: 0x11, count: 32)))
         let check = {
             var probed = false
             guard case .enclaveRefused = reconstructKEK(item, enclaveIsUsable: { probed = true; return true }) else {
@@ -2169,8 +2231,9 @@ struct HkdfGuardMLKEMKEKTests {
         #expect(sealed.status == 0)
         let payload = try #require(sealed.payload)
         #expect(payload.count == 125)
-        #expect(payload.prefix(32) == Data(SHA256.hash(data: kem.publicKey)))
-        #expect(kek.fingerprint == Data(SHA256.hash(data: kem.publicKey)))
+        // The fingerprint covers both public keys and the stored ciphertext.
+        #expect(payload.prefix(32) == Data(SHA256.hash(data: kem.publicKey + kem.encapsulated + kem.classical.publicKey.x963Representation)))
+        #expect(kek.fingerprint == Data(SHA256.hash(data: kem.publicKey + kem.encapsulated + kem.classical.publicKey.x963Representation)))
         #expect(payload[32] == 0x02)
 
         let opened = openPayload(payload, kek: kek, service: Self.service)
@@ -2179,21 +2242,31 @@ struct HkdfGuardMLKEMKEKTests {
     }
 
     @available(macOS 26.0, *)
-    @Test func theWrappingKeyIsHKDFOverTheDecapsulatedSecret() throws {
-        // The construction, rebuilt independently: K = decapsulate(c), then
-        // HKDF-SHA512 with the payload salt and the usual `info`, then
-        // AES-256-GCM over the header -- a payload sealed this way opens.
+    @Test func theWrappingKeyChainsTheKeyAgreementAndTheDecapsulatedSecret() throws {
+        // The construction, rebuilt independently. The P-256 half, per
+        // payload: ECDH with the point the salt hashes to under suite 2's
+        // own tag, then HKDF-SHA512 (payload salt, the usual `info`) to 64
+        // bytes. Those salt HKDF-SHA512 over K = decapsulate(c), same
+        // `info`. Then AES-256-GCM over the header -- a payload sealed this
+        // way opens.
         let (kem, key) = try Self.softwareKEK()
+        let classical = try #require(kem.classical as? P256.KeyAgreement.PrivateKey)
         let dek = Self.randomDEK()
         let salt = Data((0..<32).map { _ in UInt8.random(in: .min ... .max) })
         let nonceBytes = Data((0..<12).map { _ in UInt8.random(in: .min ... .max) })
-        var header = Data(SHA256.hash(data: kem.publicKey))
+        var header = Data(SHA256.hash(data: kem.publicKey + kem.encapsulated + kem.classical.publicKey.x963Representation))
         header.append(0x02)
         header.append(salt)
         header.append(nonceBytes)
+        let info = wrappingKeyInfo(service: Self.service, header: header)
+        let dst = Data("HkdfGuard-payload-ECDH-point-V01-CS02-with-P256_XMD:SHA-256_SSWU_RO_".utf8)
+        let point = try #require(hashToCurveP256(message: salt, dst: dst))
+        #expect(point.x963Representation != payloadECDHPoint(salt: salt)?.x963Representation, "not suite 1's point for the same salt")
+        let perPayload = try classical.sharedSecretFromKeyAgreement(with: point)
+            .hkdfDerivedSymmetricKey(using: SHA512.self, salt: salt, sharedInfo: info, outputByteCount: 64)
         let aesKey = HKDF<SHA512>.deriveKey(
-            inputKeyMaterial: try key.decapsulate(kem.encapsulated), salt: salt,
-            info: wrappingKeyInfo(service: Self.service, header: header), outputByteCount: 32)
+            inputKeyMaterial: try key.decapsulate(kem.encapsulated),
+            salt: perPayload.withUnsafeBytes { Data($0) }, info: info, outputByteCount: 32)
         let box = try AES.GCM.seal(dek, using: aesKey, nonce: AES.GCM.Nonce(data: nonceBytes), authenticating: header)
 
         let kek = KEK.mlkem1024(kem)
@@ -2201,16 +2274,56 @@ struct HkdfGuardMLKEMKEKTests {
         let opened = openPayload(header + box.ciphertext + box.tag, kek: kek, service: Self.service)
         #expect(opened.status == 0)
         #expect(opened.plaintext.map(Array.init) == dek)
+
+        // K alone -- the secret a memory disclosure could capture once --
+        // is not the key: HKDF over it, as the suite did before it was a
+        // hybrid, opens nothing.
+        let fromKAlone = HKDF<SHA512>.deriveKey(
+            inputKeyMaterial: try key.decapsulate(kem.encapsulated), salt: salt, info: info, outputByteCount: 32)
+        #expect(fromKAlone != aesKey)
+        #expect(throws: (any Error).self) {
+            try AES.GCM.open(box, using: fromKAlone, authenticating: header)
+        }
+    }
+
+    @available(macOS 26.0, *)
+    @Test func neitherHalfOfTheKEKOpensAPayloadWithoutTheOther() throws {
+        // The same ML-KEM key and ciphertext (so the same K) with another
+        // P-256 key, and the same P-256 key with another ML-KEM key: each
+        // is another KEK by fingerprint, and with the fingerprint forged to
+        // match, each still fails the tag.
+        let (kem, key) = try Self.softwareKEK()
+        let payload = try #require(Self.seal(Self.randomDEK(), .mlkem1024(kem)).payload)
+
+        let otherClassical = KEMKEK(key: key, publicKey: kem.publicKey, encapsulated: kem.encapsulated,
+                                    classical: P256.KeyAgreement.PrivateKey())
+        let (unrelated, _) = try Self.softwareKEK()
+        let otherKEM = KEMKEK(key: unrelated.key, publicKey: unrelated.publicKey, encapsulated: unrelated.encapsulated,
+                              classical: kem.classical)
+        for other in [otherClassical, otherKEM] {
+            #expect(other.fingerprint != kem.fingerprint)
+            #expect(openPayload(payload, kek: .mlkem1024(other), service: Self.service).status == -16)
+            let forged = other.fingerprint + payload.dropFirst(32)
+            #expect(openPayload(forged, kek: .mlkem1024(other), service: Self.service).status == -11)
+        }
     }
 
     @available(macOS 26.0, *)
     @Test func theSameKeyWithAnotherCiphertextCantOpenThePayload() throws {
         // The stored ciphertext is part of the KEK: the same enclave key with
-        // a different one has the same fingerprint, but a different K.
+        // a different one has a different K, and so a different fingerprint
+        // -- refused before any decapsulation.
         let (kem, key) = try Self.softwareKEK()
-        let other = KEMKEK(key: key, publicKey: kem.publicKey, encapsulated: try key.publicKey.encapsulate().encapsulated)
+        let other = KEMKEK(key: key, publicKey: kem.publicKey, encapsulated: try key.publicKey.encapsulate().encapsulated,
+                           classical: kem.classical)
+        #expect(KEK.mlkem1024(other).fingerprint != KEK.mlkem1024(kem).fingerprint)
         let payload = try #require(Self.seal(Self.randomDEK(), .mlkem1024(kem)).payload)
-        #expect(openPayload(payload, kek: .mlkem1024(other), service: Self.service).status == -11)
+        #expect(openPayload(payload, kek: .mlkem1024(other), service: Self.service).status == -16)
+
+        // And were the fingerprint forged to match, the other K still fails
+        // the tag.
+        let forged = other.fingerprint + payload.dropFirst(32)
+        #expect(openPayload(forged, kek: .mlkem1024(other), service: Self.service).status == -11)
     }
 
     @available(macOS 26.0, *)
@@ -2241,18 +2354,27 @@ struct HkdfGuardMLKEMKEKTests {
     func anEnclaveKEKSurvivesItsBlobAndOpensWhatItSealed() throws {
         let access = try #require(SecAccessControlCreateWithFlags(
             nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], nil))
-        let (kem, blob) = try #require(newMLKEM1024KEK(accessControl: access))
+        let (kem, stored) = try #require(newMLKEM1024KEK(accessControl: access))
+        guard case .mlkem1024(let blob, _, let classicalBlob) = stored else {
+            Issue.record("a suite 0x02 KEK is stored as one"); return
+        }
         let dek = Self.randomDEK()
         let payload = try #require(Self.seal(dek, .mlkem1024(kem)).payload)
 
-        // Rebuilt the way a stored KEK will be: blob plus ciphertext.
-        let reloaded = try #require(reconstructMLKEM1024KEK(blob: blob, encapsulated: kem.encapsulated))
+        // Rebuilt the way a stored KEK will be: both blobs plus ciphertext.
+        let reloaded = try #require(reconstructMLKEM1024KEK(blob: blob, encapsulated: kem.encapsulated, classicalBlob: classicalBlob))
+        #expect(reloaded.fingerprint == kem.fingerprint)
         #expect(reloaded.publicKey == kem.publicKey)
         let opened = openPayload(payload, kek: .mlkem1024(reloaded), service: Self.service)
         #expect(opened.status == 0)
         #expect(opened.plaintext.map(Array.init) == dek)
 
-        #expect(reconstructMLKEM1024KEK(blob: blob, encapsulated: kem.encapsulated.prefix(100)) == nil)
-        #expect(reconstructMLKEM1024KEK(blob: Data((0..<48).map { UInt8($0) }), encapsulated: kem.encapsulated) == nil)
+        #expect(reconstructMLKEM1024KEK(blob: blob, encapsulated: kem.encapsulated.prefix(100), classicalBlob: classicalBlob) == nil)
+        #expect(reconstructMLKEM1024KEK(blob: Data((0..<48).map { UInt8($0) }), encapsulated: kem.encapsulated, classicalBlob: classicalBlob) == nil)
+        #expect(reconstructMLKEM1024KEK(blob: blob, encapsulated: kem.encapsulated, classicalBlob: Data((0..<48).map { UInt8($0) })) == nil)
     }
 }
+
+/// Lets the suite 0x02 tests stand a software P-256 key in for the Secure
+/// Enclave's, as they do a software ML-KEM key.
+extension P256.KeyAgreement.PrivateKey: KeyAgreementKey {}

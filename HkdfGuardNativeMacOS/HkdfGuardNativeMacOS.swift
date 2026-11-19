@@ -27,8 +27,9 @@ enum KEKSuite: UInt8 {
     /// ECDH(P-256 KEK, hashed per-payload point) -> HKDF-SHA512 ->
     /// AES-256-GCM, the Linux and Windows libraries' construction.
     case p256HashedPoint = 0x01
-    /// ML-KEM-1024 decapsulation of the ciphertext stored with the KEK ->
-    /// HKDF-SHA512 -> AES-256-GCM (see `KEMKEK`).
+    /// A hybrid: ECDH(the KEK's P-256 key, hashed per-payload point) and
+    /// the ML-KEM-1024 decapsulation of the ciphertext stored with the KEK,
+    /// both -> HKDF-SHA512 -> AES-256-GCM (see `KEMKEK`).
     case mlkem1024StoredCiphertext = 0x02
 }
 private let hkdfguardSuiteIdLength = 1
@@ -68,6 +69,9 @@ private let hkdfguardCiphertextLength = hkdfguardDekLength + hkdfguardGCMTagLeng
 /// implementations reviewable as one design.
 private let hkdfguardHKDFInfoPrefix = Data("hkdfguard-wrap-v1:".utf8)
 private let hkdfguardPayloadPointDST = Data("HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_".utf8)
+/// Suite 0x02's tag for the same hash: its own, so the two suites never ask
+/// a key for the same point.
+private let hkdfguardPayloadPointDSTSuite2 = Data("HkdfGuard-payload-ECDH-point-V01-CS02-with-P256_XMD:SHA-256_SSWU_RO_".utf8)
 
 /// HKDF `info` for one payload: prefix || len(service) as u16 little-endian
 /// || service || header. The length prefix keeps the concatenation
@@ -99,8 +103,11 @@ func wrappingKeyInfo(service: String, header: Data) -> Data { // internal: the f
 ///
 /// Nil only if the hash lands on the point at infinity (probability about
 /// 2^-256), which must never be handed to ECDH.
-func payloadECDHPoint(salt: Data) -> P256.KeyAgreement.PublicKey? {
-    hashToCurveP256(message: salt, dst: hkdfguardPayloadPointDST)
+func payloadECDHPoint(salt: Data, suite: KEKSuite = .p256HashedPoint) -> P256.KeyAgreement.PublicKey? {
+    switch suite {
+    case .p256HashedPoint: return hashToCurveP256(message: salt, dst: hkdfguardPayloadPointDST)
+    case .mlkem1024StoredCiphertext: return hashToCurveP256(message: salt, dst: hkdfguardPayloadPointDSTSuite2)
+    }
 }
 
 /// RFC 9380 section 3 `hash_to_curve` for `P256_XMD:SHA-256_SSWU_RO_`:
@@ -371,24 +378,64 @@ enum P256Field {
 let mlkem1024PublicKeyLength = 1568
 let mlkem1024CiphertextLength = 1568
 
-/// An ML-KEM KEK: the Secure Enclave key, and the ciphertext encapsulated to
-/// it once, at provisioning. Decapsulating that ciphertext is the only way
-/// back to the secret `K` every payload's key is derived from, and it takes
-/// the enclave: the public key and the ciphertext together don't give `K`,
-/// to a classical or a quantum attacker, so neither needs to stay secret.
+/// A P-256 key that can do a key agreement: a Secure Enclave key in
+/// production, a software one in tests.
+protocol KeyAgreementKey {
+    var publicKey: P256.KeyAgreement.PublicKey { get }
+    func sharedSecretFromKeyAgreement(with publicKeyShare: P256.KeyAgreement.PublicKey) throws -> SharedSecret
+}
+extension SecureEnclave.P256.KeyAgreement.PrivateKey: KeyAgreementKey {}
+
+/// A suite 0x02 KEK, a hybrid of two Secure Enclave keys:
 ///
-/// `K` is one secret per KEK, not one per payload as the P-256 suite's
-/// shared secret is: capturing it from memory opens every payload under
-/// this KEK, and lets its holder create new ones, until the KEK is retired.
-/// That is the price of keeping the payload at 125 bytes.
+/// - an ML-KEM-1024 key, and the ciphertext encapsulated to it once, at
+///   provisioning. Decapsulating that ciphertext is the only way back to
+///   the secret `K`, and it takes the enclave: the public key and the
+///   ciphertext together don't give `K`, to a classical or a quantum
+///   attacker, so neither needs to stay secret.
+/// - a P-256 key (`classical`), used exactly as suite 0x01 uses its KEK:
+///   one key agreement per payload, with a point hashed from the payload's
+///   salt.
 ///
-/// `key` is any `KEMPrivateKey` so tests can use a software ML-KEM key;
-/// production keys are always `SecureEnclave.MLKEM1024.PrivateKey`.
+/// Every payload's key is derived from both (see `KEK.wrappingKey`). `K` is
+/// one secret per KEK -- that is what keeps the payload at 125 bytes -- so
+/// on its own, capturing it from memory once would open every payload
+/// under the KEK and let its holder mint new ones, offline, for good. The
+/// P-256 half is what prevents that: its secret is per payload and takes
+/// the enclave each time, so a captured `K` opens nothing without this
+/// Mac's enclave, as with suite 0x01. The ML-KEM half is what a quantum
+/// attacker, who can recover the P-256 private key from its public key,
+/// still can't get past.
+///
+/// The ciphertext is part of the KEK's identity: the same enclave keys with
+/// another ciphertext have another `K`. The fingerprint covers both public
+/// keys and the ciphertext, so one that was swapped or damaged in storage
+/// shows up as a different KEK -- to a payload's fingerprint check, to an
+/// operator's recorded fingerprint, and to the fingerprint the store
+/// records -- rather than as a KEK of the same name that quietly derives
+/// other keys. (ML-KEM decapsulation never fails on a wrong ciphertext; it
+/// returns a different secret.) The fingerprint is in every payload's
+/// header, so all three are bound into each payload's key and tag.
+///
+/// `key` and `classical` are protocol types so tests can use software
+/// keys; production keys are always the Secure Enclave's.
 struct KEMKEK {
     let key: any KEMPrivateKey
     /// The ML-KEM-1024 encapsulation key, raw; only ever fingerprinted.
     let publicKey: Data
     let encapsulated: Data
+    let classical: any KeyAgreementKey
+
+    /// SHA-256 of the ML-KEM public key, the stored ciphertext, and the
+    /// P-256 public key (uncompressed x963). All three are fixed-length
+    /// (1568, 1568, 65), so the split is unambiguous.
+    var fingerprint: Data {
+        var hash = SHA256()
+        hash.update(data: publicKey)
+        hash.update(data: encapsulated)
+        hash.update(data: classical.publicKey.x963Representation)
+        return Data(hash.finalize())
+    }
 }
 
 /// A service's KEK, whichever suite it is.
@@ -405,24 +452,29 @@ enum KEK {
     }
 
     /// The fingerprint at the front of every payload: SHA-256 of the public
-    /// key (see `kekFingerprint`). An ML-KEM key is 1568 bytes and a P-256
-    /// one 65, so the two kinds can't produce the same fingerprint.
+    /// key (see `kekFingerprint`) or, for suite 0x02, of both public keys
+    /// and the stored ciphertext (see `KEMKEK`). The suite 0x02 input is
+    /// 3201 bytes and the P-256 one 65, so the two kinds can't produce the
+    /// same fingerprint.
     var fingerprint: Data {
         switch self {
         case .p256(let key): return kekFingerprint(key.publicKey)
-        case .mlkem1024(let kem): return Data(SHA256.hash(data: kem.publicKey))
+        case .mlkem1024(let kem): return kem.fingerprint
         }
     }
 
     /// The AES-256 wrapping key for one payload: HKDF-SHA512 (salt = the
     /// payload salt, `info` = `wrappingKeyInfo`) over a secret only the
     /// Secure Enclave can compute -- `ECDH(KEK_priv, payloadECDHPoint(salt))`
-    /// for P-256, the decapsulated `K` for ML-KEM. The P-256 shared secret
-    /// stays inside CryptoKit's `SharedSecret`, and `K` inside a
-    /// `SymmetricKey`; neither becomes a buffer here. The header holds the
-    /// suite byte, so the two suites' keys are separated through `info`.
-    /// Throws if the enclave refuses (CRYPTO_ERROR); nil only if the salt
-    /// hashes to the point at infinity.
+    /// for P-256. Suite 0x02 chains two: that same per-payload derivation
+    /// from its P-256 key gives 64 bytes, which then salt HKDF-SHA512 over
+    /// the decapsulated `K` (same `info`). HKDF-Extract is HMAC keyed by
+    /// its salt, so the result is secret while either input is -- the
+    /// combination TLS 1.3's key schedule uses. The shared secrets stay
+    /// inside CryptoKit's `SharedSecret` and `SymmetricKey`; none becomes a
+    /// buffer here. The header holds the suite byte, so the two suites'
+    /// keys are separated through `info`. Throws if the enclave refuses
+    /// (CRYPTO_ERROR); nil only if the salt hashes to the point at infinity.
     func wrappingKey(service: String, header: Data) throws -> SymmetricKey? {
         let salt = header[hkdfguardSaltOffset..<hkdfguardNonceOffset]
         let info = wrappingKeyInfo(service: service, header: header)
@@ -434,40 +486,51 @@ enum KEK {
             let shared = try key.sharedSecretFromKeyAgreement(with: point)
             return shared.hkdfDerivedSymmetricKey(using: SHA512.self, salt: salt, sharedInfo: info, outputByteCount: 32)
         case .mlkem1024(let kem):
+            guard let point = payloadECDHPoint(salt: Data(salt), suite: .mlkem1024StoredCiphertext) else {
+                return nil
+            }
+            let shared = try kem.classical.sharedSecretFromKeyAgreement(with: point)
+            let perPayload = shared.hkdfDerivedSymmetricKey(using: SHA512.self, salt: salt, sharedInfo: info, outputByteCount: 64)
             let secret = try kem.key.decapsulate(kem.encapsulated)
-            return HKDF<SHA512>.deriveKey(inputKeyMaterial: secret, salt: salt, info: info, outputByteCount: 32)
+            return perPayload.withUnsafeBytes { perPayloadBytes in
+                HKDF<SHA512>.deriveKey(inputKeyMaterial: secret, salt: perPayloadBytes, info: info, outputByteCount: 32)
+            }
         }
     }
 }
 
-/// Generates an ML-KEM-1024 KEK in the Secure Enclave under `access`, and
-/// encapsulates to it once. Returns it with the enclave blob to store; nil
-/// if the enclave refuses, or if decapsulating doesn't give back the secret
-/// just encapsulated. The secret itself is dropped here (best effort:
-/// CryptoKit's `SymmetricKey` can't be zeroed), so from now on only the
-/// enclave can recover it.
+/// Generates a suite 0x02 KEK in the Secure Enclave under `access`: an
+/// ML-KEM-1024 key, encapsulated to once, and a P-256 key. Returns it with
+/// what to store; nil if the enclave refuses, or if decapsulating doesn't
+/// give back the secret just encapsulated. The secret itself is dropped
+/// here (best effort: CryptoKit's `SymmetricKey` can't be zeroed), so from
+/// now on only the enclave can recover it.
 @available(macOS 26.0, *)
-func newMLKEM1024KEK(accessControl access: SecAccessControl) -> (kek: KEMKEK, blob: Data)? {
+func newMLKEM1024KEK(accessControl access: SecAccessControl) -> (kek: KEMKEK, stored: StoredKEK)? {
     guard let key = try? SecureEnclave.MLKEM1024.PrivateKey(accessControl: access),
           let encapsulation = try? key.publicKey.encapsulate(),
           encapsulation.encapsulated.count == mlkem1024CiphertextLength,
-          (try? key.decapsulate(encapsulation.encapsulated)) == encapsulation.sharedSecret else {
+          (try? key.decapsulate(encapsulation.encapsulated)) == encapsulation.sharedSecret,
+          let classical = try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: access) else {
         return nil
     }
-    let kek = KEMKEK(key: key, publicKey: key.publicKey.rawRepresentation, encapsulated: encapsulation.encapsulated)
-    return (kek, key.dataRepresentation)
+    let kek = KEMKEK(key: key, publicKey: key.publicKey.rawRepresentation,
+                     encapsulated: encapsulation.encapsulated, classical: classical)
+    return (kek, .mlkem1024(blob: key.dataRepresentation, encapsulated: encapsulation.encapsulated,
+                            classicalBlob: classical.dataRepresentation))
 }
 
-/// Rebuilds a stored ML-KEM-1024 KEK from its enclave blob and its
-/// ciphertext, or nil if the blob isn't a key the enclave will load or the
-/// ciphertext is the wrong size.
+/// Rebuilds a stored suite 0x02 KEK from its two enclave blobs and its
+/// ciphertext, or nil if either blob isn't a key the enclave will load or
+/// the ciphertext is the wrong size.
 @available(macOS 26.0, *)
-func reconstructMLKEM1024KEK(blob: Data, encapsulated: Data) -> KEMKEK? {
+func reconstructMLKEM1024KEK(blob: Data, encapsulated: Data, classicalBlob: Data) -> KEMKEK? {
     guard encapsulated.count == mlkem1024CiphertextLength,
-          let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob) else {
+          let key = try? SecureEnclave.MLKEM1024.PrivateKey(dataRepresentation: blob),
+          let classical = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: classicalBlob) else {
         return nil
     }
-    return KEMKEK(key: key, publicKey: key.publicKey.rawRepresentation, encapsulated: encapsulated)
+    return KEMKEK(key: key, publicKey: key.publicKey.rawRepresentation, encapsulated: encapsulated, classical: classical)
 }
 
 private func randomBytes(_ count: Int) -> Data? {
@@ -943,9 +1006,28 @@ private enum KEKLookup {
     case failed(OSStatus)
 }
 
+private let keychainLog = Logger(subsystem: "com.hkdfguard", category: "keychain")
+
 /// Looks up the persisted Secure Enclave key's opaque data representation
 /// in the keychain, under the caller-supplied service identifier.
 private func loadKEKDataRepresentation(service: String, mode: KeychainMode) -> KEKLookup {
+    // In legacy mode the search list spans more than one keychain (login
+    // and System, plus any the user added), so the same service can have a
+    // KEK item in each, and a first-match lookup would quietly take
+    // whichever comes first. More than one is refused instead: nothing
+    // says which is the service's KEK. (The data-protection keychain holds
+    // at most one item per service and account.)
+    if case .legacy = mode {
+        var count = keychainItemAttributes(service: service, mode: mode)
+        count[kSecMatchLimit as String] = kSecMatchLimitAll
+        count[kSecReturnPersistentRef as String] = true
+        var found: CFTypeRef?
+        if SecItemCopyMatching(count as CFDictionary, &found) == errSecSuccess,
+           let refs = found as? [Data], refs.count > 1 {
+            keychainLog.error("\(service, privacy: .public): \(refs.count) keychains in the search list hold a KEK item for this service; refusing to choose one. Remove the stray ones (`security find-generic-password -s \(service, privacy: .public) -a \(hkdfguardKeychainAccount, privacy: .public)` shows each)")
+            return .failed(errSecDuplicateItem)
+        }
+    }
     var query = keychainItemAttributes(service: service, mode: mode)
     query[kSecReturnData as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -965,43 +1047,80 @@ private func loadKEKDataRepresentation(service: String, mode: KeychainMode) -> K
     }
 }
 
-/// A KEK as stored: its Secure Enclave blob, plus, for ML-KEM, the
-/// ciphertext encapsulated to it at provisioning (see `KEMKEK`).
+/// A KEK as stored: its Secure Enclave blob, plus, for suite 0x02, the
+/// ciphertext encapsulated to it at provisioning and its P-256 key's blob
+/// (see `KEMKEK`).
 enum StoredKEK: Equatable {
     case p256(blob: Data)
-    case mlkem1024(blob: Data, encapsulated: Data)
+    case mlkem1024(blob: Data, encapsulated: Data, classicalBlob: Data)
+
+    /// Zeroes the enclave blobs: they are the credential.
+    fileprivate mutating func zeroBlobs() {
+        switch self {
+        case .p256(var blob):
+            secureZero(&blob)
+            self = .p256(blob: blob)
+        case .mlkem1024(var blob, let encapsulated, var classicalBlob):
+            secureZero(&blob)
+            secureZero(&classicalBlob)
+            self = .mlkem1024(blob: blob, encapsulated: encapsulated, classicalBlob: classicalBlob)
+        }
+    }
 }
 
 // A user-scoped KEK's keychain item data. A P-256 KEK's is its bare Secure
 // Enclave blob, as it always has been. An ML-KEM KEK's is a container:
-// magic "HKGQ", format 1, the suite byte (0x02), the blob length-prefixed
-// (big-endian u16), then the 1568-byte ciphertext. Secure Enclave blobs
-// begin 0x04 0x82 (a DER octet string), so no P-256 item starts with the
-// magic. The CLI's `retire` reads this format too (`storedKEKCheck`
-// in main.swift).
+// magic "HKGQ", format 3, the suite byte (0x02), the KEK's 32-byte
+// fingerprint, the ML-KEM blob length-prefixed (big-endian u16), the
+// 1568-byte ciphertext, then the P-256 blob length-prefixed. Secure
+// Enclave blobs begin 0x04 0x82 (a DER octet
+// string), so no P-256 item starts with the magic. The CLI's `retire`
+// reads this format too (`storedKEKCheck` in main.swift).
+//
+// The fingerprint is recorded because it covers the ciphertext (see
+// `KEMKEK`), and decapsulating a damaged ciphertext doesn't fail: without
+// the record, an item whose ciphertext was damaged would load as a KEK
+// with another fingerprint; with it, the item is corrupt. As in a machine
+// KEK file, this catches damage, not someone who can rewrite the item --
+// they can record a fingerprint to match; the payloads' and the operator's
+// copies of the fingerprint are what catch that.
 private let keychainKEKMagic = Data("HKGQ".utf8)
-private let keychainKEKFormatVersion: UInt8 = 1
-private let keychainKEKHeaderLength = 4 + 1 + 1 + 2
+private let keychainKEKFormatVersion: UInt8 = 3
+private let keychainKEKHeaderLength = 4 + 1 + 1 + hkdfguardFingerprintLength + 2
 
-func encodeKeychainKEK(_ stored: StoredKEK) -> Data? {
+/// A keychain item's KEK, and the fingerprint the item records for it (an
+/// ML-KEM item always does; a P-256 item has nowhere to).
+struct KeychainKEK: Equatable {
+    var stored: StoredKEK
+    var fingerprint: Data?
+}
+
+/// `fingerprint` is the KEK's, required for ML-KEM and unused for P-256.
+func encodeKeychainKEK(_ stored: StoredKEK, fingerprint: Data? = nil) -> Data? {
     switch stored {
     case .p256(let blob):
         guard !blob.isEmpty, !blob.starts(with: keychainKEKMagic) else {
             return nil
         }
         return blob
-    case .mlkem1024(let blob, let encapsulated):
+    case .mlkem1024(let blob, let encapsulated, let classicalBlob):
         guard !blob.isEmpty, blob.count <= Int(UInt16.max),
-              encapsulated.count == mlkem1024CiphertextLength else {
+              !classicalBlob.isEmpty, classicalBlob.count <= Int(UInt16.max),
+              encapsulated.count == mlkem1024CiphertextLength,
+              let fingerprint, fingerprint.count == hkdfguardFingerprintLength else {
             return nil
         }
         var out = keychainKEKMagic
         out.append(keychainKEKFormatVersion)
         out.append(KEKSuite.mlkem1024StoredCiphertext.rawValue)
+        out.append(fingerprint)
         out.append(UInt8(blob.count >> 8))
         out.append(UInt8(blob.count & 0xFF))
         out.append(blob)
         out.append(encapsulated)
+        out.append(UInt8(classicalBlob.count >> 8))
+        out.append(UInt8(classicalBlob.count & 0xFF))
+        out.append(classicalBlob)
         return out
     }
 }
@@ -1009,9 +1128,9 @@ func encodeKeychainKEK(_ stored: StoredKEK) -> Data? {
 /// Nil only for data that has the container's magic but isn't a container
 /// this build understands: corrupt, or from a newer build. Anything else is
 /// taken as a P-256 blob, for the enclave to accept or refuse.
-func decodeKeychainKEK(_ data: Data) -> StoredKEK? {
+func decodeKeychainKEK(_ data: Data) -> KeychainKEK? {
     guard data.starts(with: keychainKEKMagic) else {
-        return .p256(blob: data)
+        return KeychainKEK(stored: .p256(blob: data), fingerprint: nil)
     }
     var bytes = [UInt8](data)
     defer { secureZero(&bytes) }
@@ -1020,12 +1139,21 @@ func decodeKeychainKEK(_ data: Data) -> StoredKEK? {
           bytes[5] == KEKSuite.mlkem1024StoredCiphertext.rawValue else {
         return nil
     }
-    let length = Int(bytes[6]) << 8 | Int(bytes[7])
-    guard length > 0, bytes.count == keychainKEKHeaderLength + length + mlkem1024CiphertextLength else {
+    let length = Int(bytes[keychainKEKHeaderLength - 2]) << 8 | Int(bytes[keychainKEKHeaderLength - 1])
+    let blobEnd = keychainKEKHeaderLength + length
+    let classicalStart = blobEnd + mlkem1024CiphertextLength + 2
+    guard length > 0, bytes.count > classicalStart else {
         return nil
     }
-    let blobEnd = keychainKEKHeaderLength + length
-    return .mlkem1024(blob: Data(bytes[keychainKEKHeaderLength..<blobEnd]), encapsulated: Data(bytes[blobEnd...]))
+    let classicalLength = Int(bytes[classicalStart - 2]) << 8 | Int(bytes[classicalStart - 1])
+    guard classicalLength > 0, bytes.count == classicalStart + classicalLength else {
+        return nil
+    }
+    return KeychainKEK(
+        stored: .mlkem1024(blob: Data(bytes[keychainKEKHeaderLength..<blobEnd]),
+                           encapsulated: Data(bytes[blobEnd..<(classicalStart - 2)]),
+                           classicalBlob: Data(bytes[classicalStart...])),
+        fingerprint: Data(bytes[6..<(6 + hkdfguardFingerprintLength)]))
 }
 
 /// What a stored KEK blob turned out to be.
@@ -1053,10 +1181,16 @@ func reconstructKEK(
     _ data: Data,
     enclaveIsUsable: () -> Bool = secureEnclaveIsUsableNow
 ) -> KEKReconstruction {
-    guard let stored = decodeKeychainKEK(data) else {
+    guard let item = decodeKeychainKEK(data) else {
         return .corrupt // a malformed container: no keybag state explains that
     }
-    return reconstructStoredKEK(stored, enclaveIsUsable: enclaveIsUsable)
+    let result = reconstructStoredKEK(item.stored, enclaveIsUsable: enclaveIsUsable)
+    // The key loaded, but is not the KEK the item records: its ciphertext
+    // (or the record) was damaged. No keybag state explains that either.
+    if case .key(let kek) = result, let recorded = item.fingerprint, kek.fingerprint != recorded {
+        return .corrupt
+    }
+    return result
 }
 
 /// `reconstructKEK` for a KEK already split into its parts -- a keychain
@@ -1070,13 +1204,13 @@ func reconstructStoredKEK(
         if let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob) {
             return .key(.p256(key))
         }
-    case .mlkem1024(let blob, let encapsulated):
+    case .mlkem1024(let blob, let encapsulated, let classicalBlob):
         // Before macOS 26 the enclave has no ML-KEM: the KEK is very likely
         // fine, and must never be reported as corrupt (and so deleted).
         guard !MachineScopeTestOverrides.withoutMLKEM, #available(macOS 26.0, *) else {
             return .enclaveRefused
         }
-        if let kem = reconstructMLKEM1024KEK(blob: blob, encapsulated: encapsulated) {
+        if let kem = reconstructMLKEM1024KEK(blob: blob, encapsulated: encapsulated, classicalBlob: classicalBlob) {
             return .key(.mlkem1024(kem))
         }
     }
@@ -1136,8 +1270,8 @@ func kekExists(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (
     switch kekScope(service: service) {
     case .policyInvalid:
         return (HKDFGuardStatus.policyInvalid.rawValue, false)
-    case .machine:
-        return machineKekExists(service: service)
+    case .machine(let settings):
+        return machineKekExists(service: service, settings: settings)
     case .user:
         break
     }
@@ -1181,7 +1315,7 @@ private func suiteRefusal(_ kek: KEK, _ suites: SuitePolicy, service: String) ->
 private func createMLKEMKEK(
     accessControl access: SecAccessControl,
     service: String
-) -> (status: Int32, created: (kek: KEMKEK, blob: Data)?) {
+) -> (status: Int32, created: (kek: KEMKEK, stored: StoredKEK)?) {
     if !MachineScopeTestOverrides.withoutMLKEM, #available(macOS 26.0, *),
        let created = newMLKEM1024KEK(accessControl: access) {
         return (HKDFGuardStatus.success.rawValue, created)
@@ -1198,6 +1332,10 @@ private func createMLKEMKEK(
 /// below — so a caller that already checked `kekExists` and got `false`
 /// doesn't need to treat a race against another creator as its own error.
 func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> Int32 {
+    withPolicySnapshot { createKEKUnderPolicy(service: service, mode: mode) }
+}
+
+private func createKEKUnderPolicy(service: String, mode: KeychainMode) -> Int32 {
 
     // Validate service identifier.
     guard validServiceName(service: service) else {
@@ -1270,8 +1408,8 @@ func createKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> I
         guard var created = maybeCreated else {
             return createStatus
         }
-        defer { secureZero(&created.blob) }
-        guard let encoded = encodeKeychainKEK(.mlkem1024(blob: created.blob, encapsulated: created.kek.encapsulated)) else {
+        defer { created.stored.zeroBlobs() }
+        guard let encoded = encodeKeychainKEK(created.stored, fingerprint: created.kek.fingerprint) else {
             return HKDFGuardStatus.unexpectedOutputLength.rawValue
         }
         representation = encoded
@@ -1361,8 +1499,8 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
     switch kekScope(service: service) {
     case .policyInvalid:
         return (HKDFGuardStatus.policyInvalid.rawValue, nil)
-    case .machine:
-        return getMachineKEK(service: service)
+    case .machine(let settings):
+        return getMachineKEK(service: service, settings: settings)
     case .user:
         break
     }
@@ -1663,8 +1801,12 @@ func loadPolicyFile(atPath path: String) -> PolicyLoad? {
 
 /// The policy in effect: the managed one if MDM delivered it, else the
 /// local file, else none (development mode). Read on every call, so a
-/// changed profile takes effect without restarting anything.
+/// changed profile takes effect without restarting anything -- but once
+/// per call: inside `withPolicySnapshot` every read gives the same answer.
 func currentMachinePolicy() -> PolicyLoad {
+    if let snapshot = PolicySnapshot.current {
+        return snapshot
+    }
     if let forced = MachineScopeTestOverrides.policy {
         return forced
     }
@@ -1672,6 +1814,21 @@ func currentMachinePolicy() -> PolicyLoad {
         return managed
     }
     return loadPolicyFile(atPath: localPolicyFilePath) ?? .none
+}
+
+private enum PolicySnapshot {
+    @TaskLocal static var current: PolicyLoad?
+}
+
+/// Runs `body` with the policy read once, now: everything `body` asks of
+/// it (the service's scope, its runner group, the suites permitted) comes
+/// from that one read, so a profile replaced mid-call can't leave a call
+/// acting on half of each. Nested uses keep the outermost read.
+func withPolicySnapshot<T>(_ body: () -> T) -> T {
+    guard PolicySnapshot.current == nil else {
+        return body()
+    }
+    return PolicySnapshot.$current.withValue(currentMachinePolicy(), operation: body)
 }
 
 /// Where a service's KEK lives.
@@ -1719,27 +1876,36 @@ func runningInSystemContext() -> Bool {
 // and `retire` -- then the Secure Enclave blob, length-prefixed (big-endian
 // u16).
 //
-// Format 2 (either suite): the suite byte, the KEK's 32-byte fingerprint
+// Format 3 (either suite): the suite byte, the KEK's 32-byte fingerprint
 // (all `status` and `retire` need, without keeping the public key at rest),
-// the blob, length-prefixed, then the stored ciphertext, length-prefixed:
-// 1568 bytes for ML-KEM-1024, none for P-256.
+// then three length-prefixed fields: the blob; the stored ciphertext (1568
+// bytes for suite 0x02, none for P-256); and suite 0x02's P-256 blob (none
+// for P-256). Format 2, an ML-KEM-only KEK from before suite 0x02 became a
+// hybrid, is no longer read.
 //
-// The blob is usable only by this Mac's Secure Enclave, in the system
+// The blobs are usable only by this Mac's Secure Enclave, in the system
 // context.
 private let machineKeyMagic = Data("HKGK".utf8)
 private let machineKeyPublicKeyLength = 65
 private let machineKeyV1HeaderLength = 4 + 1 + 65 + 2
 private let machineKeyV2HeaderLength = 4 + 1 + 1 + 32
-private let machineKeyMaxSize = 8192 // an ML-KEM-1024 file is about 3.4 KB
+private let machineKeyMaxSize = 8192 // a suite 0x02 file is about 3.7 KB
 
 struct MachineKeyFile: Equatable {
     var suite: KEKSuite
-    /// Format 1 only; format 2 keeps just the fingerprint.
+    /// Format 1 only; format 3 keeps just the fingerprint.
     var publicKey: Data?
     var fingerprint: Data
     var blob: Data
-    /// ML-KEM: the stored ciphertext. Empty for P-256.
+    /// Suite 0x02: the stored ciphertext. Empty for P-256.
     var encapsulated: Data
+    /// Suite 0x02: its P-256 key's blob. Empty for P-256.
+    var classicalBlob = Data()
+
+    fileprivate mutating func zeroBlobs() {
+        secureZero(&blob)
+        secureZero(&classicalBlob)
+    }
 
     /// A format 1 file: a P-256 KEK and its public key.
     static func v1(publicKey: Data, blob: Data) -> MachineKeyFile {
@@ -1747,22 +1913,22 @@ struct MachineKeyFile: Equatable {
                        fingerprint: Data(SHA256.hash(data: publicKey)), blob: blob, encapsulated: Data())
     }
 
-    /// A format 2 file.
-    static func v2(_ stored: StoredKEK, fingerprint: Data) -> MachineKeyFile {
+    /// A format 3 file.
+    static func v3(_ stored: StoredKEK, fingerprint: Data) -> MachineKeyFile {
         switch stored {
         case .p256(let blob):
             return MachineKeyFile(suite: .p256HashedPoint, publicKey: nil, fingerprint: fingerprint,
                                   blob: blob, encapsulated: Data())
-        case .mlkem1024(let blob, let encapsulated):
+        case .mlkem1024(let blob, let encapsulated, let classicalBlob):
             return MachineKeyFile(suite: .mlkem1024StoredCiphertext, publicKey: nil, fingerprint: fingerprint,
-                                  blob: blob, encapsulated: encapsulated)
+                                  blob: blob, encapsulated: encapsulated, classicalBlob: classicalBlob)
         }
     }
 
     var stored: StoredKEK {
         switch suite {
         case .p256HashedPoint: return .p256(blob: blob)
-        case .mlkem1024StoredCiphertext: return .mlkem1024(blob: blob, encapsulated: encapsulated)
+        case .mlkem1024StoredCiphertext: return .mlkem1024(blob: blob, encapsulated: encapsulated, classicalBlob: classicalBlob)
         }
     }
 }
@@ -1783,7 +1949,9 @@ private func appendLengthPrefixed(_ field: Data, to out: inout Data) {
 
 func encodeMachineKeyFile(_ file: MachineKeyFile) -> Data? {
     guard !file.blob.isEmpty, file.blob.count <= Int(UInt16.max),
-          file.encapsulated.count == machineKeyCiphertextLength(file.suite) else {
+          file.encapsulated.count == machineKeyCiphertextLength(file.suite),
+          file.classicalBlob.count <= Int(UInt16.max),
+          file.classicalBlob.isEmpty == (file.suite == .p256HashedPoint) else {
         return nil
     }
     var out = machineKeyMagic
@@ -1798,13 +1966,14 @@ func encodeMachineKeyFile(_ file: MachineKeyFile) -> Data? {
         guard file.fingerprint.count == 32 else {
             return nil
         }
-        out.append(2)
+        out.append(3)
         out.append(file.suite.rawValue)
         out.append(file.fingerprint)
     }
     appendLengthPrefixed(file.blob, to: &out)
     if file.publicKey == nil {
         appendLengthPrefixed(file.encapsulated, to: &out)
+        appendLengthPrefixed(file.classicalBlob, to: &out)
     }
     return out.count <= machineKeyMaxSize ? out : nil
 }
@@ -1836,7 +2005,7 @@ func decodeMachineKeyFile(_ data: Data) -> MachineKeyFile? {
             return nil
         }
         return .v1(publicKey: publicKey, blob: Data(bytes[blob]))
-    case 2:
+    case 3:
         guard bytes.count > machineKeyV2HeaderLength, let suite = KEKSuite(rawValue: bytes[5]) else {
             return nil
         }
@@ -1845,13 +2014,15 @@ func decodeMachineKeyFile(_ data: Data) -> MachineKeyFile? {
               let blob = lengthPrefixed(at: machineKeyV2HeaderLength), !blob.isEmpty,
               let encapsulated = lengthPrefixed(at: blob.upperBound),
               encapsulated.count == machineKeyCiphertextLength(suite),
-              encapsulated.upperBound == bytes.count else {
+              let classical = lengthPrefixed(at: encapsulated.upperBound),
+              classical.isEmpty == (suite == .p256HashedPoint),
+              classical.upperBound == bytes.count else {
             return nil
         }
         let stored: StoredKEK = suite == .p256HashedPoint
             ? .p256(blob: Data(bytes[blob]))
-            : .mlkem1024(blob: Data(bytes[blob]), encapsulated: Data(bytes[encapsulated]))
-        return .v2(stored, fingerprint: fingerprint)
+            : .mlkem1024(blob: Data(bytes[blob]), encapsulated: Data(bytes[encapsulated]), classicalBlob: Data(bytes[classical]))
+        return .v3(stored, fingerprint: fingerprint)
     default:
         return nil
     }
@@ -1869,9 +2040,10 @@ private func machineKeyFolder() -> String {
 }
 
 /// Reads a machine KEK file. It must be root's, writable by root alone,
-/// with no access at all for others (its runner group may read it), in
-/// folders only root controls; the reasons are for the log only.
-func readMachineKeyFile(service: String) -> MachineKeyRead {
+/// with no access at all for others, in folders only root controls. Its
+/// group must be the runner group the policy names now (none: no group
+/// access at all). The reasons are for the log only.
+func readMachineKeyFile(service: String, settings: MachineServiceSettings) -> MachineKeyRead {
     let folder = machineKeyFolder()
     let folderFd = open(folder, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard folderFd >= 0 else {
@@ -1907,6 +2079,9 @@ func readMachineKeyFile(service: String) -> MachineKeyRead {
           !aclGrantsOthersAChange(fd: fd, isFolder: false, rootOnly: true) else {
         return .untrusted("the machine KEK file for \(service) is not a root-owned file that only root can change and only its runner group can read")
     }
+    if let problem = machineKeyFileGroupProblem(mode: info.st_mode, gid: info.st_gid, runnerGroup: settings.runnerGroup) {
+        return .untrusted("the machine KEK file for \(service) \(problem)")
+    }
     guard info.st_size <= off_t(machineKeyMaxSize), var bytes = readAll(fd: fd, limit: machineKeyMaxSize) else {
         return .untrusted("the machine KEK file for \(service) is too large, or can't be read")
     }
@@ -1933,7 +2108,7 @@ private func makeMachineAccessControl() -> SecAccessControl? {
 
 /// Whether `key` can do a key agreement now, and gets the answer its
 /// public key predicts.
-private func keyAgreementWorks(_ key: SecureEnclave.P256.KeyAgreement.PrivateKey) -> Bool {
+private func keyAgreementWorks(_ key: any KeyAgreementKey) -> Bool {
     let peer = P256.KeyAgreement.PrivateKey()
     guard let ours = try? key.sharedSecretFromKeyAgreement(with: peer.publicKey),
           let theirs = try? peer.sharedSecretFromKeyAgreement(with: key.publicKey) else {
@@ -1942,12 +2117,12 @@ private func keyAgreementWorks(_ key: SecureEnclave.P256.KeyAgreement.PrivateKey
     return ours == theirs
 }
 
-/// Whether `kek` can do its suite's enclave operation now: a key agreement
-/// for P-256, decapsulating its stored ciphertext for ML-KEM.
+/// Whether `kek` can do its suite's enclave operations now: a key agreement
+/// for P-256; for suite 0x02, that and decapsulating its stored ciphertext.
 private func kekWorks(_ kek: KEK) -> Bool {
     switch kek {
     case .p256(let key): return keyAgreementWorks(key)
-    case .mlkem1024(let kem): return (try? kem.key.decapsulate(kem.encapsulated)) != nil
+    case .mlkem1024(let kem): return (try? kem.key.decapsulate(kem.encapsulated)) != nil && keyAgreementWorks(kem.classical)
     }
 }
 
@@ -1957,10 +2132,10 @@ private func logMachineRefusal(_ service: String, _ reason: String) {
 
 /// Whether the machine KEK file for `service` exists. File-level only --
 /// no Secure Enclave use -- so root can ask from Terminal (`status`).
-func machineKekExists(service: String) -> (status: Int32, exists: Bool) {
-    switch readMachineKeyFile(service: service) {
+func machineKekExists(service: String, settings: MachineServiceSettings) -> (status: Int32, exists: Bool) {
+    switch readMachineKeyFile(service: service, settings: settings) {
     case .found(var file):
-        secureZero(&file.blob)
+        file.zeroBlobs()
         return (HKDFGuardStatus.success.rawValue, true)
     case .notFound:
         return (HKDFGuardStatus.success.rawValue, false)
@@ -1975,10 +2150,10 @@ func machineKekExists(service: String) -> (status: Int32, exists: Bool) {
 
 /// The machine KEK's fingerprint and suite, from its file -- no Secure
 /// Enclave use, so they can be read from anywhere the file can.
-func machineKeySummary(service: String) -> (status: Int32, summary: (fingerprint: Data, suite: KEKSuite)?) {
-    switch readMachineKeyFile(service: service) {
+func machineKeySummary(service: String, settings: MachineServiceSettings) -> (status: Int32, summary: (fingerprint: Data, suite: KEKSuite)?) {
+    switch readMachineKeyFile(service: service, settings: settings) {
     case .found(var file):
-        secureZero(&file.blob)
+        file.zeroBlobs()
         return (HKDFGuardStatus.success.rawValue, (file.fingerprint, file.suite))
     case .notFound:
         return (HKDFGuardStatus.kekNotFound.rawValue, nil)
@@ -1993,12 +2168,12 @@ func machineKeySummary(service: String) -> (status: Int32, summary: (fingerprint
 
 /// Loads the machine KEK for wrap and unwrap: only in the system context,
 /// and only if it is the key its file says.
-func getMachineKEK(service: String) -> (status: Int32, key: KEK?) {
+func getMachineKEK(service: String, settings: MachineServiceSettings) -> (status: Int32, key: KEK?) {
     guard runningInSystemContext() else {
         logMachineRefusal(service, "machine KEKs can only be used by a LaunchDaemon -- not from Terminal, sudo, SSH or a login session")
         return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
     }
-    switch readMachineKeyFile(service: service) {
+    switch readMachineKeyFile(service: service, settings: settings) {
     case .notFound:
         return (HKDFGuardStatus.kekNotFound.rawValue, nil)
     case .accessDenied(let reason):
@@ -2008,7 +2183,7 @@ func getMachineKEK(service: String) -> (status: Int32, key: KEK?) {
         logMachineRefusal(service, reason)
         return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
     case .found(var file):
-        defer { secureZero(&file.blob) }
+        defer { file.zeroBlobs() }
         switch reconstructStoredKEK(file.stored, enclaveIsUsable: { enclaveProbeSucceeds(makeMachineAccessControl()) }) {
         case .key(let kek):
             guard kek.fingerprint == file.fingerprint else {
@@ -2026,10 +2201,123 @@ func getMachineKEK(service: String) -> (status: Int32, key: KEK?) {
 
 /// Groups too broad to read a machine KEK: each covers essentially every
 /// account, every administrator, or everyone allowed to log in remotely.
+/// Matched by name and by resolved gid, so another name for the same group
+/// can't dodge the list.
 private let overBroadRunnerGroups: Set<String> = [
-    "staff", "everyone", "localaccounts", "netaccounts", "authedusers",
+    "wheel", "staff", "everyone", "localaccounts", "netaccounts", "authedusers",
     "interactusers", "consoleusers", "admin", "com.apple.access_ssh",
 ]
+
+enum GroupLookup: Equatable {
+    case found(gid_t)
+    case missing
+    case failed(Int32)
+}
+
+/// A group's gid by name. `getgrnam_r`, not `getgrnam`: a library can't
+/// know what its host's other threads are doing with the shared buffer.
+func lookupGroupID(_ name: String) -> GroupLookup {
+    var size = 16 * 1024
+    while size <= 1024 * 1024 {
+        var entry = group()
+        var result: UnsafeMutablePointer<group>?
+        var buffer = [CChar](repeating: 0, count: size)
+        let rc = getgrnam_r(name, &entry, &buffer, size, &result)
+        if rc == ERANGE {
+            size *= 2 // a large directory group's member list didn't fit
+            continue
+        }
+        guard rc == 0 else {
+            return .failed(rc)
+        }
+        guard let found = result else {
+            return .missing
+        }
+        return .found(found.pointee.gr_gid)
+    }
+    return .failed(ERANGE)
+}
+
+/// Whether root is a member of group `gid`, nested groups included. nil
+/// when the directory can't say.
+private func rootIsMember(ofGroup gid: gid_t) -> Bool? {
+    var userUUID = [UInt8](repeating: 0, count: 16)
+    var groupUUID = [UInt8](repeating: 0, count: 16)
+    var member: Int32 = 0
+    guard mbr_uid_to_uuid(0, &userUUID) == 0,
+          mbr_gid_to_uuid(gid, &groupUUID) == 0,
+          mbr_check_membership(&userUUID, &groupUUID, &member) == 0 else {
+        return nil
+    }
+    return member != 0
+}
+
+enum RunnerGroupResolution: Equatable {
+    case gid(gid_t)
+    case refused(String)
+}
+
+/// The gid a KEK file for `name` is given, or why the group is refused: it
+/// doesn't exist, it is an over-broad group under any name, or it is not a
+/// dedicated one. Fails closed: a group that can't be looked up, or can't
+/// be told apart from an over-broad one, is refused.
+func resolveRunnerGroup(_ name: String) -> RunnerGroupResolution {
+    let tooBroad = "RunnerGroup \(name) is too broad: name a group that holds only this service's accounts"
+    guard !overBroadRunnerGroups.contains(name.lowercased()) else {
+        return .refused(tooBroad)
+    }
+    let gid: gid_t
+    switch lookupGroupID(name) {
+    case .found(let found): gid = found
+    case .missing: return .refused("RunnerGroup \(name) does not name a group on this Mac")
+    case .failed(let code): return .refused("RunnerGroup \(name) could not be looked up (\(String(cString: strerror(code))))")
+    }
+    guard gid != 0 else {
+        return .refused(tooBroad)
+    }
+    for broad in overBroadRunnerGroups.sorted() {
+        switch lookupGroupID(broad) {
+        case .found(gid): return .refused(tooBroad)
+        case .found, .missing: break
+        case .failed(let code):
+            return .refused("RunnerGroup \(name) can't be confirmed not to be the over-broad group \(broad) (\(String(cString: strerror(code))))")
+        }
+    }
+    // Root belongs to every system-wide group (staff, everyone, admin,
+    // ...) and never needs a runner group to read the file, so a group it
+    // is in -- directly, or because one of those is nested inside it --
+    // is not a dedicated one.
+    guard let rootIsIn = rootIsMember(ofGroup: gid) else {
+        return .refused("RunnerGroup \(name)'s membership could not be checked")
+    }
+    guard !rootIsIn else {
+        return .refused("RunnerGroup \(name) has root as a member, so it is not a dedicated group -- usually because a system-wide group (staff, admin, everyone, ...) is nested in it")
+    }
+    return .gid(gid)
+}
+
+/// Why a KEK file with this `mode` and `gid` is not the one `runnerGroup`
+/// (the policy's, now) calls for, or nil if it is. Checked on every read,
+/// so a group the policy no longer names does not go on being served.
+func machineKeyFileGroupProblem(mode: mode_t, gid: gid_t, runnerGroup: String?, lookup: (String) -> GroupLookup = lookupGroupID) -> String? {
+    guard let name = runnerGroup else {
+        return mode & S_IRWXG == 0 ? nil : "has no RunnerGroup in the policy, but its group (gid \(gid)) can read it: `chmod 600` it"
+    }
+    guard !overBroadRunnerGroups.contains(name.lowercased()) else {
+        return "belongs to a RunnerGroup (\(name)) that is too broad"
+    }
+    switch lookup(name) {
+    case .found(let expected):
+        guard expected != 0 else {
+            return "belongs to a RunnerGroup (\(name)) that is too broad"
+        }
+        return gid == expected ? nil : "is group gid \(gid)'s, not the policy's RunnerGroup \(name) (gid \(expected)): `chgrp \(name)` it, and rotate the KEK if the old group should never have had it"
+    case .missing:
+        return "can't be matched to its RunnerGroup: \(name) does not name a group on this Mac"
+    case .failed(let code):
+        return "can't be matched to its RunnerGroup: \(name) could not be looked up (\(String(cString: strerror(code))))"
+    }
+}
 
 /// Opens the machine KEK folder, creating it (root:wheel 0755) if it is
 /// missing. Its parent must already exist -- the package installs it.
@@ -2129,10 +2417,10 @@ private func writeMachineKeyFile(_ bytes: Data, service: String, folderFd: Int32
 
 /// Verifies an existing machine KEK, never replacing one: usable, the key
 /// its file records, and of a suite `suites` permits.
-private func verifyExistingMachineKEK(service: String, suites: SuitePolicy) -> Int32 {
-    switch readMachineKeyFile(service: service) {
+private func verifyExistingMachineKEK(service: String, settings: MachineServiceSettings, suites: SuitePolicy) -> Int32 {
+    switch readMachineKeyFile(service: service, settings: settings) {
     case .found(var file):
-        defer { secureZero(&file.blob) }
+        defer { file.zeroBlobs() }
         guard case .key(let kek) = reconstructStoredKEK(file.stored, enclaveIsUsable: { true }),
               kek.fingerprint == file.fingerprint,
               kekWorks(kek) else {
@@ -2166,18 +2454,16 @@ func createMachineKEK(service: String, settings: MachineServiceSettings, suites:
     }
     var gid: gid_t = 0
     if let name = settings.runnerGroup {
-        guard !overBroadRunnerGroups.contains(name.lowercased()) else {
-            logMachineRefusal(service, "RunnerGroup \(name) is too broad: name a group that holds only this service's accounts")
+        switch resolveRunnerGroup(name) {
+        case .gid(let resolved):
+            gid = resolved
+        case .refused(let reason):
+            logMachineRefusal(service, reason)
             return HKDFGuardStatus.policyInvalid.rawValue
         }
-        guard let group = getgrnam(name) else {
-            logMachineRefusal(service, "RunnerGroup \(name) does not name a group on this Mac")
-            return HKDFGuardStatus.policyInvalid.rawValue
-        }
-        gid = group.pointee.gr_gid
     }
 
-    let existing = verifyExistingMachineKEK(service: service, suites: suites)
+    let existing = verifyExistingMachineKEK(service: service, settings: settings, suites: suites)
     guard existing == HKDFGuardStatus.kekNotFound.rawValue else {
         return existing
     }
@@ -2190,7 +2476,7 @@ func createMachineKEK(service: String, settings: MachineServiceSettings, suites:
         return HKDFGuardStatus.accessControlCreationFailed.rawValue
     }
     // A P-256 KEK is still written in format 1, which every release reads;
-    // an ML-KEM one needs format 2.
+    // a suite 0x02 one needs format 3.
     var maybeEncoded: Data?
     switch suites.provisionSuite {
     case .p256HashedPoint:
@@ -2210,15 +2496,14 @@ func createMachineKEK(service: String, settings: MachineServiceSettings, suites:
         guard var created = maybeCreated else {
             return createStatus
         }
-        defer { secureZero(&created.blob) }
-        guard #available(macOS 26.0, *), kekWorks(.mlkem1024(created.kek)),
-              let reloaded = reconstructMLKEM1024KEK(blob: created.blob, encapsulated: created.kek.encapsulated),
-              kekWorks(.mlkem1024(reloaded)) else {
+        defer { created.stored.zeroBlobs() }
+        guard kekWorks(.mlkem1024(created.kek)),
+              case .key(let reloaded) = reconstructStoredKEK(created.stored, enclaveIsUsable: { true }),
+              reloaded.fingerprint == created.kek.fingerprint,
+              kekWorks(reloaded) else {
             return HKDFGuardStatus.kekVerificationFailed.rawValue
         }
-        maybeEncoded = encodeMachineKeyFile(.v2(
-            .mlkem1024(blob: created.blob, encapsulated: created.kek.encapsulated),
-            fingerprint: KEK.mlkem1024(created.kek).fingerprint))
+        maybeEncoded = encodeMachineKeyFile(.v3(created.stored, fingerprint: created.kek.fingerprint))
     }
     guard var encoded = maybeEncoded else {
         return HKDFGuardStatus.unexpectedOutputLength.rawValue
@@ -2229,7 +2514,7 @@ func createMachineKEK(service: String, settings: MachineServiceSettings, suites:
         auditMachineKekCreated(service: service, runnerGroup: settings.runnerGroup)
         return HKDFGuardStatus.success.rawValue
     case .alreadyExists:
-        return verifyExistingMachineKEK(service: service, suites: suites)
+        return verifyExistingMachineKEK(service: service, settings: settings, suites: suites)
     case .failed:
         return HKDFGuardStatus.keychainWriteFailed.rawValue
     }
@@ -2271,7 +2556,7 @@ func machinePolicyJSON() -> Data? {
 
 // MARK: - Wrap (seal) a DEK under the Secure Enclave KEK
 //
-// Wrapped format: [KEK fingerprint, 32-byte SHA-256 of the KEK's public key]
+// Wrapped format: [KEK fingerprint, 32 bytes: see `KEK.fingerprint`]
 //                  [suite id, 1 byte: the KEK's `KEKSuite`]
 //                  [salt, 32 random bytes]
 //                  [nonce, 12 random bytes]
@@ -2279,8 +2564,9 @@ func machinePolicyJSON() -> Data? {
 //
 // For suite 0x01 the Secure Enclave computes
 // Z = ECDH(KEK_priv, H(salt)), where H hashes the salt to a P-256 point
-// (`payloadECDHPoint`); for suite 0x02 it decapsulates the ciphertext
-// stored with the KEK (`KEMKEK`). HKDF-SHA512 turns that secret into the
+// (`payloadECDHPoint`); for suite 0x02 it does that with the KEK's P-256
+// key and also decapsulates the ciphertext stored with the KEK (`KEMKEK`).
+// HKDF-SHA512 turns that secret (suite 0x02: both, chained) into the
 // AES-256 key (`KEK.wrappingKey`); AES-256-GCM seals the DEK. Wrapping
 // needs the KEK's private key as much as unwrapping does, so only this
 // host -- not anyone who has seen the public key -- can create a payload.
@@ -2298,6 +2584,18 @@ func machinePolicyJSON() -> Data? {
 
 /// `@_cdecl` entry points below.
 private func wrapDekCore(
+    service: String,
+    dekPtr: UnsafePointer<UInt8>,
+    dekLen: Int32,
+    outPtr: UnsafeMutablePointer<UInt8>,
+    outLen: UnsafeMutablePointer<Int32>
+) -> Int32 {
+    withPolicySnapshot {
+        wrapDekUnderPolicy(service: service, dekPtr: dekPtr, dekLen: dekLen, outPtr: outPtr, outLen: outLen)
+    }
+}
+
+private func wrapDekUnderPolicy(
     service: String,
     dekPtr: UnsafePointer<UInt8>,
     dekLen: Int32,
@@ -2916,7 +3214,8 @@ public func hkdfguard_kek_exists(
     return status
 }
 
-/// Writes the 32-byte fingerprint (SHA-256 of the public key) of the KEK
+/// Writes the 32-byte fingerprint (SHA-256 of the public key and, for
+/// ML-KEM, the stored ciphertext) of the KEK
 /// `service` currently resolves to -- the same value embedded at the front
 /// of every payload wrapped under it. Public-key material only, so safe to
 /// expose; lets an operator pin which KEK a service uses and confirm it
@@ -2950,8 +3249,8 @@ public func hkdfguard_kek_fingerprint(
         switch kekScope(service: service) {
         case .policyInvalid:
             return (HKDFGuardStatus.policyInvalid.rawValue, nil)
-        case .machine:
-            let (status, summary) = machineKeySummary(service: service)
+        case .machine(let settings):
+            let (status, summary) = machineKeySummary(service: service, settings: settings)
             return (status, summary?.fingerprint)
         case .user:
             let (status, maybeKey) = getKEK(service: service)
@@ -2993,8 +3292,8 @@ public func hkdfguard_kek_suite(
         switch kekScope(service: service) {
         case .policyInvalid:
             return (HKDFGuardStatus.policyInvalid.rawValue, nil)
-        case .machine:
-            let (status, summary) = machineKeySummary(service: service)
+        case .machine(let settings):
+            let (status, summary) = machineKeySummary(service: service, settings: settings)
             return (status, summary?.suite)
         case .user:
             let (status, maybeKey) = getKEK(service: service)
@@ -3180,6 +3479,18 @@ public func hkdfguard_unwrap_dek(
 }
 
 private func unwrapDekCore(
+    servicePtr: UnsafePointer<CChar>?,
+    wrappedPtr: UnsafePointer<UInt8>?,
+    wrappedLen: Int32,
+    outPtr: UnsafeMutablePointer<UInt8>?,
+    outLen: UnsafeMutablePointer<Int32>?
+) -> Int32 {
+    withPolicySnapshot {
+        unwrapDekUnderPolicy(servicePtr: servicePtr, wrappedPtr: wrappedPtr, wrappedLen: wrappedLen, outPtr: outPtr, outLen: outLen)
+    }
+}
+
+private func unwrapDekUnderPolicy(
     servicePtr: UnsafePointer<CChar>?,
     wrappedPtr: UnsafePointer<UInt8>?,
     wrappedLen: Int32,
