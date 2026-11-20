@@ -1223,6 +1223,18 @@ struct CheckedFolder {
     func close() { _ = Darwin.close(fd) }
 }
 
+/// The components of `path`, split at every "/" *byte*, empty ones dropped.
+/// Not at "/" Characters: Swift fuses a "/" and a combining mark after it
+/// (U+0301, say) into one Character, so a Character split keeps
+/// "writable/\u{301}trusted" as one component -- which `openat` then walks
+/// as two folders, the first never checked. A "/" byte never occurs inside
+/// a multi-byte UTF-8 sequence, so every component is still valid UTF-8.
+/// The library's own folder walk works on bytes for the same reason
+/// (`readWrappedFile`).
+func pathComponents(_ path: String) -> [String] {
+    path.utf8.split(separator: UInt8(ascii: "/")).map { String(decoding: $0, as: UTF8.self) }
+}
+
 func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
     var components: [String] = []
     // A relative path is resolved against the current folder, taken from
@@ -1238,11 +1250,11 @@ func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
         defer { free(cwd) }
         absolute = String(cString: cwd) + "/" + path
     }
-    for part in absolute.split(separator: "/", omittingEmptySubsequences: true) {
+    for part in pathComponents(absolute) {
         switch part {
         case ".": continue
         case "..": if !components.isEmpty { components.removeLast() }
-        default: components.append(String(part))
+        default: components.append(part)
         }
     }
     guard let leaf = components.popLast() else {
@@ -1264,8 +1276,8 @@ func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
     var current = "/"
     func join(_ folder: String, _ name: String) -> String { folder == "/" ? "/" + name : folder + "/" + name }
     func parentOf(_ folder: String) -> String {
-        guard folder != "/", let slash = folder.lastIndex(of: "/") else { return "/" }
-        return slash == folder.startIndex ? "/" : String(folder[..<slash])
+        let parts = pathComponents(folder)
+        return parts.count <= 1 ? "/" : "/" + parts.dropLast().joined(separator: "/")
     }
     func move(to newFd: Int32, _ newPath: String) {
         _ = Darwin.close(dirFd)
@@ -1310,6 +1322,7 @@ func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
                 var parent = stat()
                 let rootOnly = st.st_uid == 0 && fstat(dirFd, &parent) == 0 && parent.st_uid == 0
                     && parent.st_mode & (S_IWGRP | S_IWOTH) == 0
+                    && !ownershipIgnored(dirFd) // there, everything looks root's to root
                 guard rootOnly else {
                     throw CLIError("\(what) \(path): the folder \(candidate) is a symbolic link; the path must be a real path with no links in it (macOS's own root-owned links, such as /tmp and /var, are accepted)")
                 }
@@ -1330,7 +1343,7 @@ func openRealFolder(_ path: String, what: String) throws -> CheckedFolder {
                     }
                     move(to: root, "/")
                 }
-                remaining = (target.split(separator: "/", omittingEmptySubsequences: true).map(String.init) + remaining)[...]
+                remaining = (pathComponents(target) + remaining)[...]
             default:
                 throw CLIError("\(what) \(path): \(candidate) is not a folder")
             }
@@ -1964,6 +1977,21 @@ func flushFolder(_ folder: CheckedFolder) throws {
 }
 
 
+// Whether `fd` is on a volume where its owner can't be trusted: one mounted
+// with ownership ignored (MNT_IGNORE_OWNERSHIP, the default for disk images
+// and removable media a user mounts), where the kernel reports every file
+// as owned by whoever asks -- by root, to root -- so "owned by root" proves
+// nothing about who controls it. Fails closed: a volume fstatfs can't
+// describe counts as one. The library's own checks refuse these volumes
+// the same way (`onVolumeIgnoringOwnership`).
+func ownershipIgnored(_ fd: Int32) -> Bool {
+    var fs = statfs()
+    guard fstatfs(fd, &fs) == 0 else {
+        return true
+    }
+    return fs.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) != 0
+}
+
 // Whether the file open as `fd` has an access control list. Reading one
 // fails with ENOENT when there is none; any other failure leaves the
 // question open, and is reported as such so that callers refuse instead of
@@ -2259,7 +2287,7 @@ func runStatus(serviceName: String) throws {
 // prefix the rule spells -- openRealFolder then refuses any symbolic link
 // in it that root didn't make.
 func refuseParentReferencesAsRoot(_ path: String) throws {
-    guard geteuid() == 0, path.split(separator: "/").contains("..") else {
+    guard geteuid() == 0, pathComponents(path).contains("..") else {
         return
     }
     throw CLIError("--key-file-path \(path) contains \"..\"; as root, give the path without it")

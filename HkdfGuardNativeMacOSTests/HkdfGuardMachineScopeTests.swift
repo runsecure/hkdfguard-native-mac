@@ -302,6 +302,37 @@ struct HkdfGuardMachineScopeTests {
         #expect(reason.contains("root"), "\(reason)")
     }
 
+    @Test func anACLGrantingOnlyReadCountsForAMachineKEKFile() throws {
+        // A machine KEK file's contents are the secret: an `everyone allow
+        // read` entry leaves the 0640 mode untouched but lets every account
+        // read the blobs. The change-rights check lets it through; the
+        // machine KEK reader's own check must not. (The reader itself needs a
+        // root-owned file; scripts/verify-machine-scope.sh exercises it.)
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.acl.\(UUID().uuidString)").path
+        #expect(FileManager.default.createFile(atPath: path, contents: Data([1, 2, 3]), attributes: [.posixPermissions: 0o640]))
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        func withFile<T>(_ body: (Int32) -> T) -> T {
+            let fd = open(path, O_RDONLY)
+            defer { close(fd) }
+            return body(fd)
+        }
+        func chmodACL(_ arguments: [String]) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+            process.arguments = arguments + [path]
+            try process.run()
+            process.waitUntilExit()
+            #expect(process.terminationStatus == 0, "chmod \(arguments)")
+        }
+
+        #expect(!withFile { aclGrantsAnything(fd: $0) }, "no ACL")
+        try chmodACL(["+a", "everyone deny write"])
+        #expect(!withFile { aclGrantsAnything(fd: $0) }, "a deny entry only takes rights away")
+        try chmodACL(["+a", "everyone allow read"])
+        #expect(!withFile { aclGrantsOthersAChange(fd: $0, isFolder: false, rootOnly: true) }, "read alone is no change")
+        #expect(withFile { aclGrantsAnything(fd: $0) }, "but it is a grant")
+    }
+
     @Test func theKeyFolderIsExcludedFromBackup() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.keks.\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
@@ -364,16 +395,23 @@ struct HkdfGuardMachineScopeTests {
     }
 
     @Test func aKeyFileMustBelongToThePolicysCurrentRunnerGroup() {
+        // A stand-in directory: _orders is dedicated; _staffalias is another
+        // name for staff's gid; root reaches _nested through a broad group
+        // nested into it after provisioning.
         let groups: (String) -> GroupLookup = { name in
             switch name {
             case "_orders": return .found(501)
+            case "_staffalias", "staff": return .found(20)
+            case "_nested": return .found(502)
             case "_zero": return .found(0)
             case "_down": return .failed(EIO)
             default: return .missing
             }
         }
+        let rootIsIn: (gid_t) -> Bool? = { gid in gid == 502 }
         func problem(_ mode: mode_t, _ gid: gid_t, _ group: String?) -> String? {
-            machineKeyFileGroupProblem(mode: mode, gid: gid, runnerGroup: group, lookup: groups)
+            machineKeyFileGroupProblem(mode: mode, gid: gid, runnerGroup: group,
+                                       resolve: { resolveRunnerGroup($0, lookup: groups, rootIsIn: rootIsIn) })
         }
         #expect(problem(0o640, 501, "_orders") == nil)
         #expect(problem(0o600, 501, "_orders") == nil)
@@ -385,6 +423,11 @@ struct HkdfGuardMachineScopeTests {
         #expect(problem(0o640, 501, "_down")?.contains("could not be looked up") == true)
         #expect(problem(0o640, 20, "staff")?.contains("too broad") == true)
         #expect(problem(0o640, 0, "_zero")?.contains("too broad") == true)
+        // Restrictions provisioning applies hold on every read too, even
+        // with the file's gid unchanged: an alias of a broad group, and a
+        // group that root -- and so a broad group -- has come to be in.
+        #expect(problem(0o640, 20, "_staffalias")?.contains("too broad") == true)
+        #expect(problem(0o640, 502, "_nested")?.contains("root as a member") == true)
         // No runner group: root only, so no group access at all.
         #expect(problem(0o600, 0, nil) == nil)
         #expect(problem(0o640, 501, nil)?.contains("chmod 600") == true)

@@ -877,7 +877,12 @@ inside it looks like. It can't tell a small group of people from a small
 group of service accounts; that part is yours.
 
 The KEK file's group is checked against the policy on every use, not just
-when the KEK is created. If you change a service's `RunnerGroup`, the
+when the KEK is created -- with every check above, not only its name: if
+a broad group is later nested into the `RunnerGroup` (so root becomes a
+member), or the name comes to mean a broad group's gid, every call for the
+service fails with `-19` even though the file's gid hasn't changed. Fix the
+group, then rotate the KEK: whoever the group admitted meanwhile may have
+read it. If you change a service's `RunnerGroup`, the
 existing file still belongs to the old group, and every call for that
 service fails with `-19` (the log names both groups) until you move it:
 
@@ -986,8 +991,10 @@ machine-scoped service:
   boot (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). `provision`
   excludes the `keks` folder from Time Machine; local APFS snapshots still
   hold it. A file that
-  isn't root's, that anyone else can write, that others can read, or that
-  this library didn't write is `-19` (`KEK_INVALID`). Of those, `retire
+  isn't root's, that anyone else can write, that others can read, that has
+  an access control list allowing anything (even read: it would let
+  accounts outside the `RunnerGroup` copy the key), or that this library
+  didn't write is `-19` (`KEK_INVALID`). Of those, `retire
   --corrupt` deletes only a file whose content is bad; wrong ownership or
   permissions on a sound file are to be fixed, not retired.
 - **Root is trusted.** Root can read the file and install a LaunchDaemon, so

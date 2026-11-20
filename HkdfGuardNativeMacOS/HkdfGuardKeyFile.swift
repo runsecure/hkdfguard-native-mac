@@ -136,6 +136,33 @@ private func onSealedSystemVolume(_ fd: Int32) -> Bool {
     return fs.f_flags & required == required
 }
 
+/// Whether `fd` has an access control list that grants anything at all:
+/// any allow entry, whoever it names and whatever right it gives, or an
+/// ACL that can't be read (fail closed). Deny entries only take rights
+/// away, so they don't count.
+///
+/// For a file whose *contents* are the secret -- a machine KEK file --
+/// `aclGrantsOthersAChange` is not enough: an entry granting only read to
+/// `everyone` leaves the 0640 mode untouched while letting every account
+/// read the Secure Enclave blobs, and a LaunchDaemon holding a copy can use
+/// the key. The library never writes such an ACL, so none is accepted.
+func aclGrantsAnything(fd: Int32) -> Bool {
+    guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else {
+        return errno != ENOENT // no ACL at all; any other failure fails closed
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+    var entry: acl_entry_t?
+    var which = ACL_FIRST_ENTRY.rawValue
+    while acl_get_entry(acl, Int32(which), &entry) == 0, let current = entry {
+        which = ACL_NEXT_ENTRY.rawValue
+        var tag = ACL_UNDEFINED_TAG
+        guard acl_get_tag_type(current, &tag) == 0, tag == ACL_EXTENDED_DENY else {
+            return true
+        }
+    }
+    return false
+}
+
 /// Whether the access control list on `fd` grants anyone other than root or
 /// this user a right that could change what the key path reads. Mode bits
 /// alone miss this: on macOS an ACL can grant write to anyone regardless of

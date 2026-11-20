@@ -374,7 +374,8 @@ extern "C" {
 //     restart (`fdesetup authrestart`).
 //   - a file that is not root's, writable by anyone else, readable by
 //     others, not in the RunnerGroup the policy names now (or group-
-//     accessible with none), or not one this library wrote is
+//     accessible with none), carrying an access control list that allows
+//     anything (even read), or not one this library wrote is
 //     HKDFGUARD_ERR_KEK_INVALID.
 //
 // hkdfguard_kek_exists and hkdfguard_kek_fingerprint answer from the file

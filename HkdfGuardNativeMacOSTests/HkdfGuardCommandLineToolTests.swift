@@ -1368,6 +1368,19 @@ struct HkdfGuardCommandLineToolTests {
         #expect(viaLinkDek.exitCode == 1)
         #expect(viaLinkDek.stderr.contains("is a symbolic link; the path must be a real path with no links in it"), "\(viaLinkDek.stderr)")
 
+        // A "/" followed by a combining mark is one Swift Character: a walk
+        // that split the path on Characters would keep "link/\u{301}sub" as
+        // one name, and the kernel would follow the link inside it unchecked.
+        let marked = real.appendingPathComponent("\u{301}sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: marked, withIntermediateDirectories: false)
+        let viaLinkMarked = link.path + "/\u{301}sub/out.key"
+        let markedWrap = try Self.runCLI(
+            ["wrap", "-kf", viaLinkMarked, "-sn", "com.hkdfguard.tests.cli.folder.link", "--dek-stdin"],
+            stdin: Self.base64Stdin(Self.randomDEK()))
+        #expect(markedWrap.exitCode == 1)
+        #expect(markedWrap.stderr.contains("is a symbolic link; the path must be a real path with no links in it"), "\(markedWrap.stderr)")
+        #expect(!FileManager.default.fileExists(atPath: marked.appendingPathComponent("out.key").path))
+
         // `..` after a link is resolved as text: link/../real/x is real/x,
         // which the kernel would otherwise reach through the link.
         let dotted = link.appendingPathComponent("..").appendingPathComponent("real").appendingPathComponent("dek.b64").path

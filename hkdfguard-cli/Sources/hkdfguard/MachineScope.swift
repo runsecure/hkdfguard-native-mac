@@ -241,7 +241,8 @@ private func aclAllowsAnything(_ fd: Int32) -> Bool {
 }
 
 /// Whether `path` (absolute, with no `.` or `..`) and every folder above
-/// it are root's and writable by root alone, by mode and by ACL. Walked
+/// it are root's and writable by root alone, by mode and by ACL, on volumes
+/// that honor ownership (see `ownershipIgnored`). Walked
 /// down from "/", each step opened from the one before without following a
 /// symbolic link and judged through its descriptor, so what is checked is
 /// what is there: nothing can be swapped between a check and the next
@@ -251,13 +252,17 @@ func rootControls(_ path: String, privateFolder: Bool = false) -> Bool {
     guard path.hasPrefix("/") else {
         return false
     }
-    let parts = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    let parts = pathComponents(path) // bytes, not Characters: see pathComponents
     guard !parts.contains("."), !parts.contains("..") else {
         return false
     }
     func rootsAlone(_ fd: Int32, folder: Bool) -> Bool {
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0 else {
+        // On a volume ignoring ownership everything looks root's to root,
+        // so "root's" proves nothing there: refused, as the library refuses
+        // it.
+        guard fstat(fd, &info) == 0, info.st_uid == 0, info.st_mode & (S_IWGRP | S_IWOTH) == 0,
+              !ownershipIgnored(fd) else {
             return false
         }
         let type = info.st_mode & S_IFMT
@@ -356,7 +361,15 @@ private func isRootOnlyFolder(_ path: String) -> Bool {
 /// run left behind.
 private func prepareSystemJobsFolder() throws {
     let parent = (systemJobsFolder as NSString).deletingLastPathComponent
-    if mkdir(parent, 0o755) != 0 && errno != EEXIST {
+    if mkdir(parent, 0o755) == 0 {
+        // mkdir applies the umask; the installed tool's folder must stay
+        // 0755 for everyone who runs it. Set on its descriptor.
+        let fd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        defer { if fd >= 0 { close(fd) } }
+        guard fd >= 0, fchmod(fd, 0o755) == 0 else {
+            throw CLIError("can't set the mode of \(parent): \(String(cString: strerror(errno)))")
+        }
+    } else if errno != EEXIST {
         throw CLIError("can't create \(parent): \(String(cString: strerror(errno)))")
     }
     if mkdir(systemJobsFolder, 0o700) != 0 && errno != EEXIST {
@@ -630,8 +643,8 @@ private func withMachineKeyFile<T>(policy: CLIPolicy, service: String, _ body: (
     }
     defer { close(fd) }
     var info = stat()
-    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0 else {
-        throw CLIError("\(path) is not a root-owned regular file; nothing was deleted")
+    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0, !ownershipIgnored(fd) else {
+        throw CLIError("\(path) is not a root-owned regular file on a volume that honors ownership; nothing was deleted")
     }
     return try body(folder, fd)
 }
