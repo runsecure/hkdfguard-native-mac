@@ -295,7 +295,7 @@ struct HkdfGuardMachineScopeTests {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.keks.\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: dir) }
-        guard case .untrusted(let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc", settings: MachineServiceSettings(runnerGroup: nil)) }) else {
+        guard case .refused(.kekCorrupted, let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc", settings: MachineServiceSettings(runnerGroup: nil)) }) else {
             Issue.record("a user-owned key folder was trusted")
             return
         }

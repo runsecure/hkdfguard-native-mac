@@ -347,6 +347,19 @@ func encodeKeychainKEK(_ stored: StoredKEK, fingerprint: Data? = nil) -> Data? {
     }
 }
 
+/// The range of a field stored as a big-endian u16 length and then that
+/// many bytes, the length at `offset` in `bytes`; nil when either runs past
+/// the end. The keychain item and the machine KEK file both store their
+/// variable-length fields this way.
+func lengthPrefixedField(in bytes: [UInt8], at offset: Int) -> Range<Int>? {
+    guard offset >= 0, bytes.count >= offset + 2 else {
+        return nil
+    }
+    let start = offset + 2
+    let end = start + (Int(bytes[offset]) << 8 | Int(bytes[offset + 1]))
+    return end <= bytes.count ? start..<end : nil
+}
+
 /// Nil only for data that has the container's magic but isn't a container
 /// this build understands: corrupt, or from a newer build. Anything else is
 /// taken as a P-256 blob, for the enclave to accept or refuse.
@@ -356,25 +369,20 @@ func decodeKeychainKEK(_ data: Data) -> KeychainKEK? {
     }
     var bytes = [UInt8](data)
     defer { secureZero(&bytes) }
+    // The ML-KEM blob, then the fixed-length ciphertext, then the P-256
+    // blob, which must end exactly where the data does.
     guard bytes.count > keychainKEKHeaderLength,
           bytes[4] == keychainKEKFormatVersion,
-          bytes[5] == KEKSuite.mlkem1024StoredCiphertext.rawValue else {
-        return nil
-    }
-    let length = Int(bytes[keychainKEKHeaderLength - 2]) << 8 | Int(bytes[keychainKEKHeaderLength - 1])
-    let blobEnd = keychainKEKHeaderLength + length
-    let classicalStart = blobEnd + mlkem1024CiphertextLength + 2
-    guard length > 0, bytes.count > classicalStart else {
-        return nil
-    }
-    let classicalLength = Int(bytes[classicalStart - 2]) << 8 | Int(bytes[classicalStart - 1])
-    guard classicalLength > 0, bytes.count == classicalStart + classicalLength else {
+          bytes[5] == KEKSuite.mlkem1024StoredCiphertext.rawValue,
+          let blob = lengthPrefixedField(in: bytes, at: keychainKEKHeaderLength - 2), !blob.isEmpty,
+          let classical = lengthPrefixedField(in: bytes, at: blob.upperBound + mlkem1024CiphertextLength),
+          !classical.isEmpty, classical.upperBound == bytes.count else {
         return nil
     }
     return KeychainKEK(
-        stored: .mlkem1024(blob: Data(bytes[keychainKEKHeaderLength..<blobEnd]),
-                           encapsulated: Data(bytes[blobEnd..<(classicalStart - 2)]),
-                           classicalBlob: Data(bytes[classicalStart...])),
+        stored: .mlkem1024(blob: Data(bytes[blob]),
+                           encapsulated: Data(bytes[blob.upperBound..<(blob.upperBound + mlkem1024CiphertextLength)]),
+                           classicalBlob: Data(bytes[classical])),
         fingerprint: Data(bytes[6..<(6 + hkdfguardFingerprintLength)]))
 }
 
@@ -552,6 +560,22 @@ func createMLKEMKEK(
     return (HKDFGuardStatus.enclaveUnavailable.rawValue, nil)
 }
 
+/// What `createKEK` answers for a KEK item that is already there -- found
+/// before creating one, or put there by a creator that won the race.
+/// Success only for a usable key of a suite `suites` permits. An item that
+/// can't be reconstructed is never replaced, whichever the reason; nor is
+/// one of a suite the policy refuses.
+private func existingKEKStatus(_ data: Data, suites: SuitePolicy, service: String) -> Int32 {
+    switch reconstructKEK(data) {
+    case .key(let kek):
+        return suiteRefusal(kek, suites, service: service) ?? HKDFGuardStatus.success.rawValue
+    case .corrupt:
+        return HKDFGuardStatus.kekCorrupted.rawValue
+    case .enclaveRefused:
+        return HKDFGuardStatus.keychainAccessDenied.rawValue
+    }
+}
+
 /// Creates a KEK for `service` if one doesn't already exist. Idempotent
 /// and safe under concurrent first-use — see the duplicate-item handling
 /// below — so a caller that already checked `kekExists` and got `false`
@@ -591,16 +615,7 @@ private func createKEKUnderPolicy(service: String, mode: KeychainMode) -> Int32 
     switch loadKEKDataRepresentation(service: service, mode: mode) {
     case .found(var existing):
         defer { secureZero(&existing) } // the SEP-wrapped blob is the credential: don't leave this copy behind
-        // An item that can't be reconstructed is never replaced, whichever
-        // the reason; nor is one of a suite the policy refuses.
-        switch reconstructKEK(existing) {
-        case .key(let kek):
-            return suiteRefusal(kek, suites, service: service) ?? HKDFGuardStatus.success.rawValue
-        case .corrupt:
-            return HKDFGuardStatus.kekCorrupted.rawValue
-        case .enclaveRefused:
-            return HKDFGuardStatus.keychainAccessDenied.rawValue
-        }
+        return existingKEKStatus(existing, suites: suites, service: service)
     case .accessDenied:
         return HKDFGuardStatus.keychainAccessDenied.rawValue
     case .failed:
@@ -679,14 +694,7 @@ private func createKEKUnderPolicy(service: String, mode: KeychainMode) -> Int32 
         switch loadKEKDataRepresentation(service: service, mode: mode) {
         case .found(var existing):
             defer { secureZero(&existing) }
-            switch reconstructKEK(existing) {
-            case .key(let kek):
-                return suiteRefusal(kek, suites, service: service) ?? HKDFGuardStatus.success.rawValue
-            case .corrupt:
-                return HKDFGuardStatus.kekCorrupted.rawValue
-            case .enclaveRefused:
-                return HKDFGuardStatus.keychainAccessDenied.rawValue
-            }
+            return existingKEKStatus(existing, suites: suites, service: service)
         case .accessDenied:
             return HKDFGuardStatus.keychainAccessDenied.rawValue
         case .notFound, .failed:

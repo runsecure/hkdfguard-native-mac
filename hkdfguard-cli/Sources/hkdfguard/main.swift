@@ -217,90 +217,65 @@ func keychainModeName() -> String {
     }
 }
 
-// Mirrors HKDFGuardStatus in HkdfGuardStatus.swift -- kept as
-// a separate, parallel definition rather than importing that module, for
-// the same "go through the C ABI only" reason as the `@_silgen_name`
-// declaration above; the raw integer values are the actual contract, this
-// enum just makes them readable here.
-enum HKDFGuardStatus: Int32 {
-    // The shared HkdfGuard status table (hkdfguard-native-linux's
-    // include/hkdfguard.h is the source of record); the comment on each case
-    // is its HKDFGUARD_* name.
-    case success = 0                       // OK
-    case invalidInputLength = -1           // ERR_INVALID_ARGUMENT
-    case outputBufferTooSmall = -2         // ERR_BUFFER_TOO_SMALL
-    case enclaveUnavailable = -3           // ERR_PROVIDER_UNAVAILABLE
-    case encryptionFailed = -5             // ERR_CRYPTO_ERROR
-    case unexpectedOutputLength = -6       // ERR_INTERNAL_ERROR
-    case invalidServiceIdentifier = -8     // ERR_INVALID_SERVICE_NAME
-    case policyInvalid = -9                // ERR_POLICY_INVALID
-    case payloadMalformed = -10            // ERR_PAYLOAD_MALFORMED
-    case decryptionFailed = -11            // ERR_PAYLOAD_AUTH_FAILED
-    case unsupportedCiphersuite = -12      // ERR_PAYLOAD_UNSUPPORTED
-    case fingerprintMismatch = -16         // ERR_KEK_FINGERPRINT_MISMATCH
-    case kekNotFound = -17                 // ERR_KEK_NOT_FOUND
-    case keychainAccessDenied = -18        // ERR_KEK_ACCESS_DENIED
-    case kekCorrupted = -19                // ERR_KEK_INVALID
-    case processHardeningFailed = -20      // ERR_PROCESS_HARDENING_FAILED
-    case fileNotFound = -32                // ERR_FILE_NOT_FOUND
-    case fileAccessDenied = -33            // ERR_FILE_ACCESS_DENIED
-    case fileIO = -34                      // ERR_FILE_IO
-    case fileTooShort = -35                // ERR_FILE_TOO_SHORT
-    case fileTooLong = -36                 // ERR_FILE_TOO_LONG
-    case fileUnprotectedKey = -37          // ERR_FILE_PLAINTEXT_KEY
-    case fileMalformed = -38               // ERR_FILE_MALFORMED
-    case fileInsecure = -39                // ERR_FILE_UNTRUSTED
-    case accessControlCreationFailed = -96 // ERR_MAC_ACCESS_CONTROL_CREATION_FAILED
-    case keyGenerationFailed = -97         // ERR_MAC_KEY_GENERATION_FAILED
-    case keychainWriteFailed = -98         // ERR_MAC_KEYCHAIN_WRITE_FAILED
-    case kekVerificationFailed = -99       // ERR_MAC_KEK_VERIFICATION_FAILED
-    case keychainReadFailed = -100         // ERR_MAC_KEYCHAIN_READ_FAILED
+// The library's status codes, as this tool sees them through the C ABI --
+// not the library's own Swift enum, which this executable deliberately
+// doesn't import (see the `@_silgen_name` declarations above). The numbers
+// are the contract: the shared HkdfGuard status table, whose source of
+// record is hkdfguard-native-linux's include/hkdfguard.h.
+//
+// HKDFGuardStatus names only the codes this tool acts on.
+// `statusDescriptions` explains every code, for messages; each entry's
+// trailing comment is its HKDFGUARD_* name, and the tests check every
+// entry against hkdfguard.h, and that none is missing.
+// Declared before the table: in main.swift a global is initialized where it
+// is written, and the table's -9 entry names the program.
+let programName = "hkdfguard"
 
-    var description: String {
-        switch self {
-        case .success: return "success"
-        case .invalidInputLength: return "invalid argument (bad service name or DEK length)"
-        case .outputBufferTooSmall: return "output buffer too small"
-        case .enclaveUnavailable: return "the Secure Enclave is not available on this machine, or can't create the KEK suite the policy asks for (ML-KEM-1024 needs macOS 26 or later; KekSuite P-256 in the policy opts in to a classical KEK)"
-        case .encryptionFailed: return "a cryptographic operation failed"
-        case .unexpectedOutputLength: return "internal error: the library produced an unexpected output length"
-        case .invalidServiceIdentifier: return "the service name is missing, empty, longer than 128 characters, or contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains \"..\""
-        case .policyInvalid: return "the hkdfguard policy (a managed com.hkdfguard profile, or /Library/Application Support/HkdfGuard/policy.plist) can't be used -- run `\(programName) status` to see why"
-        case .payloadMalformed: return "the wrapped payload is malformed"
-        case .decryptionFailed: return "decryption failed"
-        case .unsupportedCiphersuite: return "the wrapped payload uses a ciphersuite this build does not support, or one the policy refuses (RequirePostQuantum, and a P-256 payload)"
-        case .fingerprintMismatch: return "the wrapped payload's embedded KEK fingerprint does not match the current key"
-        case .kekNotFound: return "no key exists yet for this service -- call hkdfguard_create_kek first"
-        case .keychainAccessDenied: return "the keychain denied access (locked, no UI session, access prompt declined, or missing entitlement) -- a key for this service may already exist; or the policy's RequirePostQuantum refuses this service's P-256 KEK (see `hkdfguard status`)"
-        case .kekCorrupted: return "a keychain item exists for this service but could not be reconstructed into a usable key"
-        case .processHardeningFailed: return "the process could not be hardened (core dumps or debugger attachment could not be disabled, a debugger is already attached, or a distribution build's code signature lets other processes debug it)"
-        case .fileNotFound: return "the key file does not exist"
-        case .fileAccessDenied: return "this process may not read the key file"
-        case .fileIO: return "the key file is not a regular file, or reading it failed"
-        case .fileTooShort: return "the key file is shorter than a wrapped DEK"
-        case .fileTooLong: return "the key file is longer than a wrapped DEK"
-        case .fileUnprotectedKey: return "the key file appears to hold an UNWRAPPED DEK -- treat it as exposed"
-        case .fileMalformed: return "the key file is not a well-formed wrapped DEK"
-        case .fileInsecure: return "the key file is a symbolic link, owned by another user, or writable by group or others"
-        case .accessControlCreationFailed: return "failed to set up access control for a new key"
-        case .keyGenerationFailed: return "the Secure Enclave refused to generate a new key"
-        case .keychainWriteFailed: return "failed to persist the newly generated key to the keychain"
-        case .kekVerificationFailed: return "the newly created key could not be verified after being stored"
-        case .keychainReadFailed: return "reading the keychain failed"
-        }
-    }
+enum HKDFGuardStatus: Int32 {
+    case success = 0                // OK
+    case outputBufferTooSmall = -2  // ERR_BUFFER_TOO_SMALL
+    case kekNotFound = -17          // ERR_KEK_NOT_FOUND
+    case kekCorrupted = -19         // ERR_KEK_INVALID
 }
 
+let statusDescriptions: [Int32: String] = [
+    0:    "success", // OK
+    -1:   "invalid argument (bad service name or DEK length)", // ERR_INVALID_ARGUMENT
+    -2:   "output buffer too small", // ERR_BUFFER_TOO_SMALL
+    -3:   "the Secure Enclave is not available on this machine, or can't create the KEK suite the policy asks for (ML-KEM-1024 needs macOS 26 or later; KekSuite P-256 in the policy opts in to a classical KEK)", // ERR_PROVIDER_UNAVAILABLE
+    -5:   "a cryptographic operation failed", // ERR_CRYPTO_ERROR
+    -6:   "internal error: the library produced an unexpected output length", // ERR_INTERNAL_ERROR
+    -8:   "the service name is missing, empty, longer than 128 characters, or contains a character other than an ASCII letter, digit, or '.', starts with '.', or contains \"..\"", // ERR_INVALID_SERVICE_NAME
+    -9:   "the hkdfguard policy (a managed com.hkdfguard profile, or /Library/Application Support/HkdfGuard/policy.plist) can't be used -- run `\(programName) status` to see why", // ERR_POLICY_INVALID
+    -10:  "the wrapped payload is malformed", // ERR_PAYLOAD_MALFORMED
+    -11:  "decryption failed", // ERR_PAYLOAD_AUTH_FAILED
+    -12:  "the wrapped payload uses a ciphersuite this build does not support, or one the policy refuses (RequirePostQuantum, and a P-256 payload)", // ERR_PAYLOAD_UNSUPPORTED
+    -16:  "the wrapped payload's embedded KEK fingerprint does not match the current key", // ERR_KEK_FINGERPRINT_MISMATCH
+    -17:  "no key exists yet for this service -- call hkdfguard_create_kek first", // ERR_KEK_NOT_FOUND
+    -18:  "the keychain denied access (locked, no UI session, access prompt declined, or missing entitlement) -- a key for this service may already exist; or the policy's RequirePostQuantum refuses this service's P-256 KEK (see `hkdfguard status`)", // ERR_KEK_ACCESS_DENIED
+    -19:  "a keychain item exists for this service but could not be reconstructed into a usable key", // ERR_KEK_INVALID
+    -20:  "the process could not be hardened (core dumps or debugger attachment could not be disabled, a debugger is already attached, or a distribution build's code signature lets other processes debug it)", // ERR_PROCESS_HARDENING_FAILED
+    -32:  "the key file does not exist", // ERR_FILE_NOT_FOUND
+    -33:  "this process may not read the key file", // ERR_FILE_ACCESS_DENIED
+    -34:  "the key file is not a regular file, or reading it failed", // ERR_FILE_IO
+    -35:  "the key file is shorter than a wrapped DEK", // ERR_FILE_TOO_SHORT
+    -36:  "the key file is longer than a wrapped DEK", // ERR_FILE_TOO_LONG
+    -37:  "the key file appears to hold an UNWRAPPED DEK -- treat it as exposed", // ERR_FILE_PLAINTEXT_KEY
+    -38:  "the key file is not a well-formed wrapped DEK", // ERR_FILE_MALFORMED
+    -39:  "the key file is a symbolic link, owned by another user, or writable by group or others", // ERR_FILE_UNTRUSTED
+    -96:  "failed to set up access control for a new key", // ERR_MAC_ACCESS_CONTROL_CREATION_FAILED
+    -97:  "the Secure Enclave refused to generate a new key", // ERR_MAC_KEY_GENERATION_FAILED
+    -98:  "failed to persist the newly generated key to the keychain", // ERR_MAC_KEYCHAIN_WRITE_FAILED
+    -99:  "the newly created key could not be verified after being stored", // ERR_MAC_KEK_VERIFICATION_FAILED
+    -100: "reading the keychain failed", // ERR_MAC_KEYCHAIN_READ_FAILED
+]
+
 func describeStatus(_ code: Int32) -> String {
-    if let status = HKDFGuardStatus(rawValue: code) {
-        return status.description
-    }
-    return "unknown status code \(code)"
+    statusDescriptions[code] ?? "unknown status code \(code)"
 }
 
 // MARK: - Argument parsing
 
-let programName = "hkdfguard"
 let dekLen = 32
 // Generous starting capacity for the wrapped payload -- retried once at
 // the library-reported size on outputBufferTooSmall, so this only needs to

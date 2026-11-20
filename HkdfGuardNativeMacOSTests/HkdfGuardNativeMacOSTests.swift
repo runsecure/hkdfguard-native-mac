@@ -1606,8 +1606,9 @@ struct HkdfGuardHardenProcessTests {
 
 /// Drift guard: the shared C ABI must not drift between this library and
 /// hkdfguard-native-linux, the source of record. Checks the two headers
-/// against each other, and the Swift status enums -- hand-maintained copies
-/// of the table -- against the header. Pure text checks: no keychain or Secure Enclave. Skipped when the
+/// against each other, and the Swift status enums and the CLI's status
+/// descriptions -- hand-maintained copies of the table -- against the
+/// header. Pure text checks: no keychain or Secure Enclave. Skipped when the
 /// Linux repository isn't checked out next to this one.
 @Suite
 struct HkdfGuardCrossPlatformABITests {
@@ -1794,6 +1795,38 @@ struct HkdfGuardCrossPlatformABITests {
         for (label, value) in cases {
             #expect(header[label] == value, "\(file): case labelled \(label) is \(value), the header says \(header[label].map(String.init) ?? "it isn't defined")")
         }
+    }
+
+    @Test func cliDescribesEveryStatusTheHeaderDefines() throws {
+        // The CLI names only the codes it acts on (checked above), and
+        // explains every code from one table: `<code>: "<text>", // <name>`.
+        let header = Self.statusCodes(Self.defines(in: try Self.read(Self.macHeader)))
+        let source = try Self.read(Self.macRoot.appendingPathComponent("hkdfguard-cli/Sources/hkdfguard/main.swift"))
+        let marker = "let statusDescriptions: [Int32: String] = [\n"
+        let start = try #require(source.range(of: marker), "no statusDescriptions table in main.swift")
+        let end = try #require(source.range(of: "\n]\n", range: start.upperBound..<source.endIndex), "statusDescriptions has no end")
+        let body = source[start.upperBound..<end.lowerBound]
+        var described: [String: Int] = [:]
+        for line in body.split(separator: "\n") {
+            guard let match = line.firstMatch(of: /^\s*(-?[0-9]+):\s*".*",\s*\/\/\s*([A-Z0-9_]+)\s*$/) else {
+                Issue.record("statusDescriptions: an entry without its `// <name>` label: \(line)")
+                continue
+            }
+            let name = "HKDFGUARD_" + match.2
+            #expect(described[name] == nil, "statusDescriptions describes \(name) twice")
+            described[name] = Int(match.1)!
+        }
+        for (name, value) in described {
+            #expect(header[name] == value, "statusDescriptions: \(name) is \(value), the header says \(header[name].map(String.init) ?? "it isn't defined")")
+        }
+        // Every code the header defines, except the other platforms' own and
+        // PROVIDER_ERROR, which macOS never returns (it reports one of the
+        // -96..-100 refinements instead).
+        let expected = header.filter {
+            !$0.key.hasPrefix("HKDFGUARD_ERR_WIN_") && !$0.key.hasPrefix("HKDFGUARD_ERR_LINUX_")
+                && $0.key != "HKDFGUARD_ERR_PROVIDER_ERROR"
+        }
+        #expect(Set(described.keys) == Set(expected.keys), "statusDescriptions is missing \(Set(expected.keys).subtracting(described.keys).sorted()), or has extra \(Set(described.keys).subtracting(expected.keys).sorted())")
     }
 }
 

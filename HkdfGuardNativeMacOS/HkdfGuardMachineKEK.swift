@@ -144,22 +144,13 @@ func decodeMachineKeyFile(_ data: Data) -> MachineKeyFile? {
     guard bytes.count > 5, bytes.count <= machineKeyMaxSize, Data(bytes[0..<4]) == machineKeyMagic else {
         return nil
     }
-    // A big-endian u16 length, then that many bytes, at `offset`.
-    func lengthPrefixed(at offset: Int) -> Range<Int>? {
-        guard bytes.count >= offset + 2 else {
-            return nil
-        }
-        let start = offset + 2
-        let end = start + (Int(bytes[offset]) << 8 | Int(bytes[offset + 1]))
-        return end <= bytes.count ? start..<end : nil
-    }
     switch bytes[4] {
     case 1:
         guard bytes.count > machineKeyV1HeaderLength else {
             return nil
         }
         let publicKey = Data(bytes[5..<(5 + machineKeyPublicKeyLength)])
-        guard let blob = lengthPrefixed(at: machineKeyV1HeaderLength - 2), !blob.isEmpty,
+        guard let blob = lengthPrefixedField(in: bytes, at: machineKeyV1HeaderLength - 2), !blob.isEmpty,
               blob.upperBound == bytes.count,
               (try? P256.KeyAgreement.PublicKey(x963Representation: publicKey)) != nil else {
             return nil
@@ -171,10 +162,10 @@ func decodeMachineKeyFile(_ data: Data) -> MachineKeyFile? {
         }
         let fingerprint = Data(bytes[6..<machineKeyV2HeaderLength])
         guard fingerprint.contains(where: { $0 != 0 }),
-              let blob = lengthPrefixed(at: machineKeyV2HeaderLength), !blob.isEmpty,
-              let encapsulated = lengthPrefixed(at: blob.upperBound),
+              let blob = lengthPrefixedField(in: bytes, at: machineKeyV2HeaderLength), !blob.isEmpty,
+              let encapsulated = lengthPrefixedField(in: bytes, at: blob.upperBound),
               encapsulated.count == machineKeyCiphertextLength(suite),
-              let classical = lengthPrefixed(at: encapsulated.upperBound),
+              let classical = lengthPrefixedField(in: bytes, at: encapsulated.upperBound),
               classical.isEmpty == (suite == .p256HashedPoint),
               classical.upperBound == bytes.count else {
             return nil
@@ -191,8 +182,19 @@ func decodeMachineKeyFile(_ data: Data) -> MachineKeyFile? {
 enum MachineKeyRead {
     case found(MachineKeyFile)
     case notFound
-    case accessDenied(String)
-    case untrusted(String)
+    /// The file is there but can't be used: `keychainAccessDenied` when this
+    /// account may not read it, `kekCorrupted` when it, or a folder above
+    /// it, isn't one root alone controls, or isn't a file this library
+    /// wrote. `reason` is for the log.
+    case refused(HKDFGuardStatus, reason: String)
+
+    static func accessDenied(_ reason: String) -> MachineKeyRead {
+        .refused(.keychainAccessDenied, reason: reason)
+    }
+
+    static func untrusted(_ reason: String) -> MachineKeyRead {
+        .refused(.kekCorrupted, reason: reason)
+    }
 }
 
 func machineKeyFolder() -> String {
@@ -299,12 +301,9 @@ func machineKekExists(service: String, settings: MachineServiceSettings) -> (sta
         return (HKDFGuardStatus.success.rawValue, true)
     case .notFound:
         return (HKDFGuardStatus.success.rawValue, false)
-    case .accessDenied(let reason):
+    case .refused(let status, let reason):
         logMachineRefusal(service, reason)
-        return (HKDFGuardStatus.keychainAccessDenied.rawValue, false)
-    case .untrusted(let reason):
-        logMachineRefusal(service, reason)
-        return (HKDFGuardStatus.kekCorrupted.rawValue, false)
+        return (status.rawValue, false)
     }
 }
 
@@ -317,12 +316,9 @@ func machineKeySummary(service: String, settings: MachineServiceSettings) -> (st
         return (HKDFGuardStatus.success.rawValue, (file.fingerprint, file.suite))
     case .notFound:
         return (HKDFGuardStatus.kekNotFound.rawValue, nil)
-    case .accessDenied(let reason):
+    case .refused(let status, let reason):
         logMachineRefusal(service, reason)
-        return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
-    case .untrusted(let reason):
-        logMachineRefusal(service, reason)
-        return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+        return (status.rawValue, nil)
     }
 }
 
@@ -336,12 +332,9 @@ func getMachineKEK(service: String, settings: MachineServiceSettings) -> (status
     switch readMachineKeyFile(service: service, settings: settings) {
     case .notFound:
         return (HKDFGuardStatus.kekNotFound.rawValue, nil)
-    case .accessDenied(let reason):
+    case .refused(let status, let reason):
         logMachineRefusal(service, reason)
-        return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
-    case .untrusted(let reason):
-        logMachineRefusal(service, reason)
-        return (HKDFGuardStatus.kekCorrupted.rawValue, nil)
+        return (status.rawValue, nil)
     case .found(var file):
         defer { file.zeroBlobs() }
         switch reconstructStoredKEK(file.stored, enclaveIsUsable: { enclaveProbeSucceeds(makeMachineAccessControl()) }) {
@@ -590,12 +583,9 @@ private func verifyExistingMachineKEK(service: String, settings: MachineServiceS
         return suiteRefusal(kek, suites, service: service) ?? HKDFGuardStatus.success.rawValue
     case .notFound:
         return HKDFGuardStatus.kekNotFound.rawValue
-    case .accessDenied(let reason):
+    case .refused(let status, let reason):
         logMachineRefusal(service, reason)
-        return HKDFGuardStatus.keychainAccessDenied.rawValue
-    case .untrusted(let reason):
-        logMachineRefusal(service, reason)
-        return HKDFGuardStatus.kekCorrupted.rawValue
+        return status.rawValue
     }
 }
 
