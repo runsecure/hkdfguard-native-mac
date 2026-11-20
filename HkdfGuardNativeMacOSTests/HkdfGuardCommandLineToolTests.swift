@@ -1030,7 +1030,14 @@ struct HkdfGuardCommandLineToolTests {
         // and no temporary file left beside it.
         let replacement = try Data(contentsOf: URL(fileURLWithPath: keyFilePath))
         #expect(replacement.count == 125)
-        #expect(Self.unwrapInApplicationCode(Array(replacement), service: service).dek == secondDek)
+        #expect(replacement != original, "the key file still holds the old payload")
+        #expect(replacement.prefix(32) == original.prefix(32), "the new payload is not wrapped under the same KEK")
+        // Unwrapping it here reads, in this process, a KEK the CLI created:
+        // the keychain prompt the suite's doc comment describes, which would
+        // hang an unattended run. Only when that has been opted into.
+        if Self.legacyCrossProcessRoundTripEnabled {
+            #expect(Self.unwrapInApplicationCode(Array(replacement), service: service).dek == secondDek)
+        }
         let attributes = try FileManager.default.attributesOfItem(atPath: keyFilePath)
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
         #expect(try FileManager.default.contentsOfDirectory(atPath: folder) == ["wrapped.key"], "a temporary file was left behind")
@@ -1085,7 +1092,12 @@ struct HkdfGuardCommandLineToolTests {
         #expect(result.stderr.contains("could not give"), "stderr: \(result.stderr)")
 
         #expect(try Data(contentsOf: URL(fileURLWithPath: keyFilePath)) == original, "the old key file must be left as it was")
-        #expect(Self.unwrapInApplicationCode(Array(original), service: service).dek == firstDek)
+        // Byte for byte is the check; unwrapping it in this process would
+        // raise the cross-process keychain prompt (see the suite's doc
+        // comment), so only when that has been opted into.
+        if Self.legacyCrossProcessRoundTripEnabled {
+            #expect(Self.unwrapInApplicationCode(Array(original), service: service).dek == firstDek)
+        }
         #expect(try FileManager.default.contentsOfDirectory(atPath: folder) == ["wrapped.key"], "a temporary file was left behind")
     }
 
