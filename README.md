@@ -20,10 +20,10 @@ for pipelines.
 ## What it does
 
 Each calling application identifies itself with a **service name** (see
-below). A service's KEK is a key generated inside the Secure Enclave: an
-ML-KEM-1024 key by default, or a P-256 key-agreement key where the policy
-opts in to one (see [KEK suites](#kek-suites)). Its private half never
-leaves the enclave and can only be *used*, never extracted. What the
+below). A service's KEK is generated inside the Secure Enclave: an
+ML-KEM-1024 key paired with a P-256 key-agreement key by default, or a
+P-256 key-agreement key alone where the policy opts in to one (see
+[KEK suites](#kek-suites)). Its private half never leaves the enclave and can only be *used*, never extracted. What the
 library persists, in the keychain or a machine KEK file, is the enclave's
 opaque, device-bound reference to that key.
 
@@ -38,9 +38,12 @@ primitive. The KEK's suite decides where the secret comes from:
 
 1. A fresh random 32-byte **salt** and 12-byte **nonce** are drawn.
 2. The **Secure Enclave** computes the secret:
-   - **ML-KEM-1024** (suite `0x02`): it decapsulates the ciphertext stored
-     with the KEK, which was encapsulated to it once, at provisioning, and
-     gets back the 32-byte secret `K`.
+   - **ML-KEM-1024** (suite `0x02`), a hybrid of two enclave keys. With
+     the KEK's ML-KEM key it decapsulates the ciphertext stored with the
+     KEK, which was encapsulated to it once, at provisioning, and gets back
+     the 32-byte secret `K`. With the KEK's P-256 key it computes
+     `Z = ECDH(KEK_priv, H)` as the P-256 suite below does, with `CS02` in
+     the DST in place of `CS01`.
    - **P-256** (suite `0x01`), the Linux and Windows libraries'
      construction: the salt is hashed to a P-256 point `H` with RFC 9380
      hash-to-curve, suite `P256_XMD:SHA-256_SSWU_RO_`, under the DST
@@ -51,7 +54,10 @@ primitive. The KEK's suite decides where the secret comes from:
    as HKDF's salt and an `info` of `"hkdfguard-wrap-v1:"` ‖ the service
    name's length (u16, little-endian) ‖ the service name ‖ the payload
    header. The header holds the suite byte, so the two suites never derive
-   the same key.
+   the same key. Suite `0x02` runs it twice: first over `Z`, to 64 bytes,
+   then over `K` with those 64 bytes as the salt (same `info`). HKDF's
+   first step is HMAC keyed by the salt, so the AES key is secret as long
+   as either `Z` or `K` is, the way TLS 1.3 chains its secrets.
 4. **AES-256-GCM** seals the DEK under the nonce, with the payload header
    as additional authenticated data.
 
@@ -65,9 +71,9 @@ for one service can never be opened under another.
 | | ML-KEM-1024 (`0x02`) | P-256 (`0x01`) |
 |---|---|---|
 | Provisioned | by default, on macOS 26 and later | only with `KekSuite` `P-256` in the [policy](#the-policy) |
-| The secret | `K`: one per KEK | `Z`: one per payload |
-| A quantum computer that sees the public key | learns nothing that gives `K` | recovers the private key, and with it every payload |
-| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key | SHA-256 of `0x04 ‖ x ‖ y` |
+| The secret | `K`, one per KEK, and `Z`, one per payload; the key needs both | `Z`: one per payload |
+| A quantum computer that sees the public keys | recovers the P-256 private key, but learns nothing that gives `K` | recovers the private key, and with it every payload |
+| Fingerprint | SHA-256 of the 1568-byte ML-KEM public key ‖ the 1568-byte stored ciphertext ‖ the P-256 public key (`0x04 ‖ x ‖ y`) | SHA-256 of `0x04 ‖ x ‖ y` |
 | Same construction on Linux and Windows | not yet | yes |
 
 Both keep the payload at 125 bytes, and with both only this Mac can create
@@ -95,7 +101,23 @@ provisioning and then dropped; from then on only decapsulating the stored
 ciphertext gives it back, and that takes the enclave. The public key lets
 anyone encapsulate a secret of their own, not recover `K`, so it can't be
 used to forge a payload either. Neither the public key nor the stored
-ciphertext needs to stay secret.
+ciphertext needs to stay secret. The suite's P-256 half is the paragraph
+above again: every payload also needs a `Z` only the enclave can compute.
+
+The stored ciphertext is part of the KEK: the same enclave keys with another
+ciphertext give another `K`, and ML-KEM decapsulation never fails on a
+wrong one. So the fingerprint covers both public keys and the ciphertext. A
+ciphertext swapped or damaged in storage makes the KEK a different KEK:
+a payload wrapped under the original is refused by it with `-16`
+(`KEK_FINGERPRINT_MISMATCH`). The KEK's own store records the fingerprint
+beside the ciphertext, in the keychain item and in the machine KEK file
+alike, so damage there is caught at the source: the KEK is `-19`
+(`KEK_INVALID`), never loaded as a different one. That record guards
+against damage, not against someone able to rewrite the store, who can
+record a fingerprint to match; the fingerprint in each payload, and the one
+you recorded at provisioning, are what catch a substituted KEK. The
+fingerprint is in the payload header, so the ciphertext is bound into every
+payload's key and tag as well.
 
 ### What each suite gives up
 
@@ -109,20 +131,30 @@ No payload or fingerprint carries the public key, but a P-256 machine KEK
 file does, in the clear, and so does every copy of that file a backup or
 snapshot keeps.
 
-**ML-KEM-1024** has one secret per KEK, not one per payload. `K` passes
-through the process on every wrap and unwrap, as `Z` does; captured once,
-it opens every payload under that KEK, and lets its holder create new ones,
-until the KEK is retired. That is the price of keeping the payload at 125
-bytes. The alternative, a fresh encapsulation per payload with an ML-DSA
-signature to keep payloads unforgeable, has P-256's one-secret-per-payload
-property but makes every payload about 4.5 KB.
+**ML-KEM-1024** has one `K` per KEK, not one per payload: that is what
+keeps the payload at 125 bytes. `K` passes through the process on every
+wrap and unwrap. On its own, captured once, it would open every payload
+under the KEK and let its holder create new ones, offline, until the KEK
+was retired. The suite's P-256 half is there so that it doesn't: each
+payload's key also needs that payload's `Z`, which takes this Mac's Secure
+Enclave every time. So a captured `K` is worth nothing without the enclave,
+and a captured `Z` opens one payload, as with P-256.
+
+What the hybrid gives up is that against a quantum computer the P-256 half
+adds nothing, so there `K` is all that stands: an attacker who has both
+captured `K` from this Mac's memory and can break P-256 opens every payload
+under the KEK. Either alone opens none. The alternative that removes the
+shared `K` altogether, a fresh encapsulation per payload with an ML-DSA
+signature to keep payloads unforgeable, makes every payload about 4.5 KB.
+A suite `0x02` KEK also costs two enclave operations per wrap and unwrap
+where P-256 costs one.
 
 ## Wrapped payload format
 
 Always exactly **125 bytes**:
 
 ```
-[ 32-byte KEK fingerprint — SHA-256 of the KEK's public key                 ]
+[ 32-byte KEK fingerprint — see the Fingerprint row under "KEK suites"      ]
 [  1-byte suite id — 0x01 (P-256) or 0x02 (ML-KEM-1024), the KEK's suite    ]
 [ 32-byte random salt                                                       ]
 [ 12-byte random AES-GCM nonce                                              ]
@@ -140,7 +172,8 @@ does; Windows hashes the raw `x || y`, without the `0x04` prefix, so the same
 key would fingerprint differently there. That is harmless, since a payload
 is only ever opened on the machine that wrapped it, but a fingerprint is
 only meaningful on the platform that produced it. For an ML-KEM-1024 KEK it
-hashes the raw 1568-byte public key. On unwrap it is compared to the current
+hashes the raw 1568-byte ML-KEM public key, the stored ciphertext and the
+P-256 public key. On unwrap it is compared to the current
 KEK's **before** any key agreement, decapsulation or decryption is
 attempted, so "wrong or rotated KEK" is reported as `fingerprintMismatch`
 (-16) rather than as a generic decryption failure. That includes a payload
@@ -268,8 +301,10 @@ process), so it is opt-in: call it once, early in startup.
    *host executable's* signature: the Hardened Runtime (`codesign --options
    runtime`) without `com.apple.security.get-task-allow` (which Xcode adds
    to Debug builds), `cs.allow-dyld-environment-variables`, or
-   `cs.disable-library-validation`. A library can check that but not change
-   it, so by default a weak signature is only **logged** (os_log, subsystem
+   `cs.disable-library-validation`. The check reads the status and
+   entitlements the kernel holds for the *running process*, not the
+   signature of the file on disk, which can have changed since launch. A
+   library can check that but not change it, so by default a weak signature is only **logged** (os_log, subsystem
    `com.hkdfguard`, category `hardening`) and the call still succeeds. That
    keeps the library usable from python, dotnet, Go, and Xcode Debug builds
    during development.
@@ -315,7 +350,7 @@ Console.app shows the same records live.
 | 1000 | default | A KEK was created (not merely found). |
 | 1002 | default | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | default | A DEK was unwrapped. |
-| 1004 | error | A KEK was retired by the CLI's `retire` (written by the CLI, category `audit`); names its fingerprint, scope and the admin behind `sudo`. |
+| 1004 | error | A KEK was retired by the CLI's `retire` (written by the CLI, category `audit`); names its fingerprint, scope and the admin behind `sudo`. A corrupt item or file retired with `--corrupt` has no fingerprint: its record carries `kek_fingerprint=none corrupt=1`. |
 | 2000 | error | `KEK_ACCESS_DENIED`. |
 | 2002 | fault | `KEK_INVALID`. |
 | 2003 | error | Unwrap rejected a tampered, corrupted, misdirected or unknown-suite payload: `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED`. |
@@ -323,6 +358,7 @@ Console.app shows the same records live.
 | 2005 | fault | `PROVIDER_UNAVAILABLE`, `CRYPTO_ERROR`, `INTERNAL_ERROR`, or one of the macOS refinements of `PROVIDER_ERROR` (-96..-100). |
 | 2006 | fault | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK; names the file. |
 | 2007 | warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` / `hkdfguard_kek_fingerprint` calls (each held to at least 1000 ms; see [Concurrency](#concurrency)). Logged once per process. |
+| 2008 | error | The CLI refused `provision`, `retire` or `wrap` on a machine-scoped service because the admin behind `sudo` is not in the role's group, or can't be identified (written by the CLI, category `audit`); names the command, service, role, group and admin. macOS only. |
 
 The unified log has no "warning" level, so Linux's info / warning / error
 are `default` / `error` / `fault` here. `default` is the level the log keeps
@@ -394,15 +430,21 @@ reach `out` only on success; on any failure the whole declared capacity of
   rollback rather than a loud error. A file with more than one hard link is
   accepted, as on Linux and Windows: putting a second name for an older
   payload where the service looks means creating an entry in the key's
-  folder, which the folder checks below limit to the owner and root.
+  folder, which the folder checks below limit to the owner and root (the
+  key's own folder may not be writable by group or others, sticky or not).
   Group- or world-*readable* is allowed, since the payload is ciphertext. A
   root-owned file must still be readable by the reading account: `0644`, or
   `0640` with a group the account belongs to. Otherwise it is
   `fileAccessDenied` (-33).
 - **Folders.** The same holds for every folder above the file, up to `/`,
   as on Linux: each must be owned by root or the process's effective user,
-  and not writable by group or others unless it is sticky (`/tmp`-style,
-  where only an entry's owner can rename or remove it). Write bits are
+  and not writable by group or others. A sticky folder (`/tmp`-style,
+  where only an entry's owner can rename or remove it) is excused when it
+  is further up the path, but not when it is the folder the key file is
+  directly in: sticky stops nobody adding an entry, and macOS lets any user
+  hard-link a file they don't own, so whenever the key's name was free
+  someone else could link an older payload to it. Keep a key in a folder of
+  its own (`/tmp/myservice/ingest.key`, not `/tmp/ingest.key`). Write bits are
   ignored only on the sealed system volume, which nothing can change; any
   other read-only volume, such as a mounted disk image, is checked like the
   rest. Otherwise someone else could rename a file of their choosing over
@@ -504,12 +546,12 @@ here are defined there but never returned on macOS.
 | `-36` | `ERR_FILE_TOO_LONG` | `fileTooLong` | more than 125 bytes |
 | `-37` | `ERR_FILE_PLAINTEXT_KEY` | `fileUnprotectedKey` | the file appears to hold a bare, unwrapped DEK (any 32-byte value as raw/base64/hex matches). **Treat the key as exposed** and rotate it |
 | `-38` | `ERR_FILE_MALFORMED` | `fileMalformed` | 125 bytes, but the fingerprint is all zeros |
-| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | a symbolic link (refused, never followed); owned by someone other than this user or root, or writable by group or others; or an ACL lets someone else change it; or it is on a volume that ignores ownership; or a folder above it is owned by someone else, writable by group or others without being sticky, or has an ACL letting someone else add or remove entries |
+| `-39` | `ERR_FILE_UNTRUSTED` | `fileInsecure` | a symbolic link (refused, never followed); owned by someone other than this user or root, or writable by group or others; or an ACL lets someone else change it; or it is on a volume that ignores ownership; or a folder above it is owned by someone else, writable by group or others (a sticky folder is excused unless it is the one the file is directly in), or has an ACL letting someone else add or remove entries |
 | `-96` | `ERR_MAC_ACCESS_CONTROL_CREATION_FAILED` | `accessControlCreationFailed` | refines `ERR_PROVIDER_ERROR` (-4) |
 | `-97` | `ERR_MAC_KEY_GENERATION_FAILED` | `keyGenerationFailed` | the enclave refused to generate a key; refines -4 |
 | `-98` | `ERR_MAC_KEYCHAIN_WRITE_FAILED` | `keychainWriteFailed` | refines -4 |
 | `-99` | `ERR_MAC_KEK_VERIFICATION_FAILED` | `kekVerificationFailed` | stored, but couldn't be reloaded immediately after; refines -4 |
-| `-100` | `ERR_MAC_KEYCHAIN_READ_FAILED` | `keychainReadFailed` | refines -4 |
+| `-100` | `ERR_MAC_KEYCHAIN_READ_FAILED` | `keychainReadFailed` | refines -4; also, in legacy keychain mode, more than one keychain in the search list holds a KEK item for the service (the log says so): remove the stray ones |
 
 ## Keychain modes (hybrid)
 
@@ -658,9 +700,16 @@ has already unwrapped every DEK they could reach. Recover in this order:
 3. Only then `retire` the old service's KEK. Anything still wrapped under it
    stops unwrapping.
 
-`retire` is not a crypto-shred. It deletes the KEK's keychain item or key
-file, which holds the Secure Enclave key in the only form it is stored in.
-A copy taken before the retire still holds it: a Time Machine or other
+`retire` is not a crypto-shred, and it does not revoke anything. It deletes
+the KEK's keychain item or key file, which holds the Secure Enclave key in
+the only form the library stores it in. That stored form is all it takes to
+use the key, so any account that could read it before the retire may have
+kept a copy and can go on using it in the same context: a member of the
+machine KEK's `RunnerGroup`, or, in legacy keychain mode, a process running
+as the same user. That is why the steps above replace the DEKs rather than
+rely on the retire.
+
+A copy taken before the retire still holds it too: a Time Machine or other
 backup of the login keychain or of `/Library/Application Support`, or a
 local APFS snapshot. Restored onto the same Mac, that copy unwraps every
 payload under the KEK again. (On another Mac it is useless: only this Mac's
@@ -719,6 +768,47 @@ quietly leave a production service user-scoped. `hkdfguard status` prints
 why. Services the policy doesn't list stay user-scoped. Leaving out
 `SecurityAdminGroup` or `DeploymentAdminGroup` lets any admin who can
 `sudo` act in that role.
+
+### When the policy goes away
+
+A Mac that has been in production mode does not go back to development
+mode because its policy disappeared: a removed profile, an unenrolled Mac,
+a deleted `policy.plist`. Otherwise "no policy" would quietly drop
+`RequirePostQuantum`, and let anyone provision a user-scoped KEK for a
+service that was machine-scoped.
+
+The first time a **root** process reads a valid policy (`sudo hkdfguard
+…`, or a LaunchDaemon running as root), the library writes a marker:
+
+```
+/Library/Application Support/HkdfGuard/production-mode    (root:wheel 0644)
+```
+
+While the marker exists, no policy at all counts as an invalid policy:
+every call fails with `-9` (`POLICY_INVALID`), and `hkdfguard status` says
+this Mac has been in production mode. Restore the profile or `policy.plist`
+to fix it. To return the Mac to development mode on purpose, delete the
+marker as root:
+
+```sh
+sudo rm "/Library/Application Support/HkdfGuard/production-mode"
+```
+
+- **Arming it.** Provisioning or wrapping for a machine-scoped service runs
+  as root, so those Macs are armed by their first use. A policy that holds
+  only suite settings is never read by root in normal use; run
+  `sudo hkdfguard status --service-name <any service>` once to arm such a
+  Mac. A root process that can't write the marker logs why (`log show
+  --predicate 'subsystem == "com.hkdfguard"'`) and carries on.
+- **Why there.** It sits beside the local policy and the machine KEKs, not
+  in `/Library/Managed Preferences`: macOS owns that folder and clears a
+  domain's file when its profile is removed, which is the event the marker
+  has to outlive.
+- **What it is not.** A tripwire for a lost policy, not a defence against
+  root: whoever can delete a root-owned `policy.plist` can delete the
+  marker too. It does not notice a policy replaced by a weaker one. And
+  while MDM replaces a profile, calls can briefly fail with `-9`.
+- The uninstaller leaves the marker in place, like the KEKs and the policy.
 
 ### KEK suites in the policy
 
@@ -780,7 +870,30 @@ sudo dseditgroup -o edit -a _orders -t user _orders
 ```
 
 The library refuses a `RunnerGroup` that covers too many accounts (`staff`,
-`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …).
+`everyone`, `localaccounts`, `admin`, `com.apple.access_ssh`, …), whatever
+name it goes by: the check is on the group's gid. It also refuses a group
+that has root as a member, which is what a group with one of those nested
+inside it looks like. It can't tell a small group of people from a small
+group of service accounts; that part is yours.
+
+The KEK file's group is checked against the policy on every use, not just
+when the KEK is created -- with every check above, not only its name: if
+a broad group is later nested into the `RunnerGroup` (so root becomes a
+member), or the name comes to mean a broad group's gid, every call for the
+service fails with `-19` even though the file's gid hasn't changed. Fix the
+group, then rotate the KEK: whoever the group admitted meanwhile may have
+read it. If you change a service's `RunnerGroup`, the
+existing file still belongs to the old group, and every call for that
+service fails with `-19` (the log names both groups) until you move it:
+
+```sh
+sudo chgrp _orders2 "/Library/Application Support/HkdfGuard/keks/com.example.orders.kek"
+```
+
+Do the same for the service's wrapped key files. Members of the old group
+could read the KEK file until then; if they should never have had it,
+retire the KEK and provision a new one instead. Removing a `RunnerGroup`
+calls for `chmod 600`.
 
 ### Provisioning, wrapping and retiring
 
@@ -799,7 +912,37 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
 
 - **The role is checked against the admin behind `sudo`**: the account that
   logged in to the session, which `sudo` doesn't change. `sudo` alone isn't
-  enough. A root login is trusted.
+  enough. Root itself is trusted: a root login, or a process with no login
+  behind it and no `sudo` (a LaunchDaemon, an MDM script). Where the
+  session records no login but `sudo` was used (a cron job, say), the
+  account `sudo` ran for is checked instead. An admin who can't be
+  identified, or whose membership can't be looked up, is refused.
+- **The roles bind only admins whose `sudo` is limited to `hkdfguard`.**
+  They are enforced by this tool, not by the library or the system: an
+  admin with unrestricted `sudo` is root, and root can do either role's
+  work without it. To separate the roles, give each group a sudoers rule
+  for its own commands only. Pin the deployment admins' `wrap` rule to the
+  key file paths they may write: `wrap` runs as root, so it writes its
+  output wherever `--key-file-path` says. It limits the damage a loose rule
+  can do: `--force` replaces only an existing wrapped key, never any other
+  file; a path containing `..` is refused under `sudo`; and nothing is
+  written among hkdfguard's own files (machine KEKs, the policy, the
+  installed tool).
+
+  Write the rule out in full, ending in `--dek-stdin`, rather than ending
+  it in a wildcard:
+
+  ```
+  %orders-deploy ALL = (root) /usr/local/bin/hkdfguard wrap -kf /Library/Application\ Support/Orders/dek.key -sn com.example.orders --dek-stdin -fp [0-9a-f]*
+  ```
+
+  sudo's `*` matches spaces too, so a rule ending `-kf /Library/Application\ Support/Orders/*`
+  also allows whatever is added after the path: another `-sn`, `--group`,
+  `--force`, `--dek-file`. And `--dek-file` should not be left open: under
+  `sudo` the tool reads as root, so it accepts any root-only file. Its
+  error messages then say whether that file is over 64 bytes, valid base64
+  and how long it decodes to, and a file that does hold a 32-byte base64
+  key (another pipeline's DEK) is wrapped for this admin's service.
 - **The Secure Enclave work runs in a one-off LaunchDaemon job.** The
   Secure Enclave binds a key to the context it was created in, so a key
   made from Terminal, `sudo` included, would be unusable by the service's
@@ -833,20 +976,27 @@ machine-scoped service:
   Secure Enclave would refuse them anyway: a key created by a daemon can't
   be used from a login session.
 - **Only root and `RunnerGroup` members can read the KEK file**; anyone else
-  gets `-18`.
+  gets `-18`. A file whose group is not the policy's current `RunnerGroup`
+  is refused with `-19`, for every caller.
 - **The KEK file** is `/Library/Application Support/HkdfGuard/keks/<service>.kek`,
   `root:<RunnerGroup>` `0640` (`0600` with no `RunnerGroup`). A P-256 KEK's
   (format 1) holds the public key and the Secure Enclave key blob; an
-  ML-KEM-1024 KEK's (format 2) holds the suite, the 32-byte fingerprint,
-  the blob and the stored ciphertext, and no public key. Either way
+  ML-KEM-1024 KEK's (format 3) holds the suite, the 32-byte fingerprint,
+  the ML-KEM blob, the stored ciphertext and the P-256 blob, and no public
+  key. A format 2 file, from a build before the suite became a hybrid, is
+  not read: it reports `-19`, and `retire --corrupt` removes it. Either way
   `status` and `retire` read the fingerprint from the file, without the
   Secure Enclave. The blob is usable only by this
   Mac's Secure Enclave, in the system context, after the first unlock since
   boot (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`). `provision`
   excludes the `keks` folder from Time Machine; local APFS snapshots still
   hold it. A file that
-  isn't root's, that anyone else can write, that others can read, or that
-  this library didn't write is `-19` (`KEK_INVALID`).
+  isn't root's, that anyone else can write, that others can read, that has
+  an access control list allowing anything (even read: it would let
+  accounts outside the `RunnerGroup` copy the key), or that this library
+  didn't write is `-19` (`KEK_INVALID`). Of those, `retire
+  --corrupt` deletes only a file whose content is bad; wrong ownership or
+  permissions on a sound file are to be fixed, not retired.
 - **Root is trusted.** Root can read the file and install a LaunchDaemon, so
   an admin who can `sudo` can ultimately use the key, as with every secret
   store on macOS. If admins reaching a Mac over SSH is a concern, turn off
@@ -904,7 +1054,7 @@ hkdfguard retire --service-name|-sn <name> \
   run reports "already provisioned …; verified" and exits 0. Prints the
   keychain mode it used, the KEK's suite (`ML-KEM-1024`, or `P-256` where
   the policy's `KekSuite` opts in; see [KEK suites in the policy](#kek-suites-in-the-policy)),
-  and its **fingerprint** (SHA-256 of its public key) — record it. On "already provisioned", compare it with the
+  and its **fingerprint** (see [KEK suites](#kek-suites)) — record it. On "already provisioned", compare it with the
   recorded value: a mismatch means the KEK under that name is not the one
   you provisioned.
 - **`status`** reports the keychain mode, the suite the policy provisions,
@@ -949,7 +1099,16 @@ hkdfguard retire --service-name|-sn <name> \
   acts on exactly one item, by persistent reference, after confirming that
   item's own blob is the unreconstructable one. Afterwards the service can
   be provisioned again. `--fingerprint` and `--corrupt` are mutually
-  exclusive.
+  exclusive. For a **machine-scoped** service `-19` is not enough, because
+  the library also reports it for a sound KEK file it refuses to trust (a
+  stray `chmod`, an added ACL, a folder someone else can write). The file is
+  deleted only if its own content is bad: it is not a KEK file, or it is a
+  well-formed one whose key the Secure Enclave can't rebuild, or that isn't
+  the key it records. That is judged by a one-off system job, the only
+  place a machine KEK loads, with the enclave proven usable there, and the
+  file deleted must still hold exactly the bytes that were judged. A file
+  whose key loads is never deleted: restore its ownership and permissions,
+  then use it or retire it with `--fingerprint`.
 - **`wrap`** wraps the pipeline's existing 32-byte DEK — base64, read from
   **stdin** (`--dek-stdin`) or a **file** (`--dek-file`), exactly one of the
   two — under the already-provisioned KEK and writes the 125-byte payload to
@@ -978,7 +1137,7 @@ hkdfguard retire --service-name|-sn <name> \
     key file only ciphertext. Every check is made on the opened descriptor,
     so it describes the file that is read. A file carrying an access
     control list is refused too, whatever its mode bits: an ACL can grant
-    read to anyone.
+    read to anyone. So is a file whose ACL can't be read at all.
   - *No symbolic link above a path (same as the Linux tool).* Neither
     `--key-file-path` nor `--dek-file` may be reached through a symlinked
     folder: whoever could plant one where the operator writes could redirect
@@ -1033,21 +1192,41 @@ hkdfguard retire --service-name|-sn <name> \
   get the same guarantee by comparing the first 32 bytes of the payload
   `hkdfguard_wrap_dek` returns against their recorded fingerprint before
   storing it.
-- **`--force`** securely overwrites an existing `<path>` (eight alternating
-  zero/random passes, each flushed with `F_FULLFSYNC`) before replacing it.
-  It refuses a file over 64 KiB, as the Linux tool does: a wrapped key is
-  125 bytes, so anything far bigger at the key path isn't one. When the
-  existing file is a wrapped key and `--fingerprint` is not given, the KEK
-  that file was wrapped under is the pin. A wrap under a different KEK is
+- **`--force`** replaces an existing wrapped key at `<path>`, and nothing
+  else. The file there must read as a wrapped key: 125 bytes, a suite this
+  library implements, a fingerprint that isn't all zeros. Any other file is
+  refused and left untouched, whoever runs the command; remove it yourself
+  if it really should be replaced. (This is stricter than the Linux tool,
+  which replaces any file up to 64 KiB. `wrap` is often run as root by
+  admins whose `sudo` is limited to it, and must not double as a way to
+  destroy some other file.)
+  The replacement is atomic. The new key is written to a temporary file in
+  the same folder (`.hkdfguard-<random>.tmp`), given its group and
+  permissions and flushed, then renamed over the old one. Anything that
+  fails before the rename (a `--group` you can't give, a full disk) leaves
+  the old key file exactly as it was. Only then are the old file's contents
+  securely overwritten: eight alternating zero/random passes, each flushed
+  with `F_FULLFSYNC`. If that last step fails, the new key is in place and
+  the command exits `1`, saying so.
+  When `--fingerprint` is not given, the KEK the existing file was wrapped
+  under is the pin. A wrap under a different KEK is
   refused, with both fingerprints named. To move a service to a deliberately
   replaced KEK (re-provisioned after `retire`), name the new KEK with
-  `--fingerprint`. Either mismatch is detected before the overwrite
-  starts, so the existing file is left intact. It only ever
+  `--fingerprint`. Either mismatch is detected before anything is written,
+  so the existing file is left intact. It only ever
   touches a **regular file with a single link**: a symlink at `<path>` is
   refused rather than followed (`O_NOFOLLOW` + `fstat`), and so is a file
   with more than one hard link, since overwriting it would also destroy
   whatever other file shares its contents. A FIFO, device, or directory is
   refused too.
+- **Reserved locations.** `wrap` never writes a key file among hkdfguard's
+  own files: the machine KEK folder, the installed tool's folder
+  (`/Library/Application Support/HkdfGuard/v1`), `/Library/Managed
+  Preferences`, or directly in `/Library/Application Support/HkdfGuard`
+  (where the local `policy.plist` and the production-mode marker live; a
+  folder root made beneath it is fine). Run as root, it also refuses a
+  `<path>` containing `..`, so a sudoers rule that pins `wrap` to a folder
+  can't be walked out of.
 
 Exit codes: `0` success, `1` runtime failure, `2` argument error (usage
 printed). Nothing persistent is touched until every argument is validated.
@@ -1102,7 +1281,22 @@ hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 | `hkdfguard-app` | `hkdfguard.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
 | `HkdfGuardNativeMacOSTestHost` | `HkdfGuardNativeMacOSTestHost.app` | Minimal entitled host app for the test bundle, so the suite can run in data-protection mode (see Tests) |
 
-All library targets build from the single `HkdfGuardNativeMacOS.swift`.
+All library targets build from the same Swift sources in
+`HkdfGuardNativeMacOS/`:
+
+| File | Holds |
+|---|---|
+| `HkdfGuardNativeMacOS.swift` | The payload layout, and the C ABI entry points for setup, wrap and unwrap |
+| `HkdfGuardStatus.swift` | The status codes |
+| `HkdfGuardHashToCurve.swift` | RFC 9380 hash-to-curve and the P-256 field arithmetic |
+| `HkdfGuardKEK.swift` | The KEK types (P-256, ML-KEM-1024 hybrid) and wrapping-key derivation |
+| `HkdfGuardKeychain.swift` | User-scoped KEKs: keychain mode, the keychain item, service names, lookup and creation |
+| `HkdfGuardPolicy.swift` | The production policy, the production-mode marker, and a service's scope |
+| `HkdfGuardMachineKEK.swift` | Machine-scoped KEKs: the system context, the KEK file, runner groups |
+| `HkdfGuardAudit.swift` | The audit trail |
+| `HkdfGuardHardening.swift` | `hkdfguard_harden_process` |
+| `HkdfGuardKeyFile.swift` | `hkdfguard_open_file` and the file and folder trust checks |
+
 Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). Every
 target -- the framework, the dylib, both CLI builds, the test bundle, and
 the test host -- targets **macOS 14.0+**, set explicitly rather than left
@@ -1150,6 +1344,16 @@ timestamp**, then verifies: strict signature check, runtime flag, timestamp,
 `lipo` architecture, rpath, `@rpath` reference, and a `--help` launch smoke
 test. Everything is assembled in a staging
 directory and only moved into `dist/` once every check passes.
+
+Every run is a clean build. The script deletes its own build folders
+(`build-arm64/`, `hkdfguard-cli/.build-arm64/`) first and archives the app
+with a temporary DerivedData, so nothing compiled by an earlier run is
+reused. It ignores `XCODE_XCCONFIG_FILE`, `SDKROOT`, `TOOLCHAINS`,
+`SWIFT_EXEC`, `SWIFT_EXEC_MANIFEST` and `CC` from the caller's environment
+and pins `PATH`; only `DEVELOPER_DIR` chooses the toolchain. The dylib and
+the bare CLI are stripped before signing: no debug entries (which record
+build-machine paths and file times) and no local symbols, only the dylib's
+exported C ABI. The script fails if either remains.
 
 ```sh
 ./build-dist.sh        # local testing only: "Apple Development", not notarized
@@ -1207,7 +1411,9 @@ anything reaches `dist/`, the script verifies:
 - that the executable and the embedded dylib are arm64;
 - that the first `keychain-access-groups` entry is `<TeamID>.com.hkdfguard.keys`
   (the library stores KEKs under the first), and that the test-only
-  `com.hkdfguard.tests.keys` group is absent;
+  `com.hkdfguard.tests.keys` group is absent -- or, for a `debugging`
+  export, the reverse: that it carries the test-only group and not the
+  production one (see below);
 - the embedded profile: issued for that Team, granting that group, and of
   the expected type;
 - a read-only smoke test on this Mac: `--help` launches, and `status`
@@ -1219,6 +1425,15 @@ anything reaches `dist/`, the script verifies:
 |---|---|---|
 | `developer-id` | Developer ID, secure timestamp; default when `HKDFGUARD_SIGN_IDENTITY` is a Developer ID identity | any Mac, once notarized |
 | `debugging` | development; the default otherwise | only Macs registered to your developer account |
+
+A `debugging` export is development-signed, and depending on the Xcode
+version it carries `get-task-allow`: any process running as the same user
+can then attach a debugger to it and use whatever keys it can. It is
+therefore always built with the
+test-only `com.hkdfguard.tests.keys` access group, like the Debug builds,
+and never sees the KEKs a `developer-id` build stores under
+`com.hkdfguard.keys`. KEKs it provisions are test KEKs: a `developer-id`
+build can't use them, and the reverse.
 
 **Credentials are never stored in the script or the repository.** Each
 input only names something kept in your keychain or Xcode:
@@ -1379,7 +1594,10 @@ profile, runs `build-release.sh` with
 key and profile whether or not the build succeeded. Run it by hand from `main`
 first: that run does everything except publish, and uploads the `.pkg` as a
 workflow artifact, so you can test the signing setup without making a
-release.
+release. The workflow refuses a manual run from a commit that is not on
+`main`. The package it builds is signed and notarized like a release, so
+its artifact is named `DRY-RUN-not-a-release-...` and deleted after one
+day; don't install it anywhere a release belongs.
 
 ## Publishing a release
 
@@ -1402,8 +1620,8 @@ version, run the full suite on real hardware (see
 [Continuous integration](#continuous-integration)), then push a signed tag:
 
 ```sh
-git tag -s v0.9.1 -m v0.9.1   # must equal v<MARKETING_VERSION>
-git push origin v0.9.1
+git tag -s v0.9.2 -m v0.9.2   # must equal v<MARKETING_VERSION>
+git push origin v0.9.2
 ```
 
 The workflow checks that the tag matches `MARKETING_VERSION` and is on
@@ -1414,7 +1632,7 @@ To build and publish one by hand instead (the workflow runs the same
 steps):
 
 ```sh
-VERSION=v0.9.1   # must equal MARKETING_VERSION in the Xcode project
+VERSION=v0.9.2   # must equal MARKETING_VERSION in the Xcode project
 
 HKDFGUARD_RELEASE=1 \
 HKDFGUARD_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
@@ -1524,7 +1742,7 @@ package first, and install only if every check passes:
 
 ```sh
 set -e
-VERSION=v0.9.1
+VERSION=v0.9.2
 TEAM_ID=MFW3T8R8J3                        # the Team that signs this project's releases
 EXPECTED=<the SHA-256 from the release notes>
 PKG="hkdfguard-native-macos-${VERSION#v}-osx-arm64.pkg"
@@ -1577,8 +1795,9 @@ sudo "/Library/Application Support/HkdfGuard/v1/uninstall.sh"
 Removes `v1/`, the `PATH` symlink (only if it still points at this CLI), and
 the package receipt. **KEKs are not touched**: user-scoped ones live in each
 user's keychain, and machine-scoped ones in
-`/Library/Application Support/HkdfGuard/keks`, outside `v1/`, as does a local
-`policy.plist`. Retire any that should go *before*
+`/Library/Application Support/HkdfGuard/keks`, outside `v1/`, as do a local
+`policy.plist` and the [production-mode marker](#when-the-policy-goes-away).
+Retire any that should go *before*
 uninstalling, while the CLI still exists (see `retire` above).
 
 ### Why this location
@@ -1899,8 +2118,8 @@ carried by the install folder `HkdfGuard/v1/` here and by the
   arbitrary host processes.
 - The **bundled CLI** has two entitlement files: the Release build (what
   `build-dist.sh` ships) carries the production `com.hkdfguard.keys` group;
-  Debug and DebugHosted carry the test-only `com.hkdfguard.tests.keys`
-  group. The **test host** carries only the test group, and has no hardened
+  Debug and DebugHosted, and `build-dist.sh`'s debuggable `debugging`
+  export, carry the test-only `com.hkdfguard.tests.keys` group. The **test host** carries only the test group, and has no hardened
   runtime (see Tests).
 - **Data-protection mode** requires the *consuming process* to be a
   Team-signed app bundle with an embedded provisioning profile carrying
@@ -1965,8 +2184,10 @@ Ten Swift Testing suites. The three largest:
   rejected arguments, `wrap --fingerprint` (match, mismatch leaves an
   existing file untouched, malformed, the unpinned-wrap warning), `wrap
   --force` pinned to the replaced key file's KEK, `retire` by fingerprint and
-  `--corrupt`, `--force` symlink/hard-link/FIFO refusal, the 64 KiB size cap
-  and a full overwrite at that cap, file permissions, exit codes, and —
+  `--corrupt`, `--force` symlink/hard-link/FIFO refusal, its refusal of any
+  file that isn't a wrapped key, the atomic replacement (a failed write
+  leaves the old key) and the overwrite of the replaced file, the reserved
+  locations, file permissions, exit codes, and —
   hosted — the bundled CLI's data-protection provision/wrap/retire with
   this host unwrapping.
 

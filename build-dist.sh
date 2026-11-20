@@ -31,11 +31,21 @@
 #                 HKDFGUARD_SIGN_IDENTITY is a Developer ID identity.
 #   debugging     development signing for testing only: the bundle launches
 #                 only on Macs registered to the developer account. The
-#                 default otherwise.
+#                 default otherwise. A development-signed bundle may be
+#                 one a debugger can attach to (get-task-allow, depending
+#                 on the Xcode), so it is given the test-only
+#                 com.hkdfguard.tests.keys access group instead: it never
+#                 sees the KEKs a Developer ID build uses.
 #
 # Everything is assembled in a temporary staging directory and only moved
 # into place as dist/ once every build, signature, and check has passed, so
 # a failure part-way through never leaves an empty or half-populated dist/.
+#
+# Every build starts clean: the build folders this script owns
+# (build-arm64/, hkdfguard-cli/.build-arm64/) are deleted first and the app
+# is archived with its own temporary DerivedData, so nothing compiled by an
+# earlier run -- from other sources, or with other settings -- can end up in
+# what is signed here.
 #
 # Signing uses a secure timestamp (--timestamp), which contacts Apple's
 # timestamp server: this script needs network access to complete.
@@ -56,9 +66,16 @@ fi
 # DEVELOPER_DIR is left alone -- it is how a particular Xcode is chosen --
 # but the folder in use is printed, so a build log always shows which
 # toolchain built and signed the release.
+#
+# The same goes for what the build tools read from the environment:
+# XCODE_XCCONFIG_FILE adds build settings to every xcodebuild below (CI sets
+# it to build unsigned), SDKROOT picks the SDK, and SwiftPM takes its
+# compilers from SWIFT_EXEC, SWIFT_EXEC_MANIFEST and CC. None may be
+# inherited.
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 unset TOOLCHAINS
+unset XCODE_XCCONFIG_FILE SDKROOT SWIFT_EXEC SWIFT_EXEC_MANIFEST CC
 echo "==> Developer tools: ${DEVELOPER_DIR:-$(xcode-select -p)}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,6 +122,7 @@ APP_NAME="hkdfguard.app"
 APP_EXECUTABLE="hkdfguard"
 APP_BUNDLE_ID="com.hkdfguard.cli"
 ACCESS_GROUP_SUFFIX="com.hkdfguard.keys"
+TEST_ACCESS_GROUP_SUFFIX="com.hkdfguard.tests.keys"
 
 # Credentials. None are stored in this script or the repository; each input
 # below only *names* a credential kept elsewhere:
@@ -244,6 +262,23 @@ assert_entitlements() {
         || fail "$file: entitlements are [$(tr '\n' ' ' <<<"$actual")], expected [$(tr '\n' ' ' <<<"$expected")]"
 }
 
+# Asserts a Mach-O file carries no debug symbol entries and no local symbols.
+# The debug entries name every object file by its absolute path on the build
+# machine, with its modification time.
+assert_stripped() {
+    local file="$1" symbols
+    # strip itself leaves one marker entry behind ("OPT radr://5614542"),
+    # which names nothing.
+    symbols="$(nm -a "$file" | grep -v ' OPT radr://5614542$' || true)"
+    if grep -q -E '^[0-9a-f]* +- ' <<<"$symbols"; then
+        fail "$file: still carries debug symbol entries (build-machine paths)"
+    fi
+    symbols="$(nm -U "$file")"
+    if grep -q -E ' [a-z] ' <<<"$symbols"; then
+        fail "$file: still carries local symbols"
+    fi
+}
+
 # Asserts a signature verifies strictly and carries the hardened-runtime
 # flag and a secure timestamp.
 assert_signed() {
@@ -375,15 +410,26 @@ build_arch() {
     echo "==================== $rid ($arch) ===================="
     mkdir -p "$out"
 
+    # Both folders are this script's own build output (see .gitignore).
+    # Starting from nothing means no object file from an earlier run, built
+    # from other sources or with other settings, can be linked into the
+    # release.
+    echo "==> Removing earlier build output: $build_dir, $scratch"
+    rm -rf "$build_dir" "$scratch"
+
     echo "==> Building $DYLIB_NAME for $arch (Release) into $build_dir"
     # Signed manually with the identity it is re-signed with below. The
     # project's automatic signing would want an Apple Development
-    # certificate, which a release machine (CI) need not have.
+    # certificate, which a release machine (CI) need not have. SYMROOT and
+    # OBJROOT keep the intermediate files in $build_dir too: by default they
+    # go to build/, which everyday builds share and nothing here cleans.
     xcodebuild -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
         -target HkdfGuardNativeMacOSDylib \
         -configuration Release \
         ARCHS="$arch" ONLY_ACTIVE_ARCH=NO \
         BUILD_DIR="$build_dir" \
+        SYMROOT="$build_dir" \
+        OBJROOT="$build_dir/Intermediates" \
         CODE_SIGN_STYLE=Manual \
         CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
         DEVELOPMENT_TEAM="$TEAM_ID" \
@@ -421,6 +467,15 @@ build_arch() {
     cp "$HEADER" "$out/"
     cp "$cli_bin_dir/hkdfguard" "$out/"
 
+    echo "==> Stripping $rid/$DYLIB_NAME and $rid/hkdfguard"
+    # As built, both carry a debug map: the absolute path and modification
+    # time of every object file, plus all local symbol names. That tells a
+    # reader about the build machine and makes two builds of the same
+    # source differ. The dylib keeps its exported symbols (the C ABI); the
+    # CLI keeps only what dyld needs. Both are signed afterwards, below.
+    strip -S -x -no_code_signature_warning "$out/$DYLIB_NAME"
+    strip -no_code_signature_warning "$out/hkdfguard"
+
     echo "==> Making $rid/hkdfguard self-contained"
     # As linked (see Package.swift), the CLI finds the dylib via an -rpath
     # baked in as this machine's absolute build directory -- fine
@@ -455,6 +510,8 @@ build_arch() {
     echo "==> Verifying $rid"
     assert_arch "$out/$DYLIB_NAME" "$arch"
     assert_arch "$cli" "$arch"
+    assert_stripped "$out/$DYLIB_NAME"
+    assert_stripped "$cli"
     assert_signed "$out/$DYLIB_NAME"
     assert_signed "$cli"
     assert_identity "$out/$DYLIB_NAME"
@@ -497,7 +554,20 @@ build_app() {
     local export_dir="$WORK/export"
     local options="$WORK/ExportOptions.plist"
 
+    # A debugging export is development-signed, and some Xcodes make that
+    # debuggable (get-task-allow): any process of the same user can then
+    # attach to it and act as it. So it gets the test-only access group, like the Debug builds --
+    # with the production group, every production KEK on this Mac would be
+    # usable through it. HKDFGUARD_APP_ENTITLEMENTS is the app target's own
+    # build setting (the file its Release configuration signs with); no other
+    # target reads it.
     local expected_group="$TEAM_ID.$ACCESS_GROUP_SUFFIX"
+    local entitlements_file="hkdfguard.entitlements"
+    if [ "$APP_EXPORT" != "developer-id" ]; then
+        expected_group="$TEAM_ID.$TEST_ACCESS_GROUP_SUFFIX"
+        entitlements_file="hkdfguard.tests.entitlements"
+    fi
+    [ -f "$CLI_PKG/$entitlements_file" ] || fail "missing $CLI_PKG/$entitlements_file"
 
     echo
     echo "==================== osx-arm64-app ($APP_NAME, export: $APP_EXPORT) ===================="
@@ -532,6 +602,9 @@ build_app() {
         )
     fi
 
+    # Its own DerivedData, in the scratch folder: the default one under
+    # ~/Library is shared with Xcode and every other build of this project,
+    # and would be built on incrementally.
     echo "==> Archiving $APP_SCHEME (Release, arm64, team $TEAM_ID, signing: ${APP_PROFILE:+manual, profile $APP_PROFILE}${APP_PROFILE:-automatic})"
     xcodebuild archive \
         -project "$ROOT/HkdfGuardNativeMacOS.xcodeproj" \
@@ -539,9 +612,11 @@ build_app() {
         -configuration Release \
         -destination "generic/platform=macOS" \
         -archivePath "$archive" \
+        -derivedDataPath "$WORK/DerivedData" \
         ${provisioning_args[@]+"${provisioning_args[@]}"} \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
         DEVELOPMENT_TEAM="$TEAM_ID" \
+        "HKDFGUARD_APP_ENTITLEMENTS=$entitlements_file" \
         ${manual_signing[@]+"${manual_signing[@]}"} \
         ${strict_conditions[@]+"${strict_conditions[@]}"}
 
@@ -593,11 +668,15 @@ build_app() {
     grep -q "^TeamIdentifier=$TEAM_ID\$" <<<"$info" || fail "$embedded_dylib: not signed by team $TEAM_ID"
 
     # The app's own keychain identity and nothing more. A development
-    # export is debuggable by design (get-task-allow) and never packaged:
+    # export may also be debuggable (get-task-allow: older Xcodes add it
+    # to a "debugging" export, Xcode 27 does not); either way it holds only
+    # the test-only access group (checked below) and is never packaged:
     # build-pkg.sh accepts only the developer-id set.
     local app_entitlements=(com.apple.application-identifier com.apple.developer.team-identifier keychain-access-groups)
-    if [ "$APP_EXPORT" != "developer-id" ]; then
+    if [ "$APP_EXPORT" != "developer-id" ] \
+        && codesign -d --entitlements - "$exe" 2>/dev/null | grep -q 'com\.apple\.security\.get-task-allow'; then
         app_entitlements+=(com.apple.security.get-task-allow)
+        echo "    note: this export is debuggable (get-task-allow)"
     fi
     assert_entitlements "$exe" "${app_entitlements[@]}"
     assert_entitlements "$embedded_dylib"
@@ -613,10 +692,22 @@ build_app() {
     first_group="$(plist_value "$entitlements" keychain-access-groups.0)"
     [ "$first_group" = "$expected_group" ] \
         || fail "$app: first keychain-access-groups entry is '$first_group', expected '$expected_group'"
-    # The test-only group belongs to the unhardened test host and the Debug
-    # builds; a shipped bundle carrying it would share KEKs with them.
-    if grep -q 'com\.hkdfguard\.tests\.keys' "$entitlements"; then
-        fail "$app: carries the test-only com.hkdfguard.tests.keys access group"
+    # Exactly that one group: a second entry would be readable too.
+    [ -z "$(plist_value "$entitlements" keychain-access-groups.1)" ] \
+        || fail "$app: carries more than one keychain access group"
+    # The test-only group belongs to the unhardened test host, the Debug
+    # builds and a debugging export; a shipped bundle carrying it would
+    # share KEKs with them. And the reverse: nothing debuggable may hold the
+    # production group.
+    if [ "$APP_EXPORT" = "developer-id" ]; then
+        if grep -q 'com\.hkdfguard\.tests\.keys' "$entitlements"; then
+            fail "$app: carries the test-only com.hkdfguard.tests.keys access group"
+        fi
+    else
+        echo "    note: development build; uses the test-only $TEST_ACCESS_GROUP_SUFFIX access group, not production KEKs"
+    fi
+    if grep -q 'get-task-allow' "$entitlements" && grep -q "$TEAM_ID\.com\.hkdfguard\.keys" "$entitlements"; then
+        fail "$app: is debuggable (get-task-allow) and carries the production $ACCESS_GROUP_SUFFIX access group"
     fi
 
     local profile="$app/Contents/embedded.provisionprofile"

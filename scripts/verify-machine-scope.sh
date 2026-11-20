@@ -20,6 +20,8 @@
 #     still be retired
 #   - retire: refused with the wrong fingerprint; with the right one the KEK
 #     file is deleted and the payload no longer unwraps
+#   - retire --corrupt: refused for a healthy KEK file the library rejects
+#     only for its permissions; deletes a file that is not a KEK file
 #
 # Before macOS 26 the ML-KEM pass only checks that provisioning refuses,
 # rather than creating a P-256 KEK in its place.
@@ -34,7 +36,8 @@
 # _hkdfguardverify (member: nobody), the KEK files for
 # com.hkdfguard.verify.mlkem and com.hkdfguard.verify.p256, temporary
 # LaunchDaemons, and its staging folder. Refuses to start if a policy, that
-# group, or either KEK already exists.
+# group, either KEK, the staging folder or its LaunchDaemon already exists,
+# so everything it removes on exit is something it made.
 #
 # Run with: sudo bash scripts/verify-machine-scope.sh
 set -u
@@ -54,6 +57,10 @@ HG="/Library/Application Support/HkdfGuard"
 POLICY="$HG/policy.plist"
 MANAGED="/Library/Managed Preferences/com.hkdfguard.plist"
 KEKS="$HG/keks"
+# The library writes this the first time root sees a valid policy, and from
+# then on a missing policy fails closed. This script's policy is temporary,
+# so the marker it causes is removed with it (see cleanup).
+MARKER="$HG/production-mode"
 STAGE="$HG/verify"
 SERVICES="com.hkdfguard.verify.mlkem com.hkdfguard.verify.p256"
 GROUP=_hkdfguardverify
@@ -64,8 +71,35 @@ MLKEM_AVAILABLE=0
 
 [[ -e "$POLICY" ]] && fail_now "$POLICY already exists; not touching a real policy"
 [[ -e "$MANAGED" ]] && fail_now "$MANAGED exists (an MDM policy); run this on a Mac without one"
+[[ -e "$MARKER" || -L "$MARKER" ]] && fail_now "$MARKER exists: this Mac has been in production mode; not touching it"
 for s in $SERVICES; do [[ -e "$KEKS/$s.kek" ]] && fail_now "$KEKS/$s.kek already exists"; done
 dscl . -read "/Groups/$GROUP" >/dev/null 2>&1 && fail_now "group $GROUP already exists"
+# Not -e: a dangling symbolic link exists too.
+[[ -e "$STAGE" || -L "$STAGE" ]] && fail_now "$STAGE already exists (left by an interrupted run?); look at what it holds, then remove it: sudo rm -rf \"$STAGE\""
+[[ -e "$JOBPLIST" || -L "$JOBPLIST" ]] && fail_now "$JOBPLIST already exists (left by an interrupted run?); remove it: sudo launchctl bootout system/$LABEL; sudo rm \"$JOBPLIST\""
+# Whether `$1` carries an access control list entry that allows anything.
+# `ls -le` prints one line per entry ("  0: group:staff allow add_file,...");
+# deny entries only take rights away. An ACL can give an account add, delete
+# or rename rights in a folder whatever its mode says -- and an inheritable
+# one passes those rights on to every folder and file made inside it.
+has_allow_acl() {
+    local listing
+    listing="$(ls -lde "$1" 2>/dev/null)" || return 0 # can't tell: assume the worst
+    grep -qE '^ *[0-9]+: .* allow ' <<<"$listing"
+}
+
+# Root works in these folders below, and in the folders above them by path;
+# nobody else may be able to put anything in any of them: root-owned, not
+# writable by group or others, and no ACL allowing anything.
+root_only_folder() {
+    [[ -d "$1" && ! -L "$1" && "$(stat -f '%u' "$1")" = 0 && -z "$(find "$1" -maxdepth 0 -perm +022)" ]] \
+        && ! has_allow_acl "$1"
+}
+for d in / /Library "/Library/Application Support" "$HG" "$KEKS"; do
+    [[ -e "$d" || -L "$d" ]] || continue
+    root_only_folder "$d" \
+        || fail_now "$d is not a folder that only root can write (owner, mode, or an ACL: ls -lde \"$d\")"
+done
 
 CREATED_HG=0; CREATED_KEKS=0
 [[ -d "$HG" ]] || { mkdir -m 0755 "$HG" && chown root:wheel "$HG" && CREATED_HG=1; }
@@ -74,15 +108,14 @@ CREATED_HG=0; CREATED_KEKS=0
 cleanup() {
     launchctl bootout system/$LABEL 2>/dev/null; rm -f "$JOBPLIST"
     rm -f "$POLICY"
+    # Checked absent above, so this one is ours: left behind, it would make
+    # every hkdfguard call on this Mac fail with POLICY_INVALID.
+    rm -f "$MARKER"
     for s in $SERVICES; do rm -f "$KEKS/$s.kek"; done
     [[ "$CREATED_KEKS" -eq 1 ]] && rmdir "$KEKS" 2>/dev/null
     rm -rf "$STAGE"
     [[ "$CREATED_HG" -eq 1 ]] && rmdir "$HG" 2>/dev/null
     dseditgroup -o delete -n . "$GROUP" >/dev/null 2>&1
-    # The Secure Enclave prototype's watcher, if it is still installed.
-    launchctl bootout system/com.hkdfguard.sepoc.watch 2>/dev/null
-    rm -f /Library/LaunchDaemons/com.hkdfguard.sepoc.watch.plist
-    rm -rf /private/var/tmp/hkdfguard-sepoc
 }
 trap cleanup EXIT
 
@@ -97,9 +130,22 @@ byte_at() { # byte_at <offset> <file>: that byte, as two hex digits
 }
 
 echo "== staging root-owned copies of this repo's builds in $STAGE"
-mkdir -m 0755 "$STAGE" "$STAGE/bin" "$STAGE/keys" "$STAGE/out"
+# All of it root's, 0755, and it stays that way: root creates, reads and
+# removes files by name in here, so no other account may be able to add,
+# rename or replace an entry (a symbolic link planted at one of those names
+# would have root act on whatever it points at).
+# umask covers the mode bits only: an inheritable ACL on a folder above
+# would still be copied onto each new folder. So every ACL is removed before
+# anything is written into them, and each folder is checked again.
+( umask 022; mkdir "$STAGE" "$STAGE/bin" "$STAGE/keys" "$STAGE/out" ) || fail_now "could not create $STAGE"
+chown -R root:wheel "$STAGE"
+chmod -RN "$STAGE"
+for d in "$STAGE" "$STAGE/bin" "$STAGE/keys" "$STAGE/out"; do
+    root_only_folder "$d" || fail_now "$d is not a folder that only root can write, even after removing its ACL"
+done
 install -o root -g wheel -m 0755 "$CLI_SRC" "$STAGE/bin/hkdfguard"
 install -o root -g wheel -m 0644 "$LIB_SRC" "$STAGE/bin/libhkdfguard.dylib"
+chmod -N "$STAGE/bin/hkdfguard" "$STAGE/bin/libhkdfguard.dylib"
 # The development CLI finds its library in the repo; the staged one must
 # use the root-owned copy beside it.
 otool -l "$STAGE/bin/hkdfguard" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}' \
@@ -120,7 +166,12 @@ int main(int argc, char **argv) {
     int open_status = hkdfguard_open_file(argv[1], wrapped, &wrapped_len);
     uint8_t dek[32]; int dek_len = sizeof dek;
     int unwrap_status = open_status == 0 ? hkdfguard_unwrap_dek(argv[2], wrapped, wrapped_len, dek, &dek_len) : 999;
-    printf("uid=%d session_flags=0x%llx open=%d unwrap=%d dek=", (int)getuid(), flags, open_status, unwrap_status);
+    /* The groups this process really runs with: what the kernel checks the
+       key file's group against, whatever the directory says by now. */
+    gid_t groups[64]; int n = getgroups(64, groups);
+    printf("uid=%d gid=%d groups=", (int)getuid(), (int)getgid());
+    for (int i = 0; i < n; i++) printf("%s%d", i ? "," : "", (int)groups[i]);
+    printf(" session_flags=0x%llx open=%d unwrap=%d dek=", flags, open_status, unwrap_status);
     if (unwrap_status == 0) for (int i = 0; i < 32; i++) printf("%02x", dek[i]);
     printf("\n");
     return 0;
@@ -134,7 +185,12 @@ CLI="$STAGE/bin/hkdfguard"
 echo "== a runner group holding only the service account (nobody)"
 dseditgroup -o create -n . -r "HkdfGuard verification" "$GROUP" || fail_now "could not create $GROUP"
 dseditgroup -o edit -n . -a nobody -t user "$GROUP" || fail_now "could not add nobody to $GROUP"
-chown nobody "$STAGE/out"
+GROUP_GID="$(dscl . -read "/Groups/$GROUP" PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+# launchd gives a job its account's groups as it knows them when the job
+# starts. The group is seconds old and nobody was just added to it, so drop
+# every cached answer about either before the first job runs.
+dscacheutil -flushcache
+dsmemberutil flushcache >/dev/null 2>&1
 
 # The suite pass in progress: its service, key file, and the policy's suite
 # settings (empty: the defaults).
@@ -157,9 +213,15 @@ PLIST
 }
 
 # Runs the consumer as a real LaunchDaemon as <user>; prints its one line.
+# The job writes its output to a file root makes for it first -- new, empty,
+# and the job's account's own -- in the root-owned out folder: the account
+# gets one file to write, not a folder to put things in.
 consumer_daemon() { # consumer_daemon <user> <tag>
     local out="$STAGE/out/$2.txt"
     rm -f "$out"
+    # noclobber: created here or not at all, never an existing file or a link.
+    ( set -o noclobber; umask 077; : > "$out" ) 2>/dev/null || { echo "(could not create $out)"; return; }
+    chown -h "$1" "$out" || { echo "(could not give $out to $1)"; return; }
     launchctl bootout system/$LABEL 2>/dev/null
     cat > "$JOBPLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -175,12 +237,26 @@ consumer_daemon() { # consumer_daemon <user> <tag>
 </dict></plist>
 PLIST
     chown root:wheel "$JOBPLIST"; chmod 0644 "$JOBPLIST"
-    [[ "$1" = nobody ]] || touch "$out"
-    chown "$1" "$out" 2>/dev/null
     launchctl bootstrap system "$JOBPLIST"
     for _ in $(seq 1 40); do [[ -s "$out" ]] && break; sleep 0.25; done
     launchctl bootout system/$LABEL 2>/dev/null; rm -f "$JOBPLIST"
     cat "$out" 2>/dev/null || echo "(no output)"
+}
+
+# When the runner-group daemon can't even open the key file (-33), show what
+# decides that: the file, the folders above it, and the account's groups.
+explain_open_denied() { # explain_open_denied <consumer output>
+    grep -q 'open=-33' <<<"$1" || return 0
+    echo "        the daemon was denied the key file itself; what decides that:"
+    ls -lde@O "$KEYFILE" "$STAGE/keys" "$STAGE" "$HG" 2>&1 | sed 's/^/          /'
+    echo "          nobody's groups: $(id -Gn nobody 2>&1)"
+    echo "          $(dsmemberutil checkmembership -U nobody -G "$GROUP" 2>&1)"
+    echo "          read as nobody from this shell: $(sudo -u nobody head -c 1 "$KEYFILE" >/dev/null 2>&1 && echo allowed || echo denied)"
+    if grep -q -E "groups=([0-9]+,)*$GROUP_GID(,| )" <<<"$1"; then
+        echo "          the daemon ran with $GROUP (gid $GROUP_GID) among its groups, and was still denied"
+    else
+        echo "          the daemon ran WITHOUT $GROUP (gid $GROUP_GID) among its groups: launchd started it with a stale group list"
+    fi
 }
 
 # One full pass for a suite.
@@ -234,6 +310,7 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     OUT=$(consumer_daemon nobody "$tag-nobody-1")
     echo "        nobody daemon: $OUT"
     expect "a LaunchDaemon in the runner group unwraps the DEK" "unwrap=0 dek=$DEK_HEX" "$OUT"
+    explain_open_denied "$OUT"
     OUT=$("$STAGE/bin/consumer" "$KEYFILE" $SERVICE)
     echo "        root via sudo (this Terminal): $OUT"
     expect "root in a login session is refused (-18)" "unwrap=-18" "$OUT"
@@ -262,6 +339,26 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     OUT=$("$CLI" retire -sn $SERVICE -fp "$WRONG" 2>&1)
     expect "retire with the wrong fingerprint is refused" "nothing was deleted" "$OUT"
     [[ -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is still there" || fail "the KEK file was deleted"
+
+    # A healthy KEK the library refuses only for its permissions is not corrupt.
+    chmod o+r "$KEKS/$SERVICE.kek"
+    expect "a KEK file others can read is reported as -19" "kek: corrupt" "$("$CLI" status -sn $SERVICE 2>&1)"
+    OUT=$("$CLI" retire -sn $SERVICE --corrupt 2>&1)
+    expect "retire --corrupt refuses it: its key is usable" "holds a usable KEK" "$OUT"
+    [[ -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is still there" || fail "the KEK file was deleted"
+    chmod 0640 "$KEKS/$SERVICE.kek"
+    expect "with its permissions restored it is present again" "fingerprint: $FP" "$("$CLI" status -sn $SERVICE 2>&1)"
+
+    # The mode is 0640, but an ACL can still let everyone read the blobs.
+    chmod +a "everyone allow read" "$KEKS/$SERVICE.kek"
+    expect "a KEK file with an everyone-read ACL is reported as -19" "kek: corrupt" "$("$CLI" status -sn $SERVICE 2>&1)"
+    OUT=$(consumer_daemon nobody "$tag-nobody-acl")
+    echo "        nobody daemon, ACL on the KEK file: $OUT"
+    # -19, or -12 while the P-256 pass has RequirePostQuantum on: never 0.
+    if grep -q 'unwrap=0' <<<"$OUT"; then fail "a KEK file with an ACL was still used"; else pass "and nothing unwraps under it"; fi
+    chmod -N "$KEKS/$SERVICE.kek"
+    expect "with the ACL removed it is present again" "fingerprint: $FP" "$("$CLI" status -sn $SERVICE 2>&1)"
+
     OUT=$("$CLI" retire -sn $SERVICE -fp "$FP" 2>&1)
     expect "retire with the right fingerprint deletes the KEK" "retired machine KEK" "$OUT"
     [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is gone" || fail "the KEK file is still there"
@@ -271,10 +368,18 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     echo "        nobody daemon after retire: $OUT"
     expect "the payload no longer unwraps (-17)" "unwrap=-17" "$OUT"
     expect "status reports it absent" "kek: absent" "$("$CLI" status -sn $SERVICE 2>&1)"
+
+    # A file that is not a KEK file is what --corrupt is for.
+    ( umask 077; echo "not a KEK file" > "$KEKS/$SERVICE.kek" )
+    chown root:wheel "$KEKS/$SERVICE.kek"
+    expect "a file the library didn't write is reported as -19" "kek: corrupt" "$("$CLI" status -sn $SERVICE 2>&1)"
+    OUT=$("$CLI" retire -sn $SERVICE --corrupt 2>&1)
+    expect "retire --corrupt deletes it" "retired corrupt machine KEK file" "$OUT"
+    [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "the file is gone" || fail "the file is still there"
 }
 
 if [[ "$MLKEM_AVAILABLE" -eq 1 ]]; then
-    verify_suite mlkem ML-KEM-1024 02 02 ""
+    verify_suite mlkem ML-KEM-1024 02 03 ""
 else
     echo "== ML-KEM-1024: this macOS is before 26, so provisioning must refuse"
     SERVICE=com.hkdfguard.verify.mlkem; KEYFILE="$STAGE/keys/verify-mlkem.key"; SUITE_KEYS=""
@@ -284,6 +389,25 @@ else
     [[ ! -e "$KEKS/$SERVICE.kek" ]] && pass "and creates no KEK of another suite" || fail "a KEK file was created"
 fi
 verify_suite p256 P-256 01 01 "<key>KekSuite</key><string>P-256</string>"
+
+echo "== the production-mode marker"
+# Everything above ran as root under a valid policy, which records
+# production mode. From then on a missing policy must fail closed, not
+# return this Mac to development mode -- until root deletes the marker.
+if [[ -f "$MARKER" && ! -L "$MARKER" && "$(stat -f '%u %Lp' "$MARKER")" = "0 644" ]]; then
+    pass "root's use of a valid policy recorded production mode"
+else
+    fail "no root-owned 0644 marker at $MARKER"
+fi
+SERVICE=com.hkdfguard.verify.p256
+rm -f "$POLICY"
+OUT=$("$CLI" status -sn $SERVICE 2>&1)
+expect "with the policy removed, the CLI fails closed" "has been in production mode" "$OUT"
+OUT=$("$CLI" provision -sn $SERVICE 2>&1)
+expect "and provisions nothing" "policy is invalid" "$OUT"
+rm -f "$MARKER"
+OUT=$("$CLI" status -sn $SERVICE 2>&1)
+expect "with the marker deleted too, this Mac is back in development mode" "^scope: user$" "$OUT"
 
 echo
 echo "== $PASS passed, $FAILS failed"

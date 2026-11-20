@@ -13,7 +13,7 @@
 # com.hkdfguard.keys group, which the unhardened test host must not share -- there
 # is no separate "import" step or key file; provisioning *is* the import,
 # because the private key material never leaves the Secure Enclave to begin
-# with (see HkdfGuardNativeMacOS.swift). This script just runs
+# with (see HkdfGuardKEK.swift). This script just runs
 # that provisioning once, signed, so it doesn't have to happen inside every
 # test invocation.
 #
@@ -50,7 +50,7 @@ TARGET="hkdfguard-app"
 
 # A fixed, well-known service name for the persistent fixture KEK -- ASCII
 # letters/digits/'.' only, matching the library's own charset rule (see
-# validServiceName in HkdfGuardNativeMacOS.swift; no '-' or '_').
+# validServiceName in HkdfGuardKeychain.swift; no '-' or '_').
 # Hosted tests that want to consume an already-provisioned key, rather than
 # provisioning their own, reference this same name.
 SERVICE_NAME="com.hkdfguard.fixture.hostedtests"
