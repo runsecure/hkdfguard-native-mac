@@ -360,7 +360,8 @@ private func recordProductionMode(markerPath: String, requireTrustedFolder: Bool
     let folder = url.deletingLastPathComponent().path
     // The policy may be MDM's alone, on a Mac where nothing has made
     // hkdfguard's own folder yet.
-    if mkdir(folder, 0o755) != 0, errno != EEXIST {
+    let created = mkdir(folder, 0o755) == 0
+    if !created, errno != EEXIST {
         return failed("its folder can't be created", errno)
     }
     let folderFd = open(folder, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -368,6 +369,15 @@ private func recordProductionMode(markerPath: String, requireTrustedFolder: Bool
         return failed("its folder can't be opened", errno)
     }
     defer { close(folderFd) }
+    // mkdir applies this process's umask: a daemon running with 077 would
+    // make the folder 0700, and the runner groups' daemons could never
+    // reach the machine KEKs inside it. Set on the descriptor just opened,
+    // as the KEK folder is (`openMachineKeyFolderCreatingIt`).
+    if created {
+        guard (geteuid() != 0 || fchown(folderFd, 0, 0) == 0), fchmod(folderFd, 0o755) == 0 else {
+            return failed("its folder's owner and mode can't be set", errno)
+        }
+    }
     guard !requireTrustedFolder || keyFileFoldersAreTrusted(folderFd: folderFd, rootOnly: true) else {
         return failed("its folder, or one above it, is not root's or others can write it", EPERM)
     }

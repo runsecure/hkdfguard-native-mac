@@ -237,9 +237,14 @@ func readMachineKeyFile(service: String, settings: MachineServiceSettings) -> Ma
     var info = stat()
     guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == 0,
           info.st_mode & (S_IWGRP | S_IROTH | S_IWOTH | S_IXOTH) == 0,
-          !onVolumeIgnoringOwnership(fd),
-          !aclGrantsOthersAChange(fd: fd, isFolder: false, rootOnly: true) else {
+          !onVolumeIgnoringOwnership(fd) else {
         return .untrusted("the machine KEK file for \(service) is not a root-owned file that only root can change and only its runner group can read")
+    }
+    // Its mode says who may read it, and nothing else may widen that: an
+    // ACL granting even read to anyone outside the runner group would hand
+    // them the key's blobs. The library writes these files with no ACL.
+    guard !aclGrantsAnything(fd: fd) else {
+        return .untrusted("the machine KEK file for \(service) has an access control list, which can let accounts outside its runner group read it: remove it (`chmod -N`), and rotate the KEK if anyone else may have read it")
     }
     if let problem = machineKeyFileGroupProblem(mode: info.st_mode, gid: info.st_gid, runnerGroup: settings.runnerGroup) {
         return .untrusted("the machine KEK file for \(service) \(problem)")
@@ -414,13 +419,23 @@ enum RunnerGroupResolution: Equatable {
 /// doesn't exist, it is an over-broad group under any name, or it is not a
 /// dedicated one. Fails closed: a group that can't be looked up, or can't
 /// be told apart from an over-broad one, is refused.
-func resolveRunnerGroup(_ name: String) -> RunnerGroupResolution {
+///
+/// Run when a machine KEK is created and again on every read of its file
+/// (`machineKeyFileGroupProblem`): a group that was dedicated at
+/// provisioning can stop being so later -- a broad group nested into it --
+/// without its gid changing. `lookup` and `rootIsIn` are parameters only so
+/// the tests can stand in for the directory.
+func resolveRunnerGroup(
+    _ name: String,
+    lookup: (String) -> GroupLookup = lookupGroupID,
+    rootIsIn rootIsMemberOf: (gid_t) -> Bool? = rootIsMember(ofGroup:)
+) -> RunnerGroupResolution {
     let tooBroad = "RunnerGroup \(name) is too broad: name a group that holds only this service's accounts"
     guard !overBroadRunnerGroups.contains(name.lowercased()) else {
         return .refused(tooBroad)
     }
     let gid: gid_t
-    switch lookupGroupID(name) {
+    switch lookup(name) {
     case .found(let found): gid = found
     case .missing: return .refused("RunnerGroup \(name) does not name a group on this Mac")
     case .failed(let code): return .refused("RunnerGroup \(name) could not be looked up (\(String(cString: strerror(code))))")
@@ -429,7 +444,7 @@ func resolveRunnerGroup(_ name: String) -> RunnerGroupResolution {
         return .refused(tooBroad)
     }
     for broad in overBroadRunnerGroups.sorted() {
-        switch lookupGroupID(broad) {
+        switch lookup(broad) {
         case .found(gid): return .refused(tooBroad)
         case .found, .missing: break
         case .failed(let code):
@@ -440,7 +455,7 @@ func resolveRunnerGroup(_ name: String) -> RunnerGroupResolution {
     // ...) and never needs a runner group to read the file, so a group it
     // is in -- directly, or because one of those is nested inside it --
     // is not a dedicated one.
-    guard let rootIsIn = rootIsMember(ofGroup: gid) else {
+    guard let rootIsIn = rootIsMemberOf(gid) else {
         return .refused("RunnerGroup \(name)'s membership could not be checked")
     }
     guard !rootIsIn else {
@@ -451,24 +466,22 @@ func resolveRunnerGroup(_ name: String) -> RunnerGroupResolution {
 
 /// Why a KEK file with this `mode` and `gid` is not the one `runnerGroup`
 /// (the policy's, now) calls for, or nil if it is. Checked on every read,
-/// so a group the policy no longer names does not go on being served.
-func machineKeyFileGroupProblem(mode: mode_t, gid: gid_t, runnerGroup: String?, lookup: (String) -> GroupLookup = lookupGroupID) -> String? {
+/// so a group the policy no longer names does not go on being served --
+/// and with every restriction provisioning applies (`resolveRunnerGroup`),
+/// so neither does one that has stopped being dedicated since: another
+/// name for a broad group, or a group a broad one was nested into.
+func machineKeyFileGroupProblem(
+    mode: mode_t, gid: gid_t, runnerGroup: String?,
+    resolve: (String) -> RunnerGroupResolution = { resolveRunnerGroup($0) }
+) -> String? {
     guard let name = runnerGroup else {
         return mode & S_IRWXG == 0 ? nil : "has no RunnerGroup in the policy, but its group (gid \(gid)) can read it: `chmod 600` it"
     }
-    guard !overBroadRunnerGroups.contains(name.lowercased()) else {
-        return "belongs to a RunnerGroup (\(name)) that is too broad"
-    }
-    switch lookup(name) {
-    case .found(let expected):
-        guard expected != 0 else {
-            return "belongs to a RunnerGroup (\(name)) that is too broad"
-        }
+    switch resolve(name) {
+    case .gid(let expected):
         return gid == expected ? nil : "is group gid \(gid)'s, not the policy's RunnerGroup \(name) (gid \(expected)): `chgrp \(name)` it, and rotate the KEK if the old group should never have had it"
-    case .missing:
-        return "can't be matched to its RunnerGroup: \(name) does not name a group on this Mac"
-    case .failed(let code):
-        return "can't be matched to its RunnerGroup: \(name) could not be looked up (\(String(cString: strerror(code))))"
+    case .refused(let reason):
+        return "can't be used with its RunnerGroup -- \(reason). Anyone the group now admits may already have read this KEK: once the group is fixed, rotate the KEK"
     }
 }
 
@@ -529,6 +542,17 @@ private enum MachineKeyWrite {
 /// Writes the KEK file under a temporary name, owned root:`gid`, mode 0640
 /// (0600 for root only), synced, then renames it into place -- only if no
 /// file has that name yet, so an existing KEK is never replaced.
+/// Removes any access control list `fd` carries -- one inherited from its
+/// folder, say -- and confirms none is left, so the file is readable by
+/// exactly whom its mode says.
+private func removeACL(_ fd: Int32) -> Bool {
+    if aclGrantsAnything(fd: fd), let empty = acl_init(0) {
+        defer { acl_free(UnsafeMutableRawPointer(empty)) }
+        _ = acl_set_fd(fd, empty)
+    }
+    return !aclGrantsAnything(fd: fd)
+}
+
 private func writeMachineKeyFile(_ bytes: Data, service: String, folderFd: Int32, gid: gid_t) -> MachineKeyWrite {
     let finalName = "\(service).kek"
     let tempName = ".\(service).\(UInt64.random(in: .min ... .max)).tmp"
@@ -552,7 +576,7 @@ private func writeMachineKeyFile(_ bytes: Data, service: String, folderFd: Int32
         return true
     }
     let mode: mode_t = gid == 0 ? 0o600 : 0o640
-    written = written && fchown(fd, 0, gid) == 0 && fchmod(fd, mode) == 0 && fsync(fd) == 0
+    written = written && fchown(fd, 0, gid) == 0 && fchmod(fd, mode) == 0 && removeACL(fd) && fsync(fd) == 0
     close(fd)
     guard written else {
         unlinkat(folderFd, tempName, 0)
@@ -574,13 +598,36 @@ private func verifyExistingMachineKEK(service: String, settings: MachineServiceS
     switch readMachineKeyFile(service: service, settings: settings) {
     case .found(var file):
         defer { file.zeroBlobs() }
-        guard case .key(let kek) = reconstructStoredKEK(file.stored, enclaveIsUsable: { true }),
-              kek.fingerprint == file.fingerprint,
-              kekWorks(kek) else {
-            logMachineRefusal(service, "the existing machine KEK can't be used, or is not the key its file records; it was left untouched")
+        // A key that won't load or work is corrupt only if the enclave
+        // demonstrably works in the machine context right now -- the same
+        // probe `getMachineKEK` uses. Before the first unlock since boot, or
+        // for an ML-KEM KEK on a macOS before 26, a healthy KEK fails the
+        // same way, and calling it corrupt would point an operator at
+        // retiring it, and every DEK under it with it.
+        let machineEnclaveWorks = { enclaveProbeSucceeds(makeMachineAccessControl()) }
+        let unavailable = "the Secure Enclave can't use the existing machine KEK in this session (not yet unlocked since boot, or an ML-KEM KEK on a macOS before 26); it was left untouched"
+        switch reconstructStoredKEK(file.stored, enclaveIsUsable: machineEnclaveWorks) {
+        case .enclaveRefused:
+            logMachineRefusal(service, unavailable)
+            return HKDFGuardStatus.keychainAccessDenied.rawValue
+        case .corrupt:
+            logMachineRefusal(service, "the existing machine KEK's blob is not a key this Mac's Secure Enclave holds; it was left untouched")
             return HKDFGuardStatus.kekCorrupted.rawValue
+        case .key(let kek):
+            guard kek.fingerprint == file.fingerprint else {
+                logMachineRefusal(service, "the existing machine KEK is not the key its file records; it was left untouched")
+                return HKDFGuardStatus.kekCorrupted.rawValue
+            }
+            guard kekWorks(kek) else {
+                guard machineEnclaveWorks() else {
+                    logMachineRefusal(service, unavailable)
+                    return HKDFGuardStatus.keychainAccessDenied.rawValue
+                }
+                logMachineRefusal(service, "the existing machine KEK loads but its key agreement or decapsulation fails while the enclave works; it was left untouched")
+                return HKDFGuardStatus.kekCorrupted.rawValue
+            }
+            return suiteRefusal(kek, suites, service: service) ?? HKDFGuardStatus.success.rawValue
         }
-        return suiteRefusal(kek, suites, service: service) ?? HKDFGuardStatus.success.rawValue
     case .notFound:
         return HKDFGuardStatus.kekNotFound.rawValue
     case .refused(let status, let reason):

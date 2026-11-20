@@ -77,12 +77,28 @@ dscl . -read "/Groups/$GROUP" >/dev/null 2>&1 && fail_now "group $GROUP already 
 # Not -e: a dangling symbolic link exists too.
 [[ -e "$STAGE" || -L "$STAGE" ]] && fail_now "$STAGE already exists (left by an interrupted run?); look at what it holds, then remove it: sudo rm -rf \"$STAGE\""
 [[ -e "$JOBPLIST" || -L "$JOBPLIST" ]] && fail_now "$JOBPLIST already exists (left by an interrupted run?); remove it: sudo launchctl bootout system/$LABEL; sudo rm \"$JOBPLIST\""
-# Root works in these folders below; nobody else may be able to put
-# anything in them.
-for d in "$HG" "$KEKS"; do
+# Whether `$1` carries an access control list entry that allows anything.
+# `ls -le` prints one line per entry ("  0: group:staff allow add_file,...");
+# deny entries only take rights away. An ACL can give an account add, delete
+# or rename rights in a folder whatever its mode says -- and an inheritable
+# one passes those rights on to every folder and file made inside it.
+has_allow_acl() {
+    local listing
+    listing="$(ls -lde "$1" 2>/dev/null)" || return 0 # can't tell: assume the worst
+    grep -qE '^ *[0-9]+: .* allow ' <<<"$listing"
+}
+
+# Root works in these folders below, and in the folders above them by path;
+# nobody else may be able to put anything in any of them: root-owned, not
+# writable by group or others, and no ACL allowing anything.
+root_only_folder() {
+    [[ -d "$1" && ! -L "$1" && "$(stat -f '%u' "$1")" = 0 && -z "$(find "$1" -maxdepth 0 -perm +022)" ]] \
+        && ! has_allow_acl "$1"
+}
+for d in / /Library "/Library/Application Support" "$HG" "$KEKS"; do
     [[ -e "$d" || -L "$d" ]] || continue
-    [[ -d "$d" && ! -L "$d" && "$(stat -f '%u' "$d")" = 0 && -z "$(find "$d" -maxdepth 0 -perm +022)" ]] \
-        || fail_now "$d is not a folder that only root can write"
+    root_only_folder "$d" \
+        || fail_now "$d is not a folder that only root can write (owner, mode, or an ACL: ls -lde \"$d\")"
 done
 
 CREATED_HG=0; CREATED_KEKS=0
@@ -118,10 +134,18 @@ echo "== staging root-owned copies of this repo's builds in $STAGE"
 # removes files by name in here, so no other account may be able to add,
 # rename or replace an entry (a symbolic link planted at one of those names
 # would have root act on whatever it points at).
+# umask covers the mode bits only: an inheritable ACL on a folder above
+# would still be copied onto each new folder. So every ACL is removed before
+# anything is written into them, and each folder is checked again.
 ( umask 022; mkdir "$STAGE" "$STAGE/bin" "$STAGE/keys" "$STAGE/out" ) || fail_now "could not create $STAGE"
 chown -R root:wheel "$STAGE"
+chmod -RN "$STAGE"
+for d in "$STAGE" "$STAGE/bin" "$STAGE/keys" "$STAGE/out"; do
+    root_only_folder "$d" || fail_now "$d is not a folder that only root can write, even after removing its ACL"
+done
 install -o root -g wheel -m 0755 "$CLI_SRC" "$STAGE/bin/hkdfguard"
 install -o root -g wheel -m 0644 "$LIB_SRC" "$STAGE/bin/libhkdfguard.dylib"
+chmod -N "$STAGE/bin/hkdfguard" "$STAGE/bin/libhkdfguard.dylib"
 # The development CLI finds its library in the repo; the staged one must
 # use the root-owned copy beside it.
 otool -l "$STAGE/bin/hkdfguard" | awk '/LC_RPATH/{r=1} r && /path /{print $2; r=0}' \
@@ -324,6 +348,16 @@ verify_suite() { # verify_suite <tag> <suite name> <suite byte> <KEK file format
     [[ -e "$KEKS/$SERVICE.kek" ]] && pass "the KEK file is still there" || fail "the KEK file was deleted"
     chmod 0640 "$KEKS/$SERVICE.kek"
     expect "with its permissions restored it is present again" "fingerprint: $FP" "$("$CLI" status -sn $SERVICE 2>&1)"
+
+    # The mode is 0640, but an ACL can still let everyone read the blobs.
+    chmod +a "everyone allow read" "$KEKS/$SERVICE.kek"
+    expect "a KEK file with an everyone-read ACL is reported as -19" "kek: corrupt" "$("$CLI" status -sn $SERVICE 2>&1)"
+    OUT=$(consumer_daemon nobody "$tag-nobody-acl")
+    echo "        nobody daemon, ACL on the KEK file: $OUT"
+    # -19, or -12 while the P-256 pass has RequirePostQuantum on: never 0.
+    if grep -q 'unwrap=0' <<<"$OUT"; then fail "a KEK file with an ACL was still used"; else pass "and nothing unwraps under it"; fi
+    chmod -N "$KEKS/$SERVICE.kek"
+    expect "with the ACL removed it is present again" "fingerprint: $FP" "$("$CLI" status -sn $SERVICE 2>&1)"
 
     OUT=$("$CLI" retire -sn $SERVICE -fp "$FP" 2>&1)
     expect "retire with the right fingerprint deletes the KEK" "retired machine KEK" "$OUT"
