@@ -11,6 +11,10 @@
 # machine-scoped ones in $root_dir/keks, outside v1/. Retire
 # any that should go *before* uninstalling, while the CLI still exists:
 #   hkdfguard retire --service-name <name> --fingerprint <hex>
+#
+# Nor are a local policy.plist or the production-mode marker beside it: a
+# reinstalled library must find this Mac still in production mode. Delete
+# them by hand to return the Mac to development mode.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
@@ -38,6 +42,9 @@ if [ -e "$root_dir" ] || [ -L "$root_dir" ]; then
         echo "==> Removed $root_dir/v1"
     fi
     rmdir "$root_dir" 2>/dev/null || true
+    if [ -e "$root_dir/production-mode" ] || [ -L "$root_dir/production-mode" ]; then
+        echo "==> Left $root_dir/production-mode: this Mac stays in production mode (delete it to return to development mode)"
+    fi
 fi
 
 pkgutil --forget com.hkdfguard.native >/dev/null 2>&1 \

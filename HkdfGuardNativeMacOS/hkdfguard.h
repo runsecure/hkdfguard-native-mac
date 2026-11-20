@@ -347,6 +347,14 @@ extern "C" {
 // invalid, and then every call fails with HKDFGUARD_ERR_POLICY_INVALID
 // until it is fixed.
 //
+// A Mac that has been in production mode does not return to development
+// mode because its policy went away. The first time a root process reads a
+// valid policy, the library writes a marker,
+// /Library/Application Support/HkdfGuard/production-mode (root's, 0644).
+// While it exists, no policy at all is an invalid policy: every call fails
+// with HKDFGUARD_ERR_POLICY_INVALID until the policy is restored, or root
+// deletes the marker to return to development mode on purpose.
+//
 // A service listed in MachineServices has a machine KEK: a Secure Enclave
 // key created by root in the system context (a LaunchDaemon -- the CLI's
 // `provision` does this), kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,

@@ -143,6 +143,76 @@ struct HkdfGuardMachineScopeTests {
         #expect(loadPolicyFile(atPath: NSTemporaryDirectory() + "hkdfguard-no-such-policy.plist") == nil)
     }
 
+    // MARK: - The production-mode marker
+
+    private static let somePolicy = PolicyLoad.loaded(MachinePolicy(
+        source: "p", securityAdminGroup: nil, deploymentAdminGroup: nil,
+        machineServices: [:], suites: SuitePolicy(requirePostQuantum: true)))
+
+    private static func withMarkerFolder(_ body: (_ marker: String) throws -> Void) throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.marker.\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try body(dir.appendingPathComponent("production-mode").path)
+    }
+
+    @Test func aMissingPolicyFailsClosedOnceProductionModeWasRecorded() throws {
+        try Self.withMarkerFolder { marker in
+            // Never in production mode: no policy is development mode.
+            #expect(applyProductionMarker(.none, markerPath: marker, asRoot: true, requireTrustedFolder: false) == .none)
+            #expect(!FileManager.default.fileExists(atPath: marker), "no policy must never write the marker")
+
+            // Root sees a valid policy: recorded, and the policy is unchanged.
+            #expect(applyProductionMarker(Self.somePolicy, markerPath: marker, asRoot: true, requireTrustedFolder: false) == Self.somePolicy)
+            let attributes = try FileManager.default.attributesOfItem(atPath: marker)
+            #expect(attributes[.type] as? FileAttributeType == .typeRegular)
+            #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o644)
+            // Again: the existing marker is left as it is.
+            #expect(applyProductionMarker(Self.somePolicy, markerPath: marker, asRoot: true, requireTrustedFolder: false) == Self.somePolicy)
+
+            // The policy goes away: every call fails closed, for root and everyone else.
+            for asRoot in [true, false] {
+                guard case .invalid(let reason) = applyProductionMarker(.none, markerPath: marker, asRoot: asRoot, requireTrustedFolder: false) else {
+                    Issue.record("a Mac that was in production mode fell back to development mode")
+                    return
+                }
+                #expect(reason.contains(marker), "\(reason)")
+            }
+            // An invalid policy stays what it was.
+            #expect(applyProductionMarker(.invalid("x"), markerPath: marker, asRoot: true, requireTrustedFolder: false) == .invalid("x"))
+
+            // Deleting the marker is the way back to development mode.
+            try FileManager.default.removeItem(atPath: marker)
+            #expect(applyProductionMarker(.none, markerPath: marker, asRoot: false, requireTrustedFolder: false) == .none)
+        }
+    }
+
+    @Test func onlyRootRecordsProductionModeAndOnlyInATrustedFolder() throws {
+        try Self.withMarkerFolder { marker in
+            // Anyone else reading a policy leaves no marker: they couldn't
+            // write the real one, and must not try.
+            #expect(applyProductionMarker(Self.somePolicy, markerPath: marker, asRoot: false, requireTrustedFolder: false) == Self.somePolicy)
+            #expect(!FileManager.default.fileExists(atPath: marker))
+            // This folder is the test user's, not root's: with the real
+            // check on, nothing is written into it, and the policy still loads.
+            #expect(applyProductionMarker(Self.somePolicy, markerPath: marker, asRoot: true) == Self.somePolicy)
+            #expect(!FileManager.default.fileExists(atPath: marker))
+        }
+    }
+
+    @Test func anythingAtTheMarkerPathCountsAsTheMarker() throws {
+        try Self.withMarkerFolder { marker in
+            // A dangling symlink, say: not a file, but not "absent" either.
+            try FileManager.default.createSymbolicLink(atPath: marker, withDestinationPath: "/nonexistent-hkdfguard")
+            guard case .invalid = applyProductionMarker(.none, markerPath: marker, asRoot: false) else {
+                Issue.record("a marker that is not a regular file was ignored")
+                return
+            }
+        }
+        // No folder at all is development mode.
+        #expect(applyProductionMarker(.none, markerPath: "/nonexistent-hkdfguard/production-mode", asRoot: false) == .none)
+    }
+
     @Test func refusesAPolicyFileNotOwnedByRoot() throws {
         // Anyone who can write the policy decides which keys services use.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.policy.\(UUID().uuidString)")
@@ -225,7 +295,7 @@ struct HkdfGuardMachineScopeTests {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hkdfguard.keks.\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: dir) }
-        guard case .untrusted(let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc", settings: MachineServiceSettings(runnerGroup: nil)) }) else {
+        guard case .refused(.kekCorrupted, let reason) = Self.with(Self.policy(), folder: dir.path, { readMachineKeyFile(service: "svc", settings: MachineServiceSettings(runnerGroup: nil)) }) else {
             Issue.record("a user-owned key folder was trusted")
             return
         }

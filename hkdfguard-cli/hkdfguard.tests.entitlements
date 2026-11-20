@@ -5,9 +5,11 @@
 	<!--
 	 Used by the Debug and DebugHosted builds of the bundled CLI (the
 	 hkdfguard-app target) -- the builds the hosted test suite
-	 and setup-hosted-test-kek.sh run. Release, the only configuration
-	 build-dist.sh ships, uses hkdfguard.entitlements and the
-	 production com.hkdfguard.keys group instead.
+	 and setup-hosted-test-kek.sh run -- and by build-dist.sh's
+	 development-signed "debugging" export, which a debugger can attach
+	 to. A Developer ID Release build, the only one build-dist.sh ships,
+	 uses hkdfguard.entitlements and the production com.hkdfguard.keys
+	 group instead.
 
 	 A separate, test-only group, so the test fixtures can never read
 	 production KEKs: the test host (HkdfGuardNativeMacOSTestHost) runs

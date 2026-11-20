@@ -1,7 +1,7 @@
 // Host application for HkdfGuardNativeMacOSTests.
 //
 // Exists for one reason: the data-protection keychain (see `KeychainMode`
-// in HkdfGuardNativeMacOS.swift) is only available to a process
+// in HkdfGuardKeychain.swift) is only available to a process
 // carrying a `keychain-access-groups` entitlement, which on macOS means a
 // Team-signed app bundle with an embedded provisioning profile. The plain
 // `xctest` agent has no such entitlement, so tests hosted by it can only

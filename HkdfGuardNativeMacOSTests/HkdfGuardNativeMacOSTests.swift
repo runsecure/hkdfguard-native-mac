@@ -61,7 +61,7 @@ extension Trait where Self == ProvisionsP256BeforeMacOS26 {
 ///
 /// `hkdfguard_wrap_dek`/`hkdfguard_unwrap_dek`/
 /// `hkdfguard_generate_and_wrap_dek` never create a KEK; only
-/// `hkdfguard_create_kek` does (see HkdfGuardNativeMacOS.swift's
+/// `hkdfguard_create_kek` does (see HkdfGuardKeychain.swift's
 /// `createKEK`/`kekExists`). Every test below that expects a
 /// wrap/unwrap/generate-and-wrap to *succeed* therefore calls
 /// `Self.createKEK(service:)` first and asserts it returns success, exactly
@@ -1606,8 +1606,9 @@ struct HkdfGuardHardenProcessTests {
 
 /// Drift guard: the shared C ABI must not drift between this library and
 /// hkdfguard-native-linux, the source of record. Checks the two headers
-/// against each other, and the Swift status enums -- hand-maintained copies
-/// of the table -- against the header. Pure text checks: no keychain or Secure Enclave. Skipped when the
+/// against each other, and the Swift status enums and the CLI's status
+/// descriptions -- hand-maintained copies of the table -- against the
+/// header. Pure text checks: no keychain or Secure Enclave. Skipped when the
 /// Linux repository isn't checked out next to this one.
 @Suite
 struct HkdfGuardCrossPlatformABITests {
@@ -1672,19 +1673,25 @@ struct HkdfGuardCrossPlatformABITests {
         // "can't happen" returns INTERNAL_ERROR (-6) instead (see `copyOut`).
         // Comments and string literals are skipped; `!=` and prefix `!`
         // (negation) are not unwraps.
-        let source = try String(
-            contentsOf: Self.macRoot.appendingPathComponent("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift"),
-            encoding: .utf8)
+        // Every source file of the library: all of it is reachable from an
+        // export.
+        let folder = Self.macRoot.appendingPathComponent("HkdfGuardNativeMacOS")
+        let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .filter { $0.hasSuffix(".swift") }.sorted()
+        #expect(files.count >= 10, "expected the library's source files in \(folder.path), found \(files)")
         let trap = try Regex(#"(?:[\w)\]]!(?!=))|\btry!|\bas!|\bfatalError\(|\bprecondition\(|\bpreconditionFailure\(|\bassertionFailure\("#)
         let stringLiteral = try Regex(#""(?:[^"\\]|\\.)*""#)
         var offenders: [String] = []
-        for (number, line) in source.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-            var code = String(line).replacing(stringLiteral, with: "\"\"")
-            if let comment = code.range(of: "//") {
-                code = String(code[..<comment.lowerBound])
-            }
-            if code.contains(trap) {
-                offenders.append("line \(number + 1): \(line.trimmingCharacters(in: .whitespaces))")
+        for file in files {
+            let source = try String(contentsOf: folder.appendingPathComponent(file), encoding: .utf8)
+            for (number, line) in source.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                var code = String(line).replacing(stringLiteral, with: "\"\"")
+                if let comment = code.range(of: "//") {
+                    code = String(code[..<comment.lowerBound])
+                }
+                if code.contains(trap) {
+                    offenders.append("\(file) line \(number + 1): \(line.trimmingCharacters(in: .whitespaces))")
+                }
             }
         }
         #expect(offenders.isEmpty, "a runtime trap on an export path would crash the host process:\n\(offenders.joined(separator: "\n"))")
@@ -1774,7 +1781,7 @@ struct HkdfGuardCrossPlatformABITests {
     }
 
     @Test(arguments: [
-        ("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift", "enum HKDFGuardStatus: Int32, CaseIterable {"),
+        ("HkdfGuardNativeMacOS/HkdfGuardStatus.swift", "enum HKDFGuardStatus: Int32, CaseIterable {"),
         ("hkdfguard-cli/Sources/hkdfguard/main.swift", "enum HKDFGuardStatus: Int32 {"),
     ])
     func swiftStatusEnumsMatchTheHeader(file: String, marker: String) throws {
@@ -1788,6 +1795,38 @@ struct HkdfGuardCrossPlatformABITests {
         for (label, value) in cases {
             #expect(header[label] == value, "\(file): case labelled \(label) is \(value), the header says \(header[label].map(String.init) ?? "it isn't defined")")
         }
+    }
+
+    @Test func cliDescribesEveryStatusTheHeaderDefines() throws {
+        // The CLI names only the codes it acts on (checked above), and
+        // explains every code from one table: `<code>: "<text>", // <name>`.
+        let header = Self.statusCodes(Self.defines(in: try Self.read(Self.macHeader)))
+        let source = try Self.read(Self.macRoot.appendingPathComponent("hkdfguard-cli/Sources/hkdfguard/main.swift"))
+        let marker = "let statusDescriptions: [Int32: String] = [\n"
+        let start = try #require(source.range(of: marker), "no statusDescriptions table in main.swift")
+        let end = try #require(source.range(of: "\n]\n", range: start.upperBound..<source.endIndex), "statusDescriptions has no end")
+        let body = source[start.upperBound..<end.lowerBound]
+        var described: [String: Int] = [:]
+        for line in body.split(separator: "\n") {
+            guard let match = line.firstMatch(of: /^\s*(-?[0-9]+):\s*".*",\s*\/\/\s*([A-Z0-9_]+)\s*$/) else {
+                Issue.record("statusDescriptions: an entry without its `// <name>` label: \(line)")
+                continue
+            }
+            let name = "HKDFGUARD_" + match.2
+            #expect(described[name] == nil, "statusDescriptions describes \(name) twice")
+            described[name] = Int(match.1)!
+        }
+        for (name, value) in described {
+            #expect(header[name] == value, "statusDescriptions: \(name) is \(value), the header says \(header[name].map(String.init) ?? "it isn't defined")")
+        }
+        // Every code the header defines, except the other platforms' own and
+        // PROVIDER_ERROR, which macOS never returns (it reports one of the
+        // -96..-100 refinements instead).
+        let expected = header.filter {
+            !$0.key.hasPrefix("HKDFGUARD_ERR_WIN_") && !$0.key.hasPrefix("HKDFGUARD_ERR_LINUX_")
+                && $0.key != "HKDFGUARD_ERR_PROVIDER_ERROR"
+        }
+        #expect(Set(described.keys) == Set(expected.keys), "statusDescriptions is missing \(Set(expected.keys).subtracting(described.keys).sorted()), or has extra \(Set(described.keys).subtracting(expected.keys).sorted())")
     }
 }
 
@@ -2104,6 +2143,26 @@ struct HkdfGuardMLKEMKEKTests {
 
     private static func seal(_ dek: [UInt8], _ kek: KEK) -> (status: Int32, payload: Data?) {
         dek.withUnsafeBytes { sealDek($0, kek: kek, service: service) }
+    }
+
+    @Test func takingAKeychainResultZeroesTheKeychainsOwnBuffer() throws {
+        // What SecItemCopyMatching hands back: an immutable CFData holding
+        // the blob. Zeroing a `Data` cast from it wipes a private copy, so
+        // the library moves the bytes out and zeroes the original in place.
+        let secret = [UInt8](repeating: 0xAB, count: 300)
+        let keychainData = try #require(CFDataCreate(nil, secret, secret.count))
+        let source = try #require(CFDataGetBytePtr(keychainData))
+
+        let taken = try #require(takeKeychainSecret(keychainData))
+        #expect([UInt8](taken) == secret)
+        #expect(UnsafeBufferPointer(start: source, count: secret.count).allSatisfy { $0 == 0 },
+                "the keychain's object still holds the blob")
+        // The copy does not live in the keychain's object.
+        taken.withUnsafeBytes { #expect($0.baseAddress != UnsafeRawPointer(source)) }
+
+        #expect(takeKeychainSecret(nil) == nil)
+        #expect(takeKeychainSecret("not data" as CFString) == nil)
+        #expect(takeKeychainSecret(CFDataCreate(nil, nil, 0)) == Data())
     }
 
     @Test func theKeychainItemFormatKeepsP256BareAndBoxesMLKEM() throws {
