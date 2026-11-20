@@ -142,7 +142,12 @@ int main(int argc, char **argv) {
     int open_status = hkdfguard_open_file(argv[1], wrapped, &wrapped_len);
     uint8_t dek[32]; int dek_len = sizeof dek;
     int unwrap_status = open_status == 0 ? hkdfguard_unwrap_dek(argv[2], wrapped, wrapped_len, dek, &dek_len) : 999;
-    printf("uid=%d session_flags=0x%llx open=%d unwrap=%d dek=", (int)getuid(), flags, open_status, unwrap_status);
+    /* The groups this process really runs with: what the kernel checks the
+       key file's group against, whatever the directory says by now. */
+    gid_t groups[64]; int n = getgroups(64, groups);
+    printf("uid=%d gid=%d groups=", (int)getuid(), (int)getgid());
+    for (int i = 0; i < n; i++) printf("%s%d", i ? "," : "", (int)groups[i]);
+    printf(" session_flags=0x%llx open=%d unwrap=%d dek=", flags, open_status, unwrap_status);
     if (unwrap_status == 0) for (int i = 0; i < 32; i++) printf("%02x", dek[i]);
     printf("\n");
     return 0;
@@ -156,6 +161,12 @@ CLI="$STAGE/bin/hkdfguard"
 echo "== a runner group holding only the service account (nobody)"
 dseditgroup -o create -n . -r "HkdfGuard verification" "$GROUP" || fail_now "could not create $GROUP"
 dseditgroup -o edit -n . -a nobody -t user "$GROUP" || fail_now "could not add nobody to $GROUP"
+GROUP_GID="$(dscl . -read "/Groups/$GROUP" PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+# launchd gives a job its account's groups as it knows them when the job
+# starts. The group is seconds old and nobody was just added to it, so drop
+# every cached answer about either before the first job runs.
+dscacheutil -flushcache
+dsmemberutil flushcache >/dev/null 2>&1
 
 # The suite pass in progress: its service, key file, and the policy's suite
 # settings (empty: the defaults).
@@ -217,6 +228,11 @@ explain_open_denied() { # explain_open_denied <consumer output>
     echo "          nobody's groups: $(id -Gn nobody 2>&1)"
     echo "          $(dsmemberutil checkmembership -U nobody -G "$GROUP" 2>&1)"
     echo "          read as nobody from this shell: $(sudo -u nobody head -c 1 "$KEYFILE" >/dev/null 2>&1 && echo allowed || echo denied)"
+    if grep -q -E "groups=([0-9]+,)*$GROUP_GID(,| )" <<<"$1"; then
+        echo "          the daemon ran with $GROUP (gid $GROUP_GID) among its groups, and was still denied"
+    else
+        echo "          the daemon ran WITHOUT $GROUP (gid $GROUP_GID) among its groups: launchd started it with a stale group list"
+    fi
 }
 
 # One full pass for a suite.
