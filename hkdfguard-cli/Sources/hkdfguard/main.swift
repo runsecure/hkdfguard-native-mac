@@ -217,7 +217,7 @@ func keychainModeName() -> String {
     }
 }
 
-// Mirrors HKDFGuardStatus in HkdfGuardNativeMacOS.swift -- kept as
+// Mirrors HKDFGuardStatus in HkdfGuardStatus.swift -- kept as
 // a separate, parallel definition rather than importing that module, for
 // the same "go through the C ABI only" reason as the `@_silgen_name`
 // declaration above; the raw integer values are the actual contract, this
@@ -703,14 +703,14 @@ struct CLIError: Error, CustomStringConvertible {
 }
 
 // Maximum length, in bytes, the library accepts for a service name (see
-// `validServiceName` in HkdfGuardNativeMacOS.swift). Checked here
+// `validServiceName` in HkdfGuardKeychain.swift). Checked here
 // too so an over-length name fails fast with a clear message instead of
 // making a wasted round trip through hkdfguard_create_kek/hkdfguard_wrap_dek
 // just to get the same rejection back as an opaque status code.
 let maxServiceNameLength = 128
 
 // Enforces the exact same rule the library itself applies to `service` (see
-// `validServiceName` in HkdfGuardNativeMacOS.swift): 1-128 ASCII
+// `validServiceName` in HkdfGuardKeychain.swift): 1-128 ASCII
 // alphanumeric characters or '.', not starting with '.', and with no two
 // consecutive dots -- the Linux tool's rule and messages.
 func validateServiceCharset(_ service: String) throws {
@@ -787,7 +787,7 @@ func readKekFingerprint(service: String) -> (status: Int32, fingerprint: [UInt8]
 let kekKeychainAccount = "kek-v1"
 
 // What a KEK item's own data reconstructs into, read in the library's item
-// format (`decodeKeychainKEK` in HkdfGuardNativeMacOS.swift): a bare P-256
+// format (`decodeKeychainKEK` in HkdfGuardKeychain.swift): a bare P-256
 // Secure Enclave blob, or, for suite 0x02 (ML-KEM-1024 with a P-256 key),
 // "HKGQ" || format 0x03 || suite 0x02 || fingerprint (32) || blob length
 // (big-endian u16) || ML-KEM blob || 1568-byte ciphertext || blob length ||

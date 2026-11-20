@@ -61,7 +61,7 @@ extension Trait where Self == ProvisionsP256BeforeMacOS26 {
 ///
 /// `hkdfguard_wrap_dek`/`hkdfguard_unwrap_dek`/
 /// `hkdfguard_generate_and_wrap_dek` never create a KEK; only
-/// `hkdfguard_create_kek` does (see HkdfGuardNativeMacOS.swift's
+/// `hkdfguard_create_kek` does (see HkdfGuardKeychain.swift's
 /// `createKEK`/`kekExists`). Every test below that expects a
 /// wrap/unwrap/generate-and-wrap to *succeed* therefore calls
 /// `Self.createKEK(service:)` first and asserts it returns success, exactly
@@ -1672,19 +1672,25 @@ struct HkdfGuardCrossPlatformABITests {
         // "can't happen" returns INTERNAL_ERROR (-6) instead (see `copyOut`).
         // Comments and string literals are skipped; `!=` and prefix `!`
         // (negation) are not unwraps.
-        let source = try String(
-            contentsOf: Self.macRoot.appendingPathComponent("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift"),
-            encoding: .utf8)
+        // Every source file of the library: all of it is reachable from an
+        // export.
+        let folder = Self.macRoot.appendingPathComponent("HkdfGuardNativeMacOS")
+        let files = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .filter { $0.hasSuffix(".swift") }.sorted()
+        #expect(files.count >= 10, "expected the library's source files in \(folder.path), found \(files)")
         let trap = try Regex(#"(?:[\w)\]]!(?!=))|\btry!|\bas!|\bfatalError\(|\bprecondition\(|\bpreconditionFailure\(|\bassertionFailure\("#)
         let stringLiteral = try Regex(#""(?:[^"\\]|\\.)*""#)
         var offenders: [String] = []
-        for (number, line) in source.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-            var code = String(line).replacing(stringLiteral, with: "\"\"")
-            if let comment = code.range(of: "//") {
-                code = String(code[..<comment.lowerBound])
-            }
-            if code.contains(trap) {
-                offenders.append("line \(number + 1): \(line.trimmingCharacters(in: .whitespaces))")
+        for file in files {
+            let source = try String(contentsOf: folder.appendingPathComponent(file), encoding: .utf8)
+            for (number, line) in source.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                var code = String(line).replacing(stringLiteral, with: "\"\"")
+                if let comment = code.range(of: "//") {
+                    code = String(code[..<comment.lowerBound])
+                }
+                if code.contains(trap) {
+                    offenders.append("\(file) line \(number + 1): \(line.trimmingCharacters(in: .whitespaces))")
+                }
             }
         }
         #expect(offenders.isEmpty, "a runtime trap on an export path would crash the host process:\n\(offenders.joined(separator: "\n"))")
@@ -1774,7 +1780,7 @@ struct HkdfGuardCrossPlatformABITests {
     }
 
     @Test(arguments: [
-        ("HkdfGuardNativeMacOS/HkdfGuardNativeMacOS.swift", "enum HKDFGuardStatus: Int32, CaseIterable {"),
+        ("HkdfGuardNativeMacOS/HkdfGuardStatus.swift", "enum HKDFGuardStatus: Int32, CaseIterable {"),
         ("hkdfguard-cli/Sources/hkdfguard/main.swift", "enum HKDFGuardStatus: Int32 {"),
     ])
     func swiftStatusEnumsMatchTheHeader(file: String, marker: String) throws {

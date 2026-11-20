@@ -1739,7 +1739,7 @@ struct HkdfGuardCommandLineToolTests {
         switch hkdfguardKeychainMode {
         case .legacy:
             // Explicit false, not omitted -- see keychainItemAttributes in
-            // HkdfGuardNativeMacOS.swift.
+            // HkdfGuardKeychain.swift.
             query[kSecUseDataProtectionKeychain as String] = false
         case .dataProtection(let accessGroup):
             query[kSecUseDataProtectionKeychain as String] = true

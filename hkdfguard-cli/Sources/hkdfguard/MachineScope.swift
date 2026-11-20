@@ -647,7 +647,7 @@ private func withMachineKeyFile<T>(policy: CLIPolicy, service: String, _ body: (
 // `decodeMachineKeyFile` reads it, as `storedKEKCheck` does for a keychain
 // item.
 
-/// Must equal `machineKeyMaxSize` in HkdfGuardNativeMacOS.swift.
+/// Must equal `machineKeyMaxSize` in HkdfGuardMachineKEK.swift.
 private let machineKeyFileMaxSize = 8192
 
 /// The parts of a well-formed machine KEK file.

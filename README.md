@@ -1274,7 +1274,22 @@ hkdfguard retire -sn com.example.ingest -fp <fingerprint printed by provision>
 | `hkdfguard-app` | `hkdfguard.app` | The same `main.swift` as an app bundle with the `com.hkdfguard.keys` access group in Release (`com.hkdfguard.tests.keys` in Debug/DebugHosted) and hardened runtime, embedding the dylib — the build of the CLI that runs in data-protection mode |
 | `HkdfGuardNativeMacOSTestHost` | `HkdfGuardNativeMacOSTestHost.app` | Minimal entitled host app for the test bundle, so the suite can run in data-protection mode (see Tests) |
 
-All library targets build from the single `HkdfGuardNativeMacOS.swift`.
+All library targets build from the same Swift sources in
+`HkdfGuardNativeMacOS/`:
+
+| File | Holds |
+|---|---|
+| `HkdfGuardNativeMacOS.swift` | The payload layout, and the C ABI entry points for setup, wrap and unwrap |
+| `HkdfGuardStatus.swift` | The status codes |
+| `HkdfGuardHashToCurve.swift` | RFC 9380 hash-to-curve and the P-256 field arithmetic |
+| `HkdfGuardKEK.swift` | The KEK types (P-256, ML-KEM-1024 hybrid) and wrapping-key derivation |
+| `HkdfGuardKeychain.swift` | User-scoped KEKs: keychain mode, the keychain item, service names, lookup and creation |
+| `HkdfGuardPolicy.swift` | The production policy, the production-mode marker, and a service's scope |
+| `HkdfGuardMachineKEK.swift` | Machine-scoped KEKs: the system context, the KEK file, runner groups |
+| `HkdfGuardAudit.swift` | The audit trail |
+| `HkdfGuardHardening.swift` | `hkdfguard_harden_process` |
+| `HkdfGuardKeyFile.swift` | `hkdfguard_open_file` and the file and folder trust checks |
+
 Requires a **Swift 6.2+** toolchain (compile-time `#error` guard). Every
 target -- the framework, the dylib, both CLI builds, the test bundle, and
 the test host -- targets **macOS 14.0+**, set explicitly rather than left
