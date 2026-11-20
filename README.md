@@ -700,9 +700,16 @@ has already unwrapped every DEK they could reach. Recover in this order:
 3. Only then `retire` the old service's KEK. Anything still wrapped under it
    stops unwrapping.
 
-`retire` is not a crypto-shred. It deletes the KEK's keychain item or key
-file, which holds the Secure Enclave key in the only form it is stored in.
-A copy taken before the retire still holds it: a Time Machine or other
+`retire` is not a crypto-shred, and it does not revoke anything. It deletes
+the KEK's keychain item or key file, which holds the Secure Enclave key in
+the only form the library stores it in. That stored form is all it takes to
+use the key, so any account that could read it before the retire may have
+kept a copy and can go on using it in the same context: a member of the
+machine KEK's `RunnerGroup`, or, in legacy keychain mode, a process running
+as the same user. That is why the steps above replace the DEKs rather than
+rely on the retire.
+
+A copy taken before the retire still holds it too: a Time Machine or other
 backup of the login keychain or of `/Library/Application Support`, or a
 local APFS snapshot. Restored onto the same Mac, that copy unwraps every
 payload under the KEK again. (On another Mac it is useless: only this Mac's
@@ -916,6 +923,21 @@ sudo hkdfguard retire -sn com.example.orders -fp 3f1c…e09a # security admin
   file; a path containing `..` is refused under `sudo`; and nothing is
   written among hkdfguard's own files (machine KEKs, the policy, the
   installed tool).
+
+  Write the rule out in full, ending in `--dek-stdin`, rather than ending
+  it in a wildcard:
+
+  ```
+  %orders-deploy ALL = (root) /usr/local/bin/hkdfguard wrap -kf /Library/Application\ Support/Orders/dek.key -sn com.example.orders --dek-stdin -fp [0-9a-f]*
+  ```
+
+  sudo's `*` matches spaces too, so a rule ending `-kf /Library/Application\ Support/Orders/*`
+  also allows whatever is added after the path: another `-sn`, `--group`,
+  `--force`, `--dek-file`. And `--dek-file` should not be left open: under
+  `sudo` the tool reads as root, so it accepts any root-only file. Its
+  error messages then say whether that file is over 64 bytes, valid base64
+  and how long it decodes to, and a file that does hold a 32-byte base64
+  key (another pipeline's DEK) is wrapped for this admin's service.
 - **The Secure Enclave work runs in a one-off LaunchDaemon job.** The
   Secure Enclave binds a key to the context it was created in, so a key
   made from Terminal, `sudo` included, would be unusable by the service's
@@ -1193,7 +1215,9 @@ hkdfguard retire --service-name|-sn <name> \
 - **Reserved locations.** `wrap` never writes a key file among hkdfguard's
   own files: the machine KEK folder, the installed tool's folder
   (`/Library/Application Support/HkdfGuard/v1`), `/Library/Managed
-  Preferences`, or the local `policy.plist`. Run as root, it also refuses a
+  Preferences`, or directly in `/Library/Application Support/HkdfGuard`
+  (where the local `policy.plist` and the production-mode marker live; a
+  folder root made beneath it is fine). Run as root, it also refuses a
   `<path>` containing `..`, so a sudoers rule that pins `wrap` to a folder
   can't be walked out of.
 

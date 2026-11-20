@@ -1212,9 +1212,12 @@ func reconstructKEK(
     _ data: Data,
     enclaveIsUsable: () -> Bool = secureEnclaveIsUsableNow
 ) -> KEKReconstruction {
-    guard let item = decodeKeychainKEK(data) else {
+    guard var item = decodeKeychainKEK(data) else {
         return .corrupt // a malformed container: no keybag state explains that
     }
+    // An ML-KEM item's blobs are copies of their own (a P-256 item's is
+    // `data` itself, which the caller zeroes): don't leave them behind.
+    defer { item.stored.zeroBlobs() }
     let result = reconstructStoredKEK(item.stored, enclaveIsUsable: enclaveIsUsable)
     // The key loaded, but is not the KEK the item records: its ciphertext
     // (or the record) was damaged. No keybag state explains that either.
@@ -3418,7 +3421,7 @@ public func hkdfguard_kek_fingerprint(
     // leaves it.
     // For a machine KEK, from its file's public key: no Secure Enclave use,
     // so root can read it from Terminal (`status`, `provision`, `retire`).
-    let (status, maybeFingerprint) = gatedSetup { () -> (Int32, Data?) in
+    let (status, maybeFingerprint) = gatedSetup { () -> (Int32, Data?) in withPolicySnapshot {
         switch kekScope(service: service) {
         case .policyInvalid:
             return (HKDFGuardStatus.policyInvalid.rawValue, nil)
@@ -3429,7 +3432,7 @@ public func hkdfguard_kek_fingerprint(
             let (status, maybeKey) = getKEK(service: service)
             return (status, maybeKey?.fingerprint)
         }
-    }
+    } }
     guard let fingerprint = maybeFingerprint else {
         auditOperationFailed(.kekFingerprint, service: service, code: status)
         return status
@@ -3461,7 +3464,7 @@ public func hkdfguard_kek_suite(
         return HKDFGuardStatus.invalidServiceIdentifier.rawValue
     }
 
-    let (status, maybeSuite) = gatedSetup { () -> (Int32, KEKSuite?) in
+    let (status, maybeSuite) = gatedSetup { () -> (Int32, KEKSuite?) in withPolicySnapshot {
         switch kekScope(service: service) {
         case .policyInvalid:
             return (HKDFGuardStatus.policyInvalid.rawValue, nil)
@@ -3472,7 +3475,7 @@ public func hkdfguard_kek_suite(
             let (status, maybeKey) = getKEK(service: service)
             return (status, maybeKey?.suite)
         }
-    }
+    } }
     guard let suite = maybeSuite else {
         auditOperationFailed(.kekSuite, service: service, code: status)
         return status
@@ -3704,7 +3707,11 @@ private func unwrapDekUnderPolicy(
     // A payload of a suite this build does not implement is reported as
     // such, before the keychain is consulted: it is a version or build
     // mismatch, not tampering.
-    guard let suite = KEKSuite(rawValue: wrappedPtr[hkdfguardSuiteIdOffset]) else {
+    // The payload is copied once, here, and only the copy is looked at from
+    // now on: what the policy is asked about is what gets opened, whatever
+    // the caller does to its buffer meanwhile.
+    let payload = Data(bytes: wrappedPtr, count: hkdfguardWrappedLength)
+    guard let suite = KEKSuite(rawValue: payload[hkdfguardSuiteIdOffset]) else {
         return HKDFGuardStatus.unsupportedCiphersuite.rawValue
     }
     // So is one of a suite the policy refuses (RequirePostQuantum, and a
@@ -3723,8 +3730,7 @@ private func unwrapDekUnderPolicy(
     }
     // Decrypted straight into the caller's buffer (its capacity was checked
     // above): the library keeps no copy of the DEK of its own to clean up.
-    let openStatus = openPayload(
-        Data(bytes: wrappedPtr, count: hkdfguardWrappedLength), kek: kek, service: service, into: outPtr)
+    let openStatus = openPayload(payload, kek: kek, service: service, into: outPtr)
     guard openStatus == HKDFGuardStatus.success.rawValue else {
         return openStatus
     }

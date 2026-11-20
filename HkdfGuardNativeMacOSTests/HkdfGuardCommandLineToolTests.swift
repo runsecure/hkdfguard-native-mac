@@ -1102,7 +1102,11 @@ struct HkdfGuardCommandLineToolTests {
         }
         for path in ["\(installed)/wrapped.key", "/library/application support/hkdfguard/V1/wrapped.key",
                      "/Library/Application Support/HkdfGuard/policy.plist",
-                     "/Library/Application Support/HkdfGuard/Policy.plist"] {
+                     "/Library/Application Support/HkdfGuard/Policy.plist",
+                     // Any name directly in the support folder, not only the policy's.
+                     "/Library/Application Support/HkdfGuard/production-mode",
+                     "/Library/Application Support/HkdfGuard/keks",
+                     "/Library/Application Support/HkdfGuard/wrapped.key"] {
             guard FileManager.default.fileExists(atPath: (path as NSString).deletingLastPathComponent) else {
                 continue
             }

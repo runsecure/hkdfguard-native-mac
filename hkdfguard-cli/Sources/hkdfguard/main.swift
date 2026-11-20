@@ -2298,11 +2298,11 @@ func refuseParentReferencesAsRoot(_ path: String) throws {
 // policy is read from.
 let hkdfguardSupportFolder = "/Library/Application Support/HkdfGuard"
 let hkdfguardInstallFolder = hkdfguardSupportFolder + "/v1"
-let hkdfguardLocalPolicyName = "policy.plist"
 let managedPreferencesFolder = "/Library/Managed Preferences"
 
-// Refuses a key file path inside one of those folders, or naming the local
-// policy file. Folders are compared by identity (device and inode), walking
+// Refuses a key file path inside one of those folders, or directly in the
+// support folder itself (the policy, the marker, and the names `keks` and
+// `v1`). Folders are compared by identity (device and inode), walking
 // up from the checked folder's own descriptor to `/`, so another spelling
 // of the same folder -- different case on a case-insensitive volume, a
 // root-made link -- is the same folder. Fails closed: if the walk can't be
@@ -2317,19 +2317,17 @@ func refuseHkdfGuardOwnLocations(_ folder: CheckedFolder, display path: String, 
     }
     let reserved = "\(path) is where hkdfguard keeps its own files (machine KEKs, the policy, the installed tool); a wrapped key file can't be written there"
 
-    // The policy file itself: by name (any case), or whatever file already
-    // there is the policy by another name.
+    // Nothing directly in the support folder, whatever its name: the names
+    // there are hkdfguard's own -- the policy, the production-mode marker,
+    // and `keks` and `v1`, which a file of that name would stand in for
+    // before the folder exists (a file called `keks` blocks every machine
+    // provision). A folder root made beneath it for key files is fine.
     var own = stat()
     guard fstat(folder.fd, &own) == 0 else {
         throw CLIError("failed to examine the folder of \(path): \(String(cString: strerror(errno)))")
     }
     if same(own, identity(hkdfguardSupportFolder)) {
-        var leaf = stat()
-        let isPolicy = fstatat(folder.fd, folder.leaf, &leaf, AT_SYMLINK_NOFOLLOW) == 0
-            && same(leaf, identity(hkdfguardSupportFolder + "/" + hkdfguardLocalPolicyName))
-        if isPolicy || folder.leaf.lowercased() == hkdfguardLocalPolicyName {
-            throw CLIError(reserved)
-        }
+        throw CLIError(reserved)
     }
 
     let protected = [machineKeyFolder, hkdfguardInstallFolder, managedPreferencesFolder].compactMap(identity)
