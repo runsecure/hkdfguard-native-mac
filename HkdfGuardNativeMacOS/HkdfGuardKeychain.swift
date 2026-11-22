@@ -486,6 +486,22 @@ private func storeKEKDataRepresentation(_ data: Data, service: String, mode: Key
     return SecItemAdd(attributes as CFDictionary, nil)
 }
 
+/// Whether this Mac has a Secure Enclave to hold user-scoped KEKs.
+///
+/// `HKDFGUARD_FUZZING` is defined only by the fuzz build (fuzz/build.sh),
+/// never by a build that ships. There, user-scoped KEKs are software keys
+/// held in memory (`FuzzKEKStore`, fuzz/Sources/Support): the three
+/// `#if HKDFGUARD_FUZZING` branches below are the whole of it, and with
+/// them the fuzz build never reads or writes a keychain and never asks the
+/// Secure Enclave for anything, so it runs on a VM with neither.
+private var secureEnclaveAvailable: Bool {
+    #if HKDFGUARD_FUZZING
+    return true
+    #else
+    return SecureEnclave.isAvailable
+    #endif
+}
+
 /// Reports whether a valid, reconstructable KEK already exists for
 /// `service`, without creating one. Distinguishes "no key yet" (`success`,
 /// `false`) from "a keychain item is present but can't be reconstructed"
@@ -496,7 +512,7 @@ func kekExists(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (
         return (HKDFGuardStatus.invalidServiceIdentifier.rawValue, false)
     }
 
-    guard SecureEnclave.isAvailable else {
+    guard secureEnclaveAvailable else {
         return (HKDFGuardStatus.enclaveUnavailable.rawValue, false)
     }
 
@@ -509,6 +525,9 @@ func kekExists(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (
         break
     }
 
+    #if HKDFGUARD_FUZZING
+    return FuzzKEKStore.exists(service: service)
+    #else
     switch loadKEKDataRepresentation(service: service, mode: mode) {
     case .notFound:
         return (HKDFGuardStatus.success.rawValue, false)
@@ -527,6 +546,7 @@ func kekExists(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (
             return (HKDFGuardStatus.keychainAccessDenied.rawValue, false)
         }
     }
+    #endif
 }
 
 /// `keychainAccessDenied`, logged, when `suites` refuses `kek`'s suite
@@ -592,7 +612,7 @@ private func createKEKUnderPolicy(service: String, mode: KeychainMode) -> Int32 
     }
 
     // Secure Enclave must exist.
-    guard SecureEnclave.isAvailable else {
+    guard secureEnclaveAvailable else {
         return HKDFGuardStatus.enclaveUnavailable.rawValue
     }
 
@@ -608,6 +628,9 @@ private func createKEKUnderPolicy(service: String, mode: KeychainMode) -> Int32 
         break
     }
 
+    #if HKDFGUARD_FUZZING
+    return FuzzKEKStore.create(service: service, suites: suites)
+    #else
     // Existing key? Only a definite "not found" may proceed to create one:
     // a denied or failed lookup means a key may already exist that this
     // process simply can't see, and generating a replacement on top of it
@@ -710,6 +733,7 @@ private func createKEKUnderPolicy(service: String, mode: KeychainMode) -> Int32 
     default:
         return HKDFGuardStatus.keychainWriteFailed.rawValue
     }
+    #endif
 }
 
 /// Looks up the KEK for `service` — never creates one. Returns the
@@ -725,7 +749,7 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
         return (HKDFGuardStatus.invalidServiceIdentifier.rawValue, nil)
     }
 
-    guard SecureEnclave.isAvailable else {
+    guard secureEnclaveAvailable else {
         return (HKDFGuardStatus.enclaveUnavailable.rawValue, nil)
     }
 
@@ -738,6 +762,9 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
         break
     }
 
+    #if HKDFGUARD_FUZZING
+    return FuzzKEKStore.get(service: service)
+    #else
     switch loadKEKDataRepresentation(service: service, mode: mode) {
     case .notFound:
         return (HKDFGuardStatus.kekNotFound.rawValue, nil)
@@ -756,6 +783,7 @@ func getKEK(service: String, mode: KeychainMode = hkdfguardKeychainMode) -> (sta
             return (HKDFGuardStatus.keychainAccessDenied.rawValue, nil)
         }
     }
+    #endif
 }
 
 /// Computes the "fingerprint" embedded at the front of every wrapped

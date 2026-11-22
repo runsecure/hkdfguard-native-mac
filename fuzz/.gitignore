@@ -1,0 +1,9 @@
+# What fuzz/build.sh and the campaigns leave behind.
+/build/
+/libfuzzer/
+/seeds/
+/corpus/
+/artifacts/
+/campaign-*.log
+/campaign-*.sarif
+crash-*
